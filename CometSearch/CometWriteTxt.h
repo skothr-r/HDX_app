@@ -26,10 +26,19 @@ public:
                         FILE *fpoutd,
                         FILE *fpdb);
 
+   static void WriteCsv(FILE *fpout,
+                        FILE *fpoutd,
+                        FILE *fpdb);
+
    static void PrintTxtHeader(FILE *fpout);
+   static void PrintCsvHeader(FILE *fpout);
+   static void ValidateColumns();
    static void PrintModifications(FILE *fpout,
                                   Results *pOutput,
                                   int iWhichResult);
+   static void PrintModificationsCsv(FILE *fpout,
+                                     Results *pOutput,
+                                     int iWhichResult);
    static void PrintProteins(FILE *fpout,
                              FILE *fpdb,
                              int iWhichQuery,
@@ -42,6 +51,10 @@ private:
                             int iPrintTargetDecoy,
                             FILE *fpOut,
                             FILE *fpdb);
+   static void PrintCsvResults(int iWhichQuery,
+                               int iPrintTargetDecoy,
+                               FILE *fpOut,
+                               FILE *fpdb);
 };
 
 #endif

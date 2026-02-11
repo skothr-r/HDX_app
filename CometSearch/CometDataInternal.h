@@ -135,9 +135,11 @@ struct Options
    bool bOutputSqtStream;
    bool bOutputSqtFile;
    bool bOutputTxtFile;
+   bool bOutputCsvFile;
    bool bOutputPepXMLFile;
    int iOutputMzIdentMLFile;
    bool bOutputPercolatorFile;
+   bool bOutputMatchedFragmentIons;  // output matched fragment ions and fragment pairs
    bool bClipNtermMet;           // 0=leave protein sequences alone; 1=also consider w/o N-term methionine
    bool bClipNtermAA;            // 0=leave peptide sequences as-is; 1=clip N-term amino acid from every peptide
    bool bMango;                  // 0=normal; 1=Mango x-link ms2 input
@@ -196,9 +198,11 @@ struct Options
       bOutputSqtStream = a.bOutputSqtStream;
       bOutputSqtFile = a.bOutputSqtFile;
       bOutputTxtFile = a.bOutputTxtFile;
+      bOutputCsvFile = a.bOutputCsvFile;
       bOutputPepXMLFile = a.bOutputPepXMLFile;
       iOutputMzIdentMLFile = a.iOutputMzIdentMLFile;
       bOutputPercolatorFile = a.bOutputPercolatorFile;
+      bOutputMatchedFragmentIons = a.bOutputMatchedFragmentIons;
       bClipNtermMet = a.bClipNtermMet;
       bClipNtermAA = a.bClipNtermAA;
       bMango = a.bMango;
@@ -270,6 +274,15 @@ struct Results
    string sAScoreProSiteScores;               // AScorePro site scores as comma-separated string
    int    iPeffOrigResiduePosition;           // position of PEFF variant substitution; -1 = n-term, iLenPeptide = c-term; -9=unused
    int    iPeffNewResidueCount;               // more than 0 new residues is a substitution (if iPeffOrigResidueCount=1) or insertion (if iPeffOrigResidueCount>1)
+   string sMatchedFragmentIons;               // matched fragment ions (e.g., "c2,c3,z4,z1_6")
+   string sMatchedFragmentIonIntensities;     // matched fragment ion intensities (comma-separated)
+   string sMatchedFragmentIonMz;              // matched fragment ion m/z (comma-separated, same order as ions)
+   string sMatchedFragmentIonQualityScores;   // matched fragment ion quality scores (comma-separated)
+   string sSingleAAOverhangs;                 // single amino acid overhangs (e.g., "2L,3K,5I")
+   string sSingleAAOverhangFragmentPairs;      // fragment pairs for single-AA overhangs, pipe-separated (e.g., "c8-c7|z5-z4")
+   string sMultiAAOverhangs;                  // multi amino acid overhangs (e.g., "2-3LK,5-6IN")
+   string sMultiAAOverhangFragmentPairs;      // multi AA overhang fragment pairs (pipe-separated)
+   string sSiteSpecificResidues;              // site-specific residues mapped to protein (e.g., "3L,4K,6I")
    vector<struct ProteinEntryStruct> pWhichProtein;       // file positions of matched protein entries
    vector<struct ProteinEntryStruct> pWhichDecoyProtein;  // keep separate decoy list (used for separate decoy matches and combined results)
 };
@@ -954,9 +967,11 @@ struct StaticParams
       options.bOutputSqtStream = false;
       options.bOutputSqtFile = false;
       options.bOutputTxtFile = false;
+      options.bOutputCsvFile = false;
       options.bOutputPepXMLFile = true;
       options.iOutputMzIdentMLFile = false;
       options.bOutputPercolatorFile = false;
+      options.bOutputMatchedFragmentIons = true;  // Enable by default for CSV output
 
       options.bResolveFullPaths = true;
 

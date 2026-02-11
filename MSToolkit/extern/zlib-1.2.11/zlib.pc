@@ -1,0 +1,13 @@
+prefix=/Users/rebeccaskotheim/Comet/MSToolkit/obj
+exec_prefix=${prefix}
+libdir=/Users/rebeccaskotheim/Comet/MSToolkit/obj
+sharedlibdir=${libdir}
+includedir=/Users/rebeccaskotheim/Comet/MSToolkit/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.3.1
+
+Requires:
+Libs: -L${libdir} -L${sharedlibdir} -lz
+Cflags: -I${includedir}

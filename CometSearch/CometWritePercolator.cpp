@@ -37,18 +37,14 @@ bool CometWritePercolator::WritePercolator(FILE *fpout,
    int i;
    int iLenDecoyPrefix = (int)strlen(g_staticParams.szDecoyPrefix);
 
-   // Print results.
+   // Print results. Include every spectrum in the .pin (so Percolator can assign q-values to every CSV row).
+   // CSV uses minimum_xcorr to filter; we write all spectra here so .pin and CSV stay in sync after merge.
    for (i=0; i<(int)g_pvQuery.size(); ++i)
    {
-      if (g_pvQuery.at(i)->_pResults[0].fXcorr > g_staticParams.options.dMinimumXcorr)
-      {
-         PrintResults(i, fpout, fpdb, 0, iLenDecoyPrefix);  // print search hit (could be decoy if g_staticParams.options.iDecoySearch=1)
-      }
+      PrintResults(i, fpout, fpdb, 0, iLenDecoyPrefix);  // print target hit(s)
 
-      if (g_staticParams.options.iDecoySearch == 2 && g_pvQuery.at(i)->_pDecoys[0].fXcorr > g_staticParams.options.dMinimumXcorr)
-      {
-         PrintResults(i, fpout, fpdb, 2, iLenDecoyPrefix);  // print decoy hit
-      }
+      if (g_staticParams.options.iDecoySearch == 2)
+         PrintResults(i, fpout, fpdb, 2, iLenDecoyPrefix);  // print decoy hit(s)
    }
 
    fflush(fpout);
@@ -112,12 +108,15 @@ bool CometWritePercolator::PrintResults(int iWhichQuery,
       iNumPrintLines = pQuery->iMatchPeptideCount;
    }
 
-   if (iNumPrintLines > g_staticParams.options.iNumPeptideOutputLines)
-      iNumPrintLines = g_staticParams.options.iNumPeptideOutputLines;
+   /* Pin file: write all stored PSMs (up to iNumStored) so Percolator can assign q-values to every row in the CSV.
+    * CSV/txt output still uses iNumPeptideOutputLines elsewhere. */
+   if (iNumPrintLines > g_staticParams.options.iNumStored)
+      iNumPrintLines = g_staticParams.options.iNumStored;
 
    for (int iWhichResult=0; iWhichResult<iNumPrintLines; ++iWhichResult)
    {
-      if (pOutput[iWhichResult].fXcorr <= g_staticParams.options.dMinimumXcorr)
+      // Always write the top PSM (num=1) so every spectrum appears in .pin; skip only lower-ranked PSMs below threshold
+      if (iWhichResult > 0 && pOutput[iWhichResult].fXcorr <= g_staticParams.options.dMinimumXcorr)
          continue;
 
       fprintf(fpout, "%s_%d_%d_%d\t",    // id
@@ -165,8 +164,10 @@ bool CometWritePercolator::PrintResults(int iWhichQuery,
       }
 
       fprintf(fpout, "%d\t", pQuery->_spectrumInfoInternal.iScanNumber);
-      fprintf(fpout, "%0.6f\t", pQuery->_pepMassInfo.dExpPepMass);  //ExpMass
-      fprintf(fpout, "%0.6f\t", pOutput[iWhichResult].dPepMass);  //CalcMass
+      /* Use calculated peptide mass as ExpMass so (ScanNr,FileName,ExpMass) is unique per PSM;
+       * otherwise Percolator deduplicates to one PSM per spectrum and we lose q-values for num=2,3,... */
+      fprintf(fpout, "%0.6f\t", pOutput[iWhichResult].dPepMass);  // ExpMass (unique per PSM so Percolator outputs all)
+      fprintf(fpout, "%0.6f\t", pOutput[iWhichResult].dPepMass);  // CalcMass
 
       PrintPercolatorSearchHit(iWhichQuery, iWhichResult, iPrintTargetDecoy, pOutput, fpout, vProteinTargets, vProteinDecoys);
    }

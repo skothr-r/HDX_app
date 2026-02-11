@@ -108,6 +108,8 @@ expat-realclean : expat-clean
 # http://zlib.net/
 #
 ZLIB_VER := zlib-1.2.11
+ZLIB_UPGRADE_VER := zlib-1.3.1
+ZLIB_UPGRADE_TGZ := $(ZLIB_UPGRADE_VER).tar.gz
 ZLIB_SRC := $(BUILD_EXT)/$(ZLIB_VER)
 ZLIB_SRCB := $(wildcard $(ZLIB_SRC)/*.c)
 ZLIB_DST := $(BUILD_DIR)/libz.a
@@ -119,7 +121,15 @@ zlib : $(ZLIB_DST)
 
 #$(ZLIB_DST) : | $(BUILD_DIR)/ $(ZLIB_SRC)/
 $(ZLIB_DST) :
-	cd $(BUILD_EXT); unzip -o -qq zlib1211.zip
+	# Prefer upgraded zlib on macOS toolchains; keep folder name for include paths.
+	cd $(BUILD_EXT); \
+	  if [ -f "$(ZLIB_UPGRADE_TGZ)" ]; then \
+	    rm -rf "$(ZLIB_VER)" "$(ZLIB_UPGRADE_VER)"; \
+	    tar -xzf "$(ZLIB_UPGRADE_TGZ)"; \
+	    mv "$(ZLIB_UPGRADE_VER)" "$(ZLIB_VER)"; \
+	  else \
+	    unzip -o -qq zlib1211.zip; \
+	  fi
 	cd $(ZLIB_SRC); ./configure --prefix=$(BUILD_DIR) --includedir $(SRC_DIR)/include --libdir $(BUILD_DIR) 
 	make -C $(ZLIB_SRC) install
 
@@ -130,7 +140,14 @@ endif
 
 zlib-realclean : zlib-clean
 	rm -rf $(ZLIB_DST) $(BUILD_DIR)/libz.so* $(SRC_DIR)/include/zlib.h $(SRC_DIR)/include/zconf.h
-	rm -rf $(ZLIB_SRC) ; cd $(BUILD_EXT); unzip -o -qq zlib1211.zip
+	rm -rf $(ZLIB_SRC) ; cd $(BUILD_EXT); \
+	  if [ -f "$(ZLIB_UPGRADE_TGZ)" ]; then \
+	    rm -rf "$(ZLIB_UPGRADE_VER)"; \
+	    tar -xzf "$(ZLIB_UPGRADE_TGZ)"; \
+	    rm -rf "$(ZLIB_VER)" && mv "$(ZLIB_UPGRADE_VER)" "$(ZLIB_VER)"; \
+	  else \
+	    unzip -o -qq zlib1211.zip; \
+	  fi
 	
 
 # -- MSToolkit  ---------------------------------------------------------------

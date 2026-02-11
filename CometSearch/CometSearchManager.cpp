@@ -359,6 +359,42 @@ static bool compareByScanNumber(Query const* a, Query const* b)
    return (a->_spectrumInfoInternal.iScanNumber < b->_spectrumInfoInternal.iScanNumber);
 }
 
+static bool compareByProteinPosition(Query const* a, Query const* b)
+{
+   // Sort by: sequence start position -> peptide length (end position) -> charge -> MS2 retention time
+   // Note: MS1 retention time is added later by OpenMS script, so using MS2 RT here
+   int iStartA = 999999;
+   int iStartB = 999999;
+   
+   // Get protein start position from first result's first protein entry
+   if (a->iMatchPeptideCount > 0 && a->_pResults != NULL && !a->_pResults[0].pWhichProtein.empty())
+      iStartA = a->_pResults[0].pWhichProtein[0].iStartResidue;
+   if (b->iMatchPeptideCount > 0 && b->_pResults != NULL && !b->_pResults[0].pWhichProtein.empty())
+      iStartB = b->_pResults[0].pWhichProtein[0].iStartResidue;
+   
+   // 1. Sort by sequence start position (ascending)
+   if (iStartA != iStartB)
+      return iStartA < iStartB;
+   
+   // 2. Sort by peptide length (ascending - to group peptides with same start and length)
+   int iLenA = (a->iMatchPeptideCount > 0 && a->_pResults != NULL) ? a->_pResults[0].usiLenPeptide : 0;
+   int iLenB = (b->iMatchPeptideCount > 0 && b->_pResults != NULL) ? b->_pResults[0].usiLenPeptide : 0;
+   if (iLenA != iLenB)
+      return iLenA < iLenB;  // Ascending order to group same start+length
+   
+   // 3. Sort by charge (ascending)
+   if (a->_spectrumInfoInternal.usiChargeState != b->_spectrumInfoInternal.usiChargeState)
+      return a->_spectrumInfoInternal.usiChargeState < b->_spectrumInfoInternal.usiChargeState;
+   
+   // 4. Sort by MS2 retention time (ascending)
+   // Note: MS1 RT would be preferred but is added later by OpenMS script
+   if (a->_spectrumInfoInternal.fRTime != b->_spectrumInfoInternal.fRTime)
+      return a->_spectrumInfoInternal.fRTime < b->_spectrumInfoInternal.fRTime;
+   
+   // 5. Finally by scan number as tiebreaker
+   return a->_spectrumInfoInternal.iScanNumber < b->_spectrumInfoInternal.iScanNumber;
+}
+
 static bool ValidateOutputFormat()
 {
    if (!g_staticParams.options.bOutputSqtStream
@@ -834,6 +870,22 @@ bool CometSearchManager::InitializeStaticParams()
          g_staticParams.options.bOutputTxtFile = false;
       else
          g_staticParams.options.bOutputTxtFile = true;
+   }
+
+   if (GetParamValue("output_csvfile", iIntData))
+   {
+      if (iIntData == 0)
+         g_staticParams.options.bOutputCsvFile = false;
+      else
+         g_staticParams.options.bOutputCsvFile = true;
+   }
+
+   if (GetParamValue("output_matched_fragment_ions", iIntData))
+   {
+      if (iIntData == 0)
+         g_staticParams.options.bOutputMatchedFragmentIons = false;
+      else
+         g_staticParams.options.bOutputMatchedFragmentIons = true;
    }
 
    if (GetParamValue("output_pepxmlfile", iIntData))
@@ -2317,6 +2369,8 @@ bool CometSearchManager::DoSearch()
       FILE *fpout_percolator=NULL;
       FILE *fpout_txt=NULL;
       FILE *fpoutd_txt=NULL;
+      FILE *fpout_csv=NULL;
+      FILE *fpoutd_csv=NULL;
 
       std::string sOutputSQT;
       std::string sOutputDecoySQT;
@@ -2329,6 +2383,8 @@ bool CometSearchManager::DoSearch()
       std::string sOutputPercolator;
       std::string sOutputTxt;
       std::string sOutputDecoyTxt;
+      std::string sOutputCsv;
+      std::string sOutputDecoyCsv;
 
       if (g_staticParams.options.bOutputSqtFile)
       {
@@ -2434,6 +2490,62 @@ bool CometSearchManager::DoSearch()
             }
 
             CometWriteTxt::PrintTxtHeader(fpoutd_txt);
+         }
+      }
+
+      if (bSucceeded && g_staticParams.options.bOutputCsvFile)
+      {
+         if (iAnalysisType == AnalysisType_EntireFile)
+         {
+            sOutputCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix + ".csv";
+#ifdef CRUX
+            if (g_staticParams.options.iDecoySearch == 2)
+               sOutputCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix + ".target.csv";
+#endif
+         }
+         else
+         {
+            sOutputCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix +
+               "." + std::to_string(iFirstScan) + "-" + std::to_string(iLastScan) + ".csv";
+#ifdef CRUX
+            if (g_staticParams.options.iDecoySearch == 2)
+               sOutputCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix +
+               "." + std::to_string(iFirstScan) + "-" + std::to_string(iLastScan) + ".target.csv";
+#endif
+         }
+
+         if ((fpout_csv = fopen(sOutputCsv.c_str(), "w")) == NULL)
+         {
+            string strErrorMsg = " Error - cannot write to file \"" + sOutputCsv + "\".\n";
+            g_cometStatus.SetStatus(CometResult_Failed, strErrorMsg);
+            logerr(strErrorMsg);
+            bSucceeded = false;
+         }
+
+         CometWriteTxt::PrintCsvHeader(fpout_csv);
+         fflush(fpout_csv);
+
+         if (bSucceeded && (g_staticParams.options.iDecoySearch == 2))
+         {
+            if (iAnalysisType == AnalysisType_EntireFile)
+               sOutputDecoyCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix + ".decoy.csv";
+            else
+               sOutputDecoyCsv = std::string(g_staticParams.inputFile.szBaseName) + g_staticParams.szOutputSuffix +
+               "." + std::to_string(iFirstScan) + "-" + std::to_string(iLastScan) + ".decoy.csv";
+
+            fpoutd_csv = fopen(sOutputDecoyCsv.c_str(), "w");
+            if (!fpoutd_csv)
+            {
+               string strErrorMsg = " Error - cannot write to decoy file \"" + sOutputDecoyCsv + "\".\n";
+               g_cometStatus.SetStatus(CometResult_Failed, strErrorMsg);
+               logerr(strErrorMsg);
+               bSucceeded = false;
+            }
+            else
+            {
+               CometWriteTxt::PrintCsvHeader(fpoutd_csv);
+               fflush(fpoutd_csv);
+            }
          }
       }
 
@@ -2941,8 +3053,8 @@ bool CometSearchManager::DoSearch()
                fflush(stdout);
             }
 #endif
-            // Sort g_pvQuery vector by scan.
-            std::sort(g_pvQuery.begin(), g_pvQuery.end(), compareByScanNumber);
+            // Sort g_pvQuery vector by protein position, length, charge, and MS2 RT
+            std::sort(g_pvQuery.begin(), g_pvQuery.end(), compareByProteinPosition);
 
             if (!g_staticParams.options.bOutputSqtStream && !g_staticParams.iIndexDb)
             {
@@ -2968,6 +3080,11 @@ bool CometSearchManager::DoSearch()
             if (g_staticParams.options.bOutputTxtFile)
             {
                CometWriteTxt::WriteTxt(fpout_txt, fpoutd_txt, fpdb);
+            }
+
+            if (g_staticParams.options.bOutputCsvFile)
+            {
+               CometWriteTxt::WriteCsv(fpout_csv, fpoutd_csv, fpdb);
             }
 
             // Write SQT last as I destroy the g_staticParams.szMod string during that process
@@ -3164,6 +3281,22 @@ cleanup_results:
          fpoutd_txt = NULL;
          if (iTotalSpectraSearched == 0)
             remove(sOutputDecoyTxt.c_str());
+      }
+
+      if (NULL != fpout_csv)
+      {
+         fclose(fpout_csv);
+         fpout_csv = NULL;
+         if (iTotalSpectraSearched == 0)
+            remove(sOutputCsv.c_str());
+      }
+
+      if (NULL != fpoutd_csv)
+      {
+         fclose(fpoutd_csv);
+         fpoutd_csv = NULL;
+         if (iTotalSpectraSearched == 0)
+            remove(sOutputDecoyCsv.c_str());
       }
 
       if (iTotalSpectraSearched == 0)

@@ -13,7 +13,7 @@ Output: versioned directories per run:
   - plots_vN_<suffix>/       all output plots (chromatograms, RT windows, combined)
 
 Default input files (override with --csv, --mzml, --fasta):
-  CSV:   data/WT_nep2_0MUrea_08_with_ms1_perc_qvalues.csv  (full PSM set with q-values; use a CSV with "matched fragment ion mz" for Comet fragment labels if available)
+  CSV:   data/comet_frags_perc_openMS.csv  (full PSM set with q-values; use a CSV with "matched fragment ion mz" for Comet fragment labels if available)
   mzML:  data/WT_nep2_0MUrea_08.mzML
   FASTA: data/Ube2D3.fasta
 """
@@ -31,7 +31,7 @@ if _SCRIPT_DIR not in sys.path:
 
 # Default input files (project-relative; override with --csv, --mzml, --fasta)
 # Default CSV keeps all rows (from add_ms1_data_openms.py without --filter). Use --csv to point at a filtered CSV if desired.
-DEFAULT_CSV = os.path.join(_SCRIPT_DIR, 'data', 'WT_nep2_0MUrea_08_with_qvalues_ms1_all.csv')
+DEFAULT_CSV = os.path.join(_SCRIPT_DIR, 'data', 'comet_frags_perc_openMS.csv')
 DEFAULT_MZML = os.path.join(_SCRIPT_DIR, 'data', 'WT_nep2_0MUrea_08.mzML')
 DEFAULT_FASTA = os.path.join(_SCRIPT_DIR, 'data', 'Ube2D3.fasta')
 
@@ -912,7 +912,7 @@ def main():
             except Exception:
                 pass
 
-    # Chromatogram extraction MUST run first. It produces peak_windows.csv / peak_windows_all.csv and total_area
+    # Chromatogram extraction MUST run first. It produces the extraction CSV (with merged metrics) and total_area
     # used by RT windows (filtered_rt_windows_zoom_*, etc.) and combined (unique_peptides, etc.).
     need_chrom_for_downstream = do_rt or do_combined
     if do_chrom or need_chrom_for_downstream:

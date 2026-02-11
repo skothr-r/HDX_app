@@ -13,6 +13,7 @@
 // limitations under the License.
 
 
+#include <tuple>
 #include "Common.h"
 #include "ThreadPool.h"
 #include "CometPostAnalysis.h"
@@ -419,6 +420,10 @@ void CometPostAnalysis::CalculateSP(Results *pOutput,
 
          unsigned short usiMatchedFragmentIonCt = 0;
          unsigned short usiMaxFragCharge;
+         
+         // Vector to store matched fragment ion information for output
+         // Store as: <<ionSeries, <fragmentNumber, charge>>, <intensity, mz>>
+         vector<pair<pair<int, pair<int, int> >, pair<float, double> > > vMatchedIonsWithIntensity;
 
          // if no variable mods are used in search, clear piVarModSites here
          if (!g_staticParams.variableModParameters.bVarModSearch)
@@ -570,6 +575,13 @@ void CometPostAnalysis::CalculateSP(Results *pOutput,
 
                         // Simple sum intensity.
                         dTmpIntenMatch += fSpScore;
+                        
+                        // Store matched ion information for output (ion identity, intensity, theoretical m/z)
+                        if (g_staticParams.options.bOutputMatchedFragmentIons)
+                        {
+                           int iFragNumber = iii + 1; // fragment number (1-indexed)
+                           vMatchedIonsWithIntensity.push_back(make_pair(make_pair(iWhichIonSeries, make_pair(iFragNumber, ctCharge)), make_pair(fSpScore, dFragmentIonMass)));
+                        }
 
                         // Increase score for consecutive fragment ion series matches.
                         if (ionSeries[iWhichIonSeries].bPreviousMatch[ctCharge])
@@ -620,6 +632,13 @@ void CometPostAnalysis::CalculateSP(Results *pOutput,
 
                                           // Simple sum intensity.
                                           dTmpIntenMatch += fSpScore;
+                                          
+                                          // Store matched ion information for output (neutral loss)
+                                          if (g_staticParams.options.bOutputMatchedFragmentIons)
+                                          {
+                                             int iFragNumber = iii + 1; // fragment number (1-indexed)
+                                             vMatchedIonsWithIntensity.push_back(make_pair(make_pair(iWhichIonSeries, make_pair(iFragNumber, ctCharge)), make_pair(fSpScore, dNewMass)));
+                                          }
 
                                           // Increase score for consecutive fragment ion series matches.
                                           if (ionSeries[iWhichIonSeries].bPreviousMatch[ctCharge])
@@ -666,6 +685,13 @@ void CometPostAnalysis::CalculateSP(Results *pOutput,
 
                                           // Simple sum intensity.
                                           dTmpIntenMatch += fSpScore;
+                                          
+                                          // Store matched ion information for output (neutral loss)
+                                          if (g_staticParams.options.bOutputMatchedFragmentIons)
+                                          {
+                                             int iFragNumber = iii + 1; // fragment number (1-indexed)
+                                             vMatchedIonsWithIntensity.push_back(make_pair(make_pair(iWhichIonSeries, make_pair(iFragNumber, ctCharge)), make_pair(fSpScore, dNewMass)));
+                                          }
 
                                           // Increase score for consecutive fragment ion series matches.
                                           if (ionSeries[iWhichIonSeries].bPreviousMatch[ctCharge])
@@ -699,6 +725,339 @@ void CometPostAnalysis::CalculateSP(Results *pOutput,
          pOutput[i].fScoreSp =  (float)(( ((int)pOutput[i].fScoreSp)  * 100)  / 100.0);
 
          pOutput[i].usiMatchedIons = usiMatchedFragmentIonCt;
+         
+         // Build matched fragment ions string if requested
+         if (g_staticParams.options.bOutputMatchedFragmentIons && !vMatchedIonsWithIntensity.empty())
+         {
+            // Sort matched ions by ion series, then fragment number, then charge
+            sort(vMatchedIonsWithIntensity.begin(), vMatchedIonsWithIntensity.end());
+
+            // Deduplicate by (ionSeries, fragmentNumber) - combine intensities from different charge states; keep m/z from first occurrence (main peak)
+            // Map: (ionSeries, fragmentNumber) -> (max intensity, sum intensity, m/z)
+            map<pair<int, int>, std::tuple<float, float, double> > mapUniqueIons;
+            vector<pair<int, pair<int, int> > > vMatchedIons; // For fragment pair calculation (keep charge info)
+            
+            for (size_t j = 0; j < vMatchedIonsWithIntensity.size(); ++j)
+            {
+               int iIonSeries = vMatchedIonsWithIntensity[j].first.first;
+               int iFragNumber = vMatchedIonsWithIntensity[j].first.second.first;
+               int iCharge = vMatchedIonsWithIntensity[j].first.second.second;
+               float fIntensity = vMatchedIonsWithIntensity[j].second.first;
+               double dMz = vMatchedIonsWithIntensity[j].second.second;
+               
+               pair<int, int> key = make_pair(iIonSeries, iFragNumber);
+               
+               // Store for fragment pair calculation (keep charge info)
+               vMatchedIons.push_back(make_pair(iIonSeries, make_pair(iFragNumber, iCharge)));
+               
+               // Deduplicate: keep max intensity, sum intensities, and m/z from first occurrence
+               if (mapUniqueIons.find(key) == mapUniqueIons.end())
+               {
+                  mapUniqueIons[key] = std::make_tuple(fIntensity, fIntensity, dMz);
+               }
+               else
+               {
+                  float fMax = std::get<0>(mapUniqueIons[key]);
+                  float fSum = std::get<1>(mapUniqueIons[key]);
+                  if (fIntensity > fMax) fMax = fIntensity;
+                  fSum += fIntensity;
+                  mapUniqueIons[key] = std::make_tuple(fMax, fSum, std::get<2>(mapUniqueIons[key])); // keep existing m/z
+               }
+            }
+            
+            // Convert map to sorted vector for output
+            vector<pair<pair<int, int>, std::tuple<float, float, double> > > vUniqueIonsSorted;
+            for (auto& ion : mapUniqueIons)
+            {
+               vUniqueIonsSorted.push_back(make_pair(ion.first, ion.second));
+            }
+            sort(vUniqueIonsSorted.begin(), vUniqueIonsSorted.end());
+
+            string sIonString;
+            string sIntensityString;
+            string sMzString;
+            string sQualityString;
+            const char* szIonSeriesNames[] = {"a", "b", "c", "x", "y", "z", "z1"};
+            
+            for (size_t j = 0; j < vUniqueIonsSorted.size(); ++j)
+            {
+               int iIonSeries = vUniqueIonsSorted[j].first.first;
+               int iFragNumber = vUniqueIonsSorted[j].first.second;
+               float fMaxIntensity = std::get<0>(vUniqueIonsSorted[j].second);
+               float fSumIntensity = std::get<1>(vUniqueIonsSorted[j].second);
+               double dMz = std::get<2>(vUniqueIonsSorted[j].second);
+
+               if (j > 0)
+               {
+                  sIonString += ",";
+                  sIntensityString += ",";
+                  sMzString += ",";
+                  sQualityString += ",";
+               }
+
+               // Format: ionSeries + fragmentNumber
+               // e.g., "c2", "z4", "z1_6" (z1 ion series uses underscore before fragment number)
+               if (iIonSeries == ION_SERIES_Z1)
+               {
+                  // z1 (z+1) ions: format as "z1_N" where N is fragment number
+                  sIonString += szIonSeriesNames[iIonSeries];
+                  sIonString += "_";
+                  sIonString += to_string(iFragNumber);
+               }
+               else
+               {
+                  // Regular ions: format as "ionSeriesN" where N is fragment number
+                  sIonString += szIonSeriesNames[iIonSeries];
+                  sIonString += to_string(iFragNumber);
+               }
+               
+               // Format intensities, m/z, and quality scores
+               char szBuffer[64];
+               snprintf(szBuffer, sizeof(szBuffer), "%.1f", fMaxIntensity);
+               sIntensityString += szBuffer;
+               snprintf(szBuffer, sizeof(szBuffer), "%.4f", dMz);
+               sMzString += szBuffer;
+               if (dTmpIntenMatch > 0.0)
+                  snprintf(szBuffer, sizeof(szBuffer), "%.2f", fSumIntensity / dTmpIntenMatch); // Normalize quality score
+               else
+                  snprintf(szBuffer, sizeof(szBuffer), "0.00");
+               sQualityString += szBuffer;
+            }
+
+            pOutput[i].sMatchedFragmentIons = sIonString;
+            pOutput[i].sMatchedFragmentIonIntensities = sIntensityString;
+            pOutput[i].sMatchedFragmentIonMz = sMzString;
+            pOutput[i].sMatchedFragmentIonQualityScores = sQualityString;
+            
+            // Calculate fragment pairs (consecutive fragments in same ion series AND same charge)
+            // Group fragment numbers by (ion series, charge) to ensure pairs are from same charge state
+            map<pair<int, int>, vector<int> > mapIonSeriesChargeToFragNumbers; // <ionSeries, charge> -> fragment numbers
+            set<pair<int, pair<int, int> > > setAllFragments; // For validation: all (ionSeries, fragNumber, charge)
+            
+            for (size_t j = 0; j < vMatchedIons.size(); ++j)
+            {
+               int iIonSeries = vMatchedIons[j].first;
+               int iFragNumber = vMatchedIons[j].second.first;
+               int iCharge = vMatchedIons[j].second.second;
+               
+               pair<int, int> key = make_pair(iIonSeries, iCharge);
+               mapIonSeriesChargeToFragNumbers[key].push_back(iFragNumber);
+               setAllFragments.insert(make_pair(iIonSeries, make_pair(iFragNumber, iCharge)));
+            }
+            
+            // Remove duplicates and sort for each (ion series, charge) combination
+            for (auto& pair : mapIonSeriesChargeToFragNumbers)
+            {
+               sort(pair.second.begin(), pair.second.end());
+               pair.second.erase(unique(pair.second.begin(), pair.second.end()), pair.second.end());
+            }
+            
+            // Find consecutive fragments and build fragment pairs string
+            vector<string> vFragmentPairs;
+            set<string> setFragmentPairs; // For duplicate detection
+            
+            for (auto& pair : mapIonSeriesChargeToFragNumbers)
+            {
+               int iIonSeries = pair.first.first;
+               int iCharge = pair.first.second;
+               vector<int>& vFragNumbers = pair.second;
+               
+               // Find consecutive fragment numbers (difference of 1)
+               for (size_t k = 0; k < vFragNumbers.size() - 1; ++k)
+               {
+                  int iFrag1 = vFragNumbers[k];
+                  int iFrag2 = vFragNumbers[k + 1];
+                  
+                  if (iFrag2 == iFrag1 + 1)  // Consecutive fragments
+                  {
+                     string sFragmentPair;
+                     if (iIonSeries == ION_SERIES_Z1)
+                     {
+                        sFragmentPair = string(szIonSeriesNames[iIonSeries]) + "_" + to_string(iFrag1) + "-" + 
+                                       string(szIonSeriesNames[iIonSeries]) + "_" + to_string(iFrag2);
+                     }
+                     else
+                     {
+                        sFragmentPair = string(szIonSeriesNames[iIonSeries]) + to_string(iFrag1) + "-" + 
+                                       string(szIonSeriesNames[iIonSeries]) + to_string(iFrag2);
+                     }
+                     
+                     // Check for duplicates (shouldn't happen, but validate)
+                     if (setFragmentPairs.find(sFragmentPair) == setFragmentPairs.end())
+                     {
+                        vFragmentPairs.push_back(sFragmentPair);
+                        setFragmentPairs.insert(sFragmentPair);
+                     }
+                  }
+               }
+            }
+            
+            // VALIDATION: Check that we didn't miss any pairs
+            // For each fragment that has a neighbor (fragNumber+1) in the same (ionSeries, charge), verify pair exists
+            int iValidationMissedPairs = 0;
+            for (auto& fragInfo : setAllFragments)
+            {
+               int iIonSeries = fragInfo.first;
+               int iFragNumber = fragInfo.second.first;
+               int iCharge = fragInfo.second.second;
+               
+               // Check if fragment+1 exists with same ion series and charge
+               pair<int, pair<int, int> > neighborFrag = make_pair(iIonSeries, make_pair(iFragNumber + 1, iCharge));
+               if (setAllFragments.find(neighborFrag) != setAllFragments.end())
+               {
+                  // Neighbor exists - verify pair exists
+                  string sExpectedPair;
+                  if (iIonSeries == ION_SERIES_Z1)
+                  {
+                     sExpectedPair = string(szIonSeriesNames[iIonSeries]) + "_" + to_string(iFragNumber) + "-" + 
+                                    string(szIonSeriesNames[iIonSeries]) + "_" + to_string(iFragNumber + 1);
+                  }
+                  else
+                  {
+                     sExpectedPair = string(szIonSeriesNames[iIonSeries]) + to_string(iFragNumber) + "-" + 
+                                    string(szIonSeriesNames[iIonSeries]) + to_string(iFragNumber + 1);
+                  }
+                  
+                  if (setFragmentPairs.find(sExpectedPair) == setFragmentPairs.end())
+                  {
+                     // Missing pair - add it
+                     vFragmentPairs.push_back(sExpectedPair);
+                     setFragmentPairs.insert(sExpectedPair);
+                     iValidationMissedPairs++;
+                  }
+               }
+            }
+            
+            // Report validation if pairs were missed and recovered
+            if (iValidationMissedPairs > 0)
+            {
+               fprintf(stderr, "WARNING: Found %d missing fragment pairs for peptide %s (recovered)\n", 
+                       iValidationMissedPairs, pOutput[i].szPeptide);
+            }
+            
+            // Format fragment pairs: pipe-separated pairs, comma-separated groups
+            if (!vFragmentPairs.empty())
+            {
+               // Sort pairs for consistent output
+               sort(vFragmentPairs.begin(), vFragmentPairs.end());
+               
+               string sFragmentPairsString;
+               for (size_t p = 0; p < vFragmentPairs.size(); ++p)
+               {
+                  if (p > 0)
+                     sFragmentPairsString += ",";
+                  sFragmentPairsString += vFragmentPairs[p];
+               }
+               pOutput[i].sSingleAAOverhangFragmentPairs = sFragmentPairsString;
+            }
+            else
+            {
+               pOutput[i].sSingleAAOverhangFragmentPairs.clear();
+            }
+            
+            // Calculate single AA overhangs and map to protein positions
+            // Get peptide sequence and protein start position
+            string sPeptideSeq = string(pOutput[i].szPeptide);
+            int iPeptideLength = pOutput[i].usiLenPeptide;
+            int iProteinStart = 0;
+            if (!pOutput[i].pWhichProtein.empty())
+               iProteinStart = pOutput[i].pWhichProtein[0].iStartResidue;
+            
+            // Map to store overhangs: peptide position -> residue
+            map<int, char> mapOverhangPositions; // peptide position (1-indexed) -> residue
+            
+            // Calculate overhangs from fragment pairs
+            for (auto& pair : mapIonSeriesChargeToFragNumbers)
+            {
+               int iIonSeries = pair.first.first;
+               vector<int>& vFragNumbers = pair.second;
+               
+               // Find consecutive fragment numbers
+               for (size_t k = 0; k < vFragNumbers.size() - 1; ++k)
+               {
+                  int iFrag1 = vFragNumbers[k];
+                  int iFrag2 = vFragNumbers[k + 1];
+                  
+                  if (iFrag2 == iFrag1 + 1)  // Consecutive fragments
+                  {
+                     int iPeptidePosition = 0;
+                     char cResidue = '\0';
+                     
+                     // Calculate peptide position based on ion series type
+                     if (iIonSeries == ION_SERIES_A || iIonSeries == ION_SERIES_B || iIonSeries == ION_SERIES_C)
+                     {
+                        // N-terminal ions: fragment N means positions 1..N
+                        // Consecutive fragments N and N+1 means overhang at position N+1
+                        iPeptidePosition = iFrag2; // 1-indexed from N-term
+                        if (iPeptidePosition > 0 && iPeptidePosition <= iPeptideLength)
+                           cResidue = sPeptideSeq[iPeptidePosition - 1]; // Convert to 0-indexed
+                     }
+                     else if (iIonSeries == ION_SERIES_X || iIonSeries == ION_SERIES_Y || 
+                              iIonSeries == ION_SERIES_Z || iIonSeries == ION_SERIES_Z1)
+                     {
+                        // C-terminal ions: fragment N means last N amino acids
+                        // Consecutive fragments N and N+1 means overhang at position (length - N) from N-term
+                        iPeptidePosition = iPeptideLength - iFrag1; // Position from N-term (1-indexed)
+                        if (iPeptidePosition > 0 && iPeptidePosition <= iPeptideLength)
+                           cResidue = sPeptideSeq[iPeptidePosition - 1]; // Convert to 0-indexed
+                     }
+                     
+                     // Store overhang position
+                     if (cResidue != '\0' && iPeptidePosition > 0 && iPeptidePosition <= iPeptideLength)
+                     {
+                        mapOverhangPositions[iPeptidePosition] = cResidue;
+                     }
+                  }
+               }
+            }
+            
+            // Format single AA overhangs mapped to protein positions
+            if (!mapOverhangPositions.empty() && iProteinStart > 0)
+            {
+               vector<pair<int, char> > vOverhangsSorted;
+               for (auto& overhang : mapOverhangPositions)
+               {
+                  vOverhangsSorted.push_back(make_pair(overhang.first, overhang.second));
+               }
+               sort(vOverhangsSorted.begin(), vOverhangsSorted.end());
+               
+               string sSingleAAOverhangs;
+               string sSiteSpecificResidues;
+               for (size_t o = 0; o < vOverhangsSorted.size(); ++o)
+               {
+                  int iPeptidePos = vOverhangsSorted[o].first;
+                  char cResidue = vOverhangsSorted[o].second;
+                  int iProteinPos = iProteinStart + iPeptidePos - 1; // Map to protein position
+                  
+                  if (o > 0)
+                  {
+                     sSingleAAOverhangs += ",";
+                     sSiteSpecificResidues += ",";
+                  }
+                  
+                  // Peptide position format: "positionResidue" (e.g., "2L")
+                  sSingleAAOverhangs += to_string(iPeptidePos) + cResidue;
+                  
+                  // Protein position format: "positionResidue" (e.g., "3L")
+                  sSiteSpecificResidues += to_string(iProteinPos) + cResidue;
+               }
+               
+               pOutput[i].sSingleAAOverhangs = sSingleAAOverhangs;
+               pOutput[i].sSiteSpecificResidues = sSiteSpecificResidues;
+            }
+            else
+            {
+               pOutput[i].sSingleAAOverhangs.clear();
+               pOutput[i].sSiteSpecificResidues.clear();
+            }
+         }
+         else
+         {
+            pOutput[i].sMatchedFragmentIons.clear();
+            pOutput[i].sMatchedFragmentIonIntensities.clear();
+            pOutput[i].sMatchedFragmentIonQualityScores.clear();
+            pOutput[i].sSingleAAOverhangFragmentPairs.clear();
+         }
       }
    }
 }

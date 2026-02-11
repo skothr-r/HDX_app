@@ -549,7 +549,20 @@ bool RAWReader::readRawFile(const char *c, Spectrum &s, int scNum){
   preInfo.parScanNum = evaluateTrailerInt("Master Scan Number:");
   preInfo.charge = evaluateTrailerInt("Charge State:");
   preInfo.dMonoMZ = evaluateTrailerDouble("Monoisotopic M/Z:");
+  
+  // Try to get ion injection time from trailer first
   IIT = (float)evaluateTrailerDouble("Ion Injection Time (ms):");
+  
+  // If trailer value is 0 or missing, try alternative field names
+  if (IIT <= 0.0f) {
+    IIT = (float)evaluateTrailerDouble("Ion Injection Time:");
+    if (IIT <= 0.0f) {
+      IIT = (float)evaluateTrailerDouble("Ion Injection Time (sec):");
+      if (IIT > 0.0f) {
+        IIT *= 1000.0f;  // Convert seconds to milliseconds
+      }
+    }
+  }
   SPS = evaluateTrailerString("SPS Masses:");
   ScanDescription = evaluateTrailerString("Scan Description:");
 

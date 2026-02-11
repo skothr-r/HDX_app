@@ -103,9 +103,9 @@ PEAK_DRIFT_BUFFER_SEC = 30.0
 # Collection window extends beyond integration window by this much (seconds each side) so grey band is visibly wider.
 COLLECTION_EXTENSION_SEC = 30.0
 
-# Stage 2 significant fragments (chromatogram extraction): 5 ppm + % max MS2 intensity. Initial CSV uses 5 ppm only (run_visualization); here we further restrict to peaks above this fraction of max intensity in the summed MS2 so "significant" = Comet match + 5 ppm + above noise. Used for placed_ion_labels, red squares, rejection "no significant overhang", and output significant_fragment_* columns.
+# Stage 2 significant fragments: 5 ppm (from Step 5 accuracy filter) + optional % max MS2 intensity. Step 6 (extract) uses 5 ppm only (skip_significance_intensity_filter=True); Step 7 (refine_significant_frags) applies 0.5% + plateau. Used for placed_ion_labels, red squares, and output significant_fragment_* columns.
 SIGNIFICANT_FRAGMENT_PPM_MS2 = 5.0
-SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC = 0.005   # 0.5% of max MS2 intensity
+SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC = 0.005   # 0.5% of max MS2 intensity (Step 7 only; Step 6 skips this)
 
 # Global variable to cache MSExperiment and FeatureMap (load once, reuse many times)
 _cached_experiment = None
@@ -248,25 +248,51 @@ def find_chromatogram_peak_apex(chromatogram, ms1_rts, window_size=30.0):
     apex_point = max(peak_points, key=lambda x: x[1])
     return apex_point
 
-# Mass constants
-PROTON_MASS = 1.007276466812
+# Mass constants - aligned with Comet (CometMassSpecUtils.h, CometDataInternal.h)
+PROTON_MASS = 1.00727646688   # Comet PROTON_MASS
+_HYDROGEN_MONO = 1.007825035  # Comet Hydrogen_Mono
+_OXYGEN_MONO = 15.99491463
+_CARBON_MONO = 12.00000000
+_NITROGEN_MONO = 14.0030740
+_SULPHUR_MONO = 31.9720707
 C13_C12_DIFF = 1.0033548378  # Mass difference between C13 and C12
 
-# Monoisotopic residue masses (neutral, Da) for b/y ion m/z
+# Comet fragment offsets (from GetFragmentIonMass: c=b+NH3, z=y-NH2, z1=y-NH2+H)
+_dNH3 = _NITROGEN_MONO + 3 * _HYDROGEN_MONO   # 17.026549
+_dNH2 = _NITROGEN_MONO + 2 * _HYDROGEN_MONO   # 16.018724
+_dOH2 = _HYDROGEN_MONO + _HYDROGEN_MONO + _OXYGEN_MONO  # H2O
+
+# Monoisotopic residue masses - Comet AssignMass (pdAAMassFragment)
 _AA_MASS = {
-    'A': 71.03711, 'R': 156.10111, 'N': 114.04293, 'D': 115.02694, 'C': 103.00919,
-    'E': 129.04259, 'Q': 128.05858, 'G': 57.02146, 'H': 137.05891, 'I': 113.08406,
-    'L': 113.08406, 'K': 128.09496, 'M': 131.04049, 'F': 147.06841, 'P': 97.05276,
-    'S': 87.03203, 'T': 101.04768, 'W': 186.07931, 'Y': 163.06333, 'V': 99.06841,
+    'G': _CARBON_MONO*2 + _HYDROGEN_MONO*3 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'A': _CARBON_MONO*3 + _HYDROGEN_MONO*5 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'S': _CARBON_MONO*3 + _HYDROGEN_MONO*5 + _NITROGEN_MONO + _OXYGEN_MONO*2,
+    'P': _CARBON_MONO*5 + _HYDROGEN_MONO*7 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'V': _CARBON_MONO*5 + _HYDROGEN_MONO*9 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'T': _CARBON_MONO*4 + _HYDROGEN_MONO*7 + _NITROGEN_MONO + _OXYGEN_MONO*2,
+    'C': _CARBON_MONO*3 + _HYDROGEN_MONO*5 + _NITROGEN_MONO + _OXYGEN_MONO + _SULPHUR_MONO,
+    'L': _CARBON_MONO*6 + _HYDROGEN_MONO*11 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'I': _CARBON_MONO*6 + _HYDROGEN_MONO*11 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'N': _CARBON_MONO*4 + _HYDROGEN_MONO*6 + _NITROGEN_MONO*2 + _OXYGEN_MONO*2,
+    'D': _CARBON_MONO*4 + _HYDROGEN_MONO*5 + _NITROGEN_MONO + _OXYGEN_MONO*3,
+    'Q': _CARBON_MONO*5 + _HYDROGEN_MONO*8 + _NITROGEN_MONO*2 + _OXYGEN_MONO*2,
+    'K': _CARBON_MONO*6 + _HYDROGEN_MONO*12 + _NITROGEN_MONO*2 + _OXYGEN_MONO,
+    'E': _CARBON_MONO*5 + _HYDROGEN_MONO*7 + _NITROGEN_MONO + _OXYGEN_MONO*3,
+    'M': _CARBON_MONO*5 + _HYDROGEN_MONO*9 + _NITROGEN_MONO + _OXYGEN_MONO + _SULPHUR_MONO,
+    'H': _CARBON_MONO*6 + _HYDROGEN_MONO*7 + _NITROGEN_MONO*3 + _OXYGEN_MONO,
+    'F': _CARBON_MONO*9 + _HYDROGEN_MONO*9 + _NITROGEN_MONO + _OXYGEN_MONO,
+    'R': _CARBON_MONO*6 + _HYDROGEN_MONO*12 + _NITROGEN_MONO*4 + _OXYGEN_MONO,
+    'Y': _CARBON_MONO*9 + _HYDROGEN_MONO*9 + _NITROGEN_MONO + _OXYGEN_MONO*2,
+    'W': _CARBON_MONO*11 + _HYDROGEN_MONO*10 + _NITROGEN_MONO*2 + _OXYGEN_MONO,
 }
-# y-ion: C-term mass + 19.01839 (H2O + H+)
-_Y_ION_OFFSET = 19.01839
-# c-ion: N-term fragment + NH2 + H (neutral offset)
-_C_ION_OFFSET_NEUTRAL = 18.010564
-# z-ion: C-term fragment + N• - 2H (neutral offset vs sum of residues)
-_Z_ION_OFFSET_NEUTRAL = 3.0149 - 17.0027   # -13.9878
-# z+1: reduced z (z + H)
-_Z1_ION_OFFSET_NEUTRAL = _Z_ION_OFFSET_NEUTRAL + 1.0078  # -12.98
+
+# y-ion: C-term mass + H2O + H+ (dCtermOH2Proton)
+_Y_ION_OFFSET = _dOH2 + PROTON_MASS  # 19.01784
+
+# Comet formulas: c = b + NH3 (b = sum + PROTON), z = y - NH2 (y = sum + dOH2 + PROTON), z1 = z + H
+_C_ION_OFFSET_NEUTRAL = PROTON_MASS + _dNH3   # 18.03383
+_Z_ION_OFFSET_NEUTRAL = _dOH2 + PROTON_MASS - _dNH2   # 2.99912
+_Z1_ION_OFFSET_NEUTRAL = _Z_ION_OFFSET_NEUTRAL + _HYDROGEN_MONO   # 4.00694
 
 
 def theoretical_by_ion_mz(sequence, charge=1):
@@ -280,7 +306,7 @@ def theoretical_by_ion_mz(sequence, charge=1):
     for i in range(n - 1):
         mass_b += _AA_MASS.get(seq[i], 0)
         b_mzs.append((mass_b / charge, f'b{i+1}'))
-    mass_y = _Y_ION_OFFSET + PROTON_MASS  # y1 = C-term residue + 19 + H
+    mass_y = _Y_ION_OFFSET  # y1 = C-term residue + H2O + H (matches Comet dCtermOH2Proton)
     for i in range(n - 1):
         mass_y += _AA_MASS.get(seq[n - 1 - i], 0)
         y_mzs.append((mass_y / charge, f'y{i+1}'))
@@ -289,20 +315,22 @@ def theoretical_by_ion_mz(sequence, charge=1):
 
 def theoretical_c_z_z1_ion_mz(sequence, fragment_charge=1):
     """Return (c_list, z_list, z1_list) for sequence; each list is [(mz, label), ...]. Strips non-letter.
-    Only c, z, and z+1 ions (for ETD/ECD-style labeling on MS2)."""
+    Only c, z, and z+1 ions (for ETD/ECD-style labeling on MS2).
+    Matches Comet: m/z = (neutral + (z-1)*PROTON) / z."""
     seq = ''.join(c for c in str(sequence).upper() if c in _AA_MASS)
     if not seq:
         return [], [], []
     n = len(seq)
     c_mzs, z_mzs, z1_mzs = [], [], []
-    # c: N-term; neutral = sum(residues 1..k) + C_ION_OFFSET
-    mass_c = _C_ION_OFFSET_NEUTRAL + PROTON_MASS * fragment_charge
+    # c: N-term; neutral = sum(residues 1..k) + C_OFFSET; m/z = (neutral + (z-1)*PROTON)/z
+    protons = (fragment_charge - 1) * PROTON_MASS
+    mass_c = _C_ION_OFFSET_NEUTRAL + protons
     for i in range(n - 1):
         mass_c += _AA_MASS.get(seq[i], 0)
         c_mzs.append((mass_c / fragment_charge, f'c{i+1}'))
-    # z and z+1: C-term; same residue sums as y (z1 = last residue, z2 = last two, ...)
-    mass_z = _Z_ION_OFFSET_NEUTRAL + PROTON_MASS * fragment_charge
-    mass_z1 = _Z1_ION_OFFSET_NEUTRAL + PROTON_MASS * fragment_charge
+    # z and z+1: C-term; same residue sums as y
+    mass_z = _Z_ION_OFFSET_NEUTRAL + protons
+    mass_z1 = _Z1_ION_OFFSET_NEUTRAL + protons
     for i in range(n - 1):
         mass_z += _AA_MASS.get(seq[n - 1 - i], 0)
         mass_z1 += _AA_MASS.get(seq[n - 1 - i], 0)
@@ -365,6 +393,68 @@ def comet_matched_ions_to_theoretical_mz(comet_ion_names, peptide, fragment_char
         if mz is not None and label is not None:
             result.append((mz, label))
     return result
+
+
+def get_best_theoretical_match(ion_name, peptide, observed_mz, charges=(1, 2, 3, 4, 5)):
+    """
+    Charge-agnostic match: try all plausible fragment charges (z=1..5), pick the
+    hypothesis with minimum |ppm|. ppm is a property of the match, not the instrument—
+    wrong charge hypothesis explodes ppm even with perfect measurement.
+    Returns (theoretical_mz, best_charge, ppm) or None if no valid match.
+    """
+    best_theo, best_charge, best_ppm = None, None, float('inf')
+    for z in charges:
+        theo_list = comet_matched_ions_to_theoretical_mz([ion_name], peptide, fragment_charge=z)
+        if not theo_list:
+            continue
+        theo_mz = theo_list[0][0]
+        if theo_mz <= 0:
+            continue
+        ppm = abs(observed_mz - theo_mz) / theo_mz * 1e6
+        if ppm < best_ppm:
+            best_ppm = ppm
+            best_theo = theo_mz
+            best_charge = z
+    if best_theo is not None:
+        return (best_theo, best_charge, best_ppm)
+    return None
+
+
+def matches_b_or_y_ion(ion_name, peptide, observed_mz, ppm_threshold, charges=(1, 2, 3, 4, 5)):
+    """
+    For Comet c/z ion at same cleavage, check if observed m/z matches b or y theoretical.
+    Returns True if observed matches b or y within ppm → reject as CID/HCD mis-assignment.
+    """
+    seq = ''.join(c for c in str(peptide).upper() if c in _AA_MASS)
+    if not seq:
+        return False
+    n = len(seq)
+    k = None
+    if ion_name.startswith('c') and ion_name[1:].isdigit():
+        k = int(ion_name[1:])
+    elif ion_name.startswith('z1_'):
+        k = n - int(ion_name.split('_')[-1])
+    elif ion_name.startswith('z') and ion_name[1:].isdigit():
+        k = n - int(ion_name[1:])
+    if k is None or k < 1 or k >= n:
+        return False
+    mass_b = PROTON_MASS
+    for i in range(k):
+        mass_b += _AA_MASS.get(seq[i], 0)
+    mass_y = _Y_ION_OFFSET
+    for i in range(k, n):
+        mass_y += _AA_MASS.get(seq[i], 0)
+    for z in charges:
+        protons = (z - 1) * PROTON_MASS
+        b_mz = (mass_b + protons) / z
+        y_mz = (mass_y + protons) / z
+        for theo in (b_mz, y_mz):
+            if theo <= 0:
+                continue
+            ppm = abs(observed_mz - theo) / theo * 1e6
+            if ppm <= ppm_threshold:
+                return True
+    return False
 
 
 def _display_label_for_comet_ion(name):
@@ -2380,13 +2470,6 @@ def run_plots_from_dataframe(args):
     print(f"[DEBUG] Plot-from-dataframe: accepted CSV -> {os.path.abspath(accepted_csv)} ({len(accepted_df)} rows)")
     print(f"[DEBUG] Plot-from-dataframe: rejected CSV -> {os.path.abspath(rejected_csv)} ({len(rejected_df)} rows)")
 
-    # Write peak_windows.csv (accepted only) to dataframes_dir so combined step can find it
-    dataframes_dir = getattr(args, 'dataframes_dir', None)
-    if dataframes_dir and os.path.isdir(dataframes_dir) and len(accepted_no_status) > 0:
-        peak_windows_path = os.path.join(dataframes_dir, 'peak_windows.csv')
-        accepted_no_status.to_csv(peak_windows_path, index=False)
-        print(f"[DEBUG] Plot-from-dataframe: peak_windows.csv -> {os.path.abspath(peak_windows_path)}")
-
     # Build scatter data from df for all peptides (coelution_score, shape_corr, etc.)
     df_all = df.copy()
 
@@ -2424,6 +2507,8 @@ def run_chromatograms(args):
     extract_only = getattr(args, 'extract_only', False)
     plot_only = getattr(args, 'plot_only', False)
     no_psm_filter = getattr(args, 'no_psm_filter', False)
+    # Step 6 (extract): skip 0.5% intensity filter; significance filter applied in Step 7 (refine_significant_frags)
+    skip_significance_intensity_filter = getattr(args, 'skip_significance_intensity_filter', False)
 
     if plot_only:
         run_plots_from_dataframe(args)
@@ -2879,7 +2964,7 @@ def run_chromatograms(args):
         "score=0.28 coel + 0.28 shape + 0.14 ratio + 0.12 RT_cov + 0.05 rt_prior + 0.05 quality + 0.20 strength | "
         "accept: apex ≥ 10^5 (reject noise) | M+0>M+1 or M+1>M+2 in window | PSM: q≤0.05, PEP≤0.05 (best PSM; no E-value threshold)"
     )
-    MIN_SCANS_REQUIRED = 1  # need >= 1 scan (within 5ppm); envelope: M+0>M+1 or M+1>M+2
+    MIN_SCANS_REQUIRED = 1  # need >= 1 scan with valid MS1 RT; envelope: M+0>M+1 or M+1>M+2 in window
     MIN_APEX_INTENSITY = 1e5  # apex peak below this is treated as noise; pretty much never select below 10^5
     # PSM score thresholds: reject peptide if its best PSM exceeds any of these (aligned with scatter-plot reference lines)
     FILTER_PSM_QVALUE_MAX = 0.05   # reject if best PSM q-value > this (q ≤ 0.05 acceptable)
@@ -3470,11 +3555,11 @@ def run_chromatograms(args):
                         all_peptide_scatter_data[peptide_key] = _scatter_sentinel_with_overlay(peptide_key)
                     elif pass_num == 1:
                         _save_early_rejected_figure(group, peptide_key, current_peptide_1based, num_peptides,
-                            f"Need >=1 scan within 5ppm (has {n_spectra}); filter: >=1 scan, M0>M+1>M+2>0",
+                            f"Need >=1 scan with MS1 RT (has {n_spectra}); envelope: M0>M+1 or M+1>M+2 in window",
                             rejected_dir, FILTERING_CRITERIA, early_rejected_paths)
                         rejection_counts['Need >=1 scan'] += 1
                         print(f"[DEBUG] Peptide {current_peptide_1based}/{num_peptides}: {peptide_key} -> early-rejected (need >=1 scan, has {n_spectra})")
-                    print(f"[DEBUG]   Warning: peptide has {n_spectra} scans (filter requires >=1 scan within 5ppm, M0>M+1>M+2>0), skipping")
+                    print(f"[DEBUG]   Warning: peptide has {n_spectra} scans (need >=1 with MS1 RT; envelope M0>M+1 or M+1>M+2), skipping")
                     continue
                 if n_spectra >= 2 and ms1_rts_table and idx < 3:
                     rt_span_sec = max(ms1_rts_table) - min(ms1_rts_table)
@@ -4547,7 +4632,7 @@ def run_chromatograms(args):
                         y_max_pre = np.max(ms2_ints_pre) * 1.05 if len(ms2_ints_pre) > 0 else 1.0
                         label_placements_pre = _ms2_label_positions_no_overlap(
                             ion_mz_labels_pre, ms2_mzs_pre, ms2_ints_pre, y_max_pre, ppm_ms2=SIGNIFICANT_FRAGMENT_PPM_MS2, label_offset_frac=0.06,
-                            mz_near=40.0, min_y_sep_frac=0.045, min_intensity_frac=SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC)
+                            mz_near=40.0, min_y_sep_frac=0.045, min_intensity_frac=(0.0 if skip_significance_intensity_filter else SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC))
                         significant_frag_count = len(label_placements_pre)
                 # Add annotations to individual figure (pass all table RTs so both clusters visible)
                 n_scan_rts = len([rt for rt in ms1_rts_table if rt and rt > 0])
@@ -5326,7 +5411,7 @@ def run_chromatograms(args):
                         # Non-overlapping label positions (Stage 2 significant: 5 ppm + % max intensity)
                         label_placements = _ms2_label_positions_no_overlap(
                             ion_mz_labels, ms2_mzs, ms2_ints, y_max_ms2, ppm_ms2=SIGNIFICANT_FRAGMENT_PPM_MS2, label_offset_frac=0.14,
-                            mz_near=80.0, min_y_sep_frac=0.12, min_intensity_frac=SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC, horizontal_offset_mz=18.0)
+                            mz_near=80.0, min_y_sep_frac=0.12, min_intensity_frac=(0.0 if skip_significance_intensity_filter else SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC), horizontal_offset_mz=18.0)
                         placed_ion_labels = {ion_label for (_x, _y, ion_label, _xy) in label_placements}
                         clean_peptide_ms2 = re.sub(r'\[.*?\]', '', peptide) if peptide else ''
                         row0 = group.iloc[0]
@@ -7111,6 +7196,11 @@ def run_chromatograms(args):
                         peak_window_data['coelution_score'] = coelution_score
                 except:
                     pass
+                try:
+                    if 'shape_corr' in locals() and shape_corr is not None:
+                        peak_window_data['shape_corr'] = shape_corr
+                except:
+                    pass
         
                 all_peak_windows.append(peak_window_data)
 
@@ -7120,23 +7210,6 @@ def run_chromatograms(args):
                 else:
                     total_1d = np.sum(intensity_matrix, axis=1) if intensity_matrix.ndim == 2 else np.asarray(intensity_matrix, dtype=float)
                     traces_list.append((np.asarray(rts, dtype=float), np.asarray(total_1d, dtype=float)))
-
-                # Write dataframe after each chromatogram extraction (progress persistence / recovery if interrupted)
-                try:
-                    if extract_only:
-                        _inc_dir = getattr(args, 'extract_output_dir', None) or os.path.dirname(os.path.abspath(output_png))
-                    else:
-                        _inc_dir = output_dir
-                    _inc_dirs = [_inc_dir]
-                    _df_dir = getattr(args, 'dataframes_dir', None)
-                    if _df_dir:
-                        _inc_dirs.append(_df_dir)
-                    _df_inc = pd.DataFrame(all_peak_windows)
-                    for _d in _inc_dirs:
-                        os.makedirs(_d, exist_ok=True)
-                        _df_inc.to_csv(os.path.join(_d, 'peak_windows_all.csv'), index=False)
-                except Exception:
-                    pass  # non-fatal; final write at end will still run
 
                 if extract_only:
                     if current_peptide_1based % 10 == 0 or current_peptide_1based == num_peptides:
@@ -7299,21 +7372,6 @@ def run_chromatograms(args):
         # Metrics CSV (used by plot-from-dataframe)
         metrics_path = os.path.join(extract_output_dir, 'chromatogram_metrics_all.csv')
         df_extract.to_csv(metrics_path, index=False)
-        # Chromatogram window dataframes (same data) for downstream: peak_windows_all.csv, peak_windows.csv
-        peak_windows_all_path = os.path.join(extract_output_dir, 'peak_windows_all.csv')
-        df_extract.to_csv(peak_windows_all_path, index=False)
-        accepted_windows = [w for w in all_peak_windows if w.get('status') == 'accepted']
-        drop_cols = [c for c in ('status', 'rejection_reason') if c in df_extract.columns]
-        if accepted_windows:
-            df_accepted = pd.DataFrame(accepted_windows).drop(columns=drop_cols, errors='ignore')
-            peak_windows_path = os.path.join(extract_output_dir, 'peak_windows.csv')
-            df_accepted.to_csv(peak_windows_path, index=False)
-        dataframes_dir = getattr(args, 'dataframes_dir', None)
-        if dataframes_dir and os.path.isdir(dataframes_dir):
-            df_extract.to_csv(os.path.join(dataframes_dir, 'peak_windows_all.csv'), index=False)
-            if accepted_windows:
-                df_accepted = pd.DataFrame(accepted_windows).drop(columns=drop_cols, errors='ignore')
-                df_accepted.to_csv(os.path.join(dataframes_dir, 'peak_windows.csv'), index=False)
         npz_path = os.path.join(extract_output_dir, 'chromatogram_traces.npz')
         save_dict = {}
         for i, (rts_arr, int_arr) in enumerate(traces_list):
@@ -7327,12 +7385,7 @@ def run_chromatograms(args):
         print(f"  Output folder: {out_abs}")
         print("  Files written:")
         print(f"    · chromatogram_metrics_all.csv   — metrics for all peptides")
-        print(f"    · peak_windows_all.csv          — peak/window data (all)")
-        if accepted_windows:
-            print(f"    · peak_windows.csv              — peak/window data (accepted only)")
         print(f"    · chromatogram_traces.npz        — RT/intensity traces for plotting")
-        if dataframes_dir and os.path.isdir(dataframes_dir):
-            print(f"  Also copied peak_windows*.csv to: {os.path.abspath(dataframes_dir)}")
         print("  To generate plots later, run:")
         print(f"    plot-from-dataframe --plot-only --chromatogram-metrics-csv \"{out_abs}/chromatogram_metrics_all.csv\" --chromatogram-traces \"{out_abs}/chromatogram_traces.npz\"")
         print("")
@@ -7413,10 +7466,13 @@ def run_chromatograms(args):
         from matplotlib.gridspec import GridSpec
         from matplotlib.ticker import MultipleLocator as _ML
         fig_overview = plt.figure(figsize=(22, 28))
+        fig_overview.patch.set_facecolor('black')
         gs_overview = GridSpec(3, 1, figure=fig_overview, height_ratios=[1, 1, 4], hspace=0.35)
         ax_overview = fig_overview.add_subplot(gs_overview[0])
         ax_overview_log = fig_overview.add_subplot(gs_overview[1], sharex=ax_overview)
         ax_overview_tracks = fig_overview.add_subplot(gs_overview[2])
+        for ax in (ax_overview, ax_overview_log, ax_overview_tracks):
+            ax.set_facecolor('black')
         # Full RT range from data (rts are in seconds); ensure overlay spans actual run, not squashed into first minutes
         if overlay_data:
             all_rts_sec = np.concatenate([np.asarray(item['rts'], dtype=float).ravel() for item in overlay_data])
@@ -7456,6 +7512,17 @@ def run_chromatograms(args):
                 if np.isfinite(m):
                     y_max_ov = max(y_max_ov, m)
         # Top: linear scale (raw intensity, no gap-breaking so lines always draw)
+        x_max_ov_plot = x_max_ov if x_max_ov > x_min_ov else x_min_ov + 1.0
+        # Designated windows (integration = green, collection = gray) — draw first so behind traces
+        for item in overlay_data:
+            min_rt_m = item.get('min_rt')
+            max_rt_m = item.get('max_rt')
+            cmin = item.get('collection_min_rt')
+            cmax = item.get('collection_max_rt')
+            if min_rt_m is not None and max_rt_m is not None:
+                ax_overview.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+            if cmin is not None and cmax is not None:
+                ax_overview.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
         for i, item in enumerate(overlay_data):
             rts_sec = item['rts']
             rts_min_overlay = np.asarray(rts_sec, dtype=float) / 60.0
@@ -7467,20 +7534,11 @@ def run_chromatograms(args):
                 color = cmap_overview(area_norm_overview(ta))
             else:
                 color = (0.6, 0.6, 0.6, 0.8)
-            ax_overview.plot(rts_min_overlay, total_ints, color=color, alpha=0.5, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
-        ax_overview.set_ylabel('Intensity', fontsize=13, fontfamily='serif')
-        ax_overview.set_title('Accepted Peptides – Raw Intensity (green = integration window, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif')
-        x_max_ov_plot = x_max_ov if x_max_ov > x_min_ov else x_min_ov + 1.0
-        # Designated windows (integration = green, collection = gray) on linear panel
-        for item in overlay_data:
-            min_rt_m = item.get('min_rt')
-            max_rt_m = item.get('max_rt')
-            cmin = item.get('collection_min_rt')
-            cmax = item.get('collection_max_rt')
-            if min_rt_m is not None and max_rt_m is not None:
-                ax_overview.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.12, color='green', zorder=0)
-            if cmin is not None and cmax is not None:
-                ax_overview.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.06, color=COLLECTION_WINDOW_COLOR, zorder=0)
+            color_rgb = color[:3] if len(color) >= 3 else color
+            ax_overview.fill_between(rts_min_overlay, 0, total_ints, color=color_rgb, alpha=0.35, zorder=5)
+            ax_overview.plot(rts_min_overlay, total_ints, color=color_rgb, alpha=0.5, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
+        ax_overview.set_ylabel('Intensity', fontsize=13, fontfamily='serif', color='0.85')
+        ax_overview.set_title('Accepted Peptides – Raw Intensity (green = integration window, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
         ax_overview.set_xlim(left=x_min_ov, right=x_max_ov_plot)
         ax_overview.xaxis.set_major_locator(_ML(max(0.5, (x_max_ov_plot - x_min_ov) / 10)))
         ax_overview.xaxis.set_minor_locator(_ML(max(0.1, (x_max_ov_plot - x_min_ov) / 30)))
@@ -7493,11 +7551,13 @@ def run_chromatograms(args):
                         y_max_ov = max(y_max_ov, m)
         if y_max_ov > 0:
             ax_overview.set_ylim(0, y_max_ov * 1.1)
-        ax_overview.tick_params(labelsize=11)
+        ax_overview.tick_params(labelsize=11, colors='0.85')
         for label in ax_overview.get_xticklabels() + ax_overview.get_yticklabels():
             label.set_fontfamily('serif')
-        ax_overview.grid(True, alpha=0.3)
-        ax_overview.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1)
+        ax_overview.grid(True, alpha=0.25)
+        for spine in ax_overview.spines.values():
+            spine.set_color('0.6')
+        ax_overview.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1, labelcolor='0.9')
         # Bottom: log scale (reveals tails and coelution; diagnostic)
         y_floor = 1.0  # avoid log(0)
         for item in overlay_data:
@@ -7506,9 +7566,9 @@ def run_chromatograms(args):
             cmin = item.get('collection_min_rt')
             cmax = item.get('collection_max_rt')
             if min_rt_m is not None and max_rt_m is not None:
-                ax_overview_log.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.12, color='green', zorder=0)
+                ax_overview_log.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
             if cmin is not None and cmax is not None:
-                ax_overview_log.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.06, color=COLLECTION_WINDOW_COLOR, zorder=0)
+                ax_overview_log.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
         for i, item in enumerate(overlay_data):
             rts_sec = item['rts']
             rts_min_overlay = np.asarray(rts_sec, dtype=float) / 60.0
@@ -7521,20 +7581,24 @@ def run_chromatograms(args):
                 color = cmap_overview(area_norm_overview(ta))
             else:
                 color = (0.6, 0.6, 0.6, 0.8)
-            ax_overview_log.plot(rts_min_overlay, total_ints_log, color=color, alpha=0.5, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
-        ax_overview_log.set_ylabel('Intensity (log)', fontsize=13, fontfamily='serif')
+            color_rgb = color[:3] if len(color) >= 3 else color
+            ax_overview_log.fill_between(rts_min_overlay, y_floor, total_ints_log, color=color_rgb, alpha=0.35, zorder=5)
+            ax_overview_log.plot(rts_min_overlay, total_ints_log, color=color_rgb, alpha=0.5, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
+        ax_overview_log.set_ylabel('Intensity (log)', fontsize=13, fontfamily='serif', color='0.85')
         ax_overview_log.set_yscale('log')
-        ax_overview_log.set_title('Accepted Peptides – Raw Intensity (log; green = integration, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif')
+        ax_overview_log.set_title('Accepted Peptides – Raw Intensity (log; green = integration, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
         ax_overview_log.set_xlim(left=x_min_ov, right=x_max_ov_plot)
         ax_overview_log.xaxis.set_major_locator(_ML(max(0.5, (x_max_ov_plot - x_min_ov) / 10)))
         ax_overview_log.xaxis.set_minor_locator(_ML(max(0.1, (x_max_ov_plot - x_min_ov) / 30)))
         if y_max_ov > 0:
             ax_overview_log.set_ylim(y_floor, y_max_ov * 2.0)
-        ax_overview_log.tick_params(labelsize=11)
+        ax_overview_log.tick_params(labelsize=11, colors='0.85')
         for label in ax_overview_log.get_xticklabels() + ax_overview_log.get_yticklabels():
             label.set_fontfamily('serif')
-        ax_overview_log.grid(True, alpha=0.3, which='both')
-        ax_overview_log.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1)
+        ax_overview_log.grid(True, alpha=0.25, which='both')
+        for spine in ax_overview_log.spines.values():
+            spine.set_color('0.6')
+        ax_overview_log.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1, labelcolor='0.9')
         # Third panel: track-offset (ridgeline) — per-peptide normalized to 0–1 for shape comparison (raw intensity in linear/log above)
         track_height = 1.0
         track_gap = 0.15
@@ -7565,31 +7629,46 @@ def run_chromatograms(args):
                 lab = str(lab)[:19] + '…'
             ax_overview_tracks.text(x_min_tracks - label_pad_min, y_offset + track_height * 0.5, lab,
                                     va='center', ha='right', fontsize=7, fontfamily='serif')
-        ax_overview_tracks.set_xlabel('MS1 Retention Time (min)', fontsize=13, fontfamily='serif')
-        ax_overview_tracks.set_ylabel('Track (shape norm.)', fontsize=11, fontfamily='serif')
-        ax_overview_tracks.set_title('Accepted Peptides – Tracks (shape only: each trace max=1; x zoomed to integration windows)', fontsize=14, fontweight='bold', fontfamily='serif')
+        # RT windows on tracks panel (green/gray)
+        for item in overlay_data:
+            min_rt_m = item.get('min_rt')
+            max_rt_m = item.get('max_rt')
+            cmin = item.get('collection_min_rt')
+            cmax = item.get('collection_max_rt')
+            if min_rt_m is not None and max_rt_m is not None:
+                ax_overview_tracks.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+            if cmin is not None and cmax is not None:
+                ax_overview_tracks.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+        ax_overview_tracks.set_xlabel('MS1 Retention Time (min)', fontsize=13, fontfamily='serif', color='0.85')
+        ax_overview_tracks.set_ylabel('Track (shape norm.)', fontsize=11, fontfamily='serif', color='0.85')
+        ax_overview_tracks.set_title('Accepted Peptides – Tracks (shape only: each trace max=1; x zoomed to integration windows)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
         ax_overview_tracks.set_xlim(left=x_min_tracks - label_pad_min - 0.5, right=x_max_tracks + 0.3)
         _span_t = (x_max_tracks + 0.3) - (x_min_tracks - label_pad_min - 0.5)
         ax_overview_tracks.xaxis.set_major_locator(_ML(max(0.5, _span_t / 10)))
         ax_overview_tracks.xaxis.set_minor_locator(_ML(max(0.1, _span_t / 30)))
         ax_overview_tracks.set_ylim(-0.3, n_tracks * (track_height + track_gap) - track_gap + 0.3)
-        ax_overview_tracks.tick_params(labelsize=11)
+        ax_overview_tracks.tick_params(labelsize=11, colors='0.85')
         for label in ax_overview_tracks.get_xticklabels() + ax_overview_tracks.get_yticklabels():
             label.set_fontfamily('serif')
         ax_overview_tracks.set_yticks([])
         ax_overview_tracks.tick_params(axis='y', left=False)
-        ax_overview_tracks.grid(True, alpha=0.3, axis='x')
+        ax_overview_tracks.grid(True, alpha=0.25, axis='x')
+        for spine in ax_overview_tracks.spines.values():
+            spine.set_color('0.6')
+        # Track row labels need light color on black
+        for txt in ax_overview_tracks.texts:
+            txt.set_color('0.9')
         if area_norm_overview is not None:
             sm_overview = ScalarMappable(norm=area_norm_overview, cmap=cmap_overview)
             sm_overview.set_array([])
             cbar_overview = fig_overview.colorbar(sm_overview, ax=[ax_overview, ax_overview_log, ax_overview_tracks], shrink=0.5, aspect=25, pad=0.08)
-            cbar_overview.set_label('total_area (MS1 peak)', fontsize=12, fontweight='bold', fontfamily='serif')
-            cbar_overview.ax.tick_params(labelsize=10)
+            cbar_overview.set_label('total_area (MS1 peak)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
+            cbar_overview.ax.tick_params(labelsize=10, colors='0.85')
             for label in cbar_overview.ax.get_xticklabels():
                 label.set_fontfamily('serif')
         fig_overview.tight_layout(rect=[0, 0, 0.82, 1], pad=1.2)
         overview_path = os.path.join(output_dir, 'all_peptides_overlay.png')
-        fig_overview.savefig(overview_path, dpi=150, bbox_inches='tight', pad_inches=0.25, facecolor='white')
+        fig_overview.savefig(overview_path, dpi=150, bbox_inches='tight', pad_inches=0.25, facecolor='black')
         plt.close(fig_overview)
         print(f"[DEBUG] Overview overlay plot (linear + log + track subplots) saved to: {os.path.abspath(overview_path)}")
 
@@ -7599,7 +7678,19 @@ def run_chromatograms(args):
         n_tr = len(overlay_data)
         fig_h_tracks = max(12, 0.38 * n_tr)
         fig_tracks, ax_tracks = plt.subplots(figsize=(20, fig_h_tracks))
+        fig_tracks.patch.set_facecolor('black')
+        ax_tracks.set_facecolor('black')
         label_pad = 1.2
+        # RT windows (green = integration, gray = collection) — draw first
+        for item in overlay_data:
+            min_rt_m = item.get('min_rt')
+            max_rt_m = item.get('max_rt')
+            cmin = item.get('collection_min_rt')
+            cmax = item.get('collection_max_rt')
+            if min_rt_m is not None and max_rt_m is not None:
+                ax_tracks.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+            if cmin is not None and cmax is not None:
+                ax_tracks.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
         for i, item in enumerate(overlay_data):
             rts_min = np.asarray(item['rts'], dtype=float) / 60.0
             I = np.asarray(item['total_intensities'], dtype=float)
@@ -7620,20 +7711,23 @@ def run_chromatograms(args):
             lab = item.get('label') or f'#{i+1}'
             if len(str(lab)) > 28:
                 lab = str(lab)[:25] + '…'
-            ax_tracks.text(x_min_tracks - label_pad, y0 + track_h * 0.5, lab, va='center', ha='right', fontsize=8, fontfamily='serif')
-        ax_tracks.set_xlabel('MS1 Retention Time (min)', fontsize=13, fontfamily='serif')
-        ax_tracks.set_ylabel('Track (shape norm.)', fontsize=11, fontfamily='serif')
-        ax_tracks.set_title('Accepted Peptides – Tracks (per-peptide normalized; x zoomed to integration windows)', fontsize=14, fontweight='bold', fontfamily='serif')
+            ax_tracks.text(x_min_tracks - label_pad, y0 + track_h * 0.5, lab, va='center', ha='right', fontsize=8, fontfamily='serif', color='0.9')
+        ax_tracks.set_xlabel('MS1 Retention Time (min)', fontsize=13, fontfamily='serif', color='0.85')
+        ax_tracks.set_ylabel('Track (shape norm.)', fontsize=11, fontfamily='serif', color='0.85')
+        ax_tracks.set_title('Accepted Peptides – Tracks (per-peptide normalized; x zoomed to integration windows)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
         ax_tracks.set_xlim(x_min_tracks - label_pad - 0.5, x_max_tracks + 0.3)
         ax_tracks.set_ylim(-0.3, n_tr * (track_h + track_gap) - track_gap + 0.3)
         ax_tracks.set_yticks([])
         ax_tracks.tick_params(axis='y', left=False)
-        ax_tracks.grid(True, alpha=0.3, axis='x')
+        ax_tracks.tick_params(axis='x', labelsize=11, colors='0.85')
         for label in ax_tracks.get_xticklabels():
             label.set_fontfamily('serif')
+        ax_tracks.grid(True, alpha=0.25, axis='x')
+        for spine in ax_tracks.spines.values():
+            spine.set_color('0.6')
         fig_tracks.tight_layout()
         tracks_only_path = os.path.join(output_dir, 'all_peptides_overlay_tracks_only.png')
-        fig_tracks.savefig(tracks_only_path, dpi=150, bbox_inches='tight', facecolor='white')
+        fig_tracks.savefig(tracks_only_path, dpi=150, bbox_inches='tight', facecolor='black')
         plt.close(fig_tracks)
         print(f"[DEBUG] Standalone tracks plot saved to: {os.path.abspath(tracks_only_path)}")
 
@@ -7675,10 +7769,13 @@ def run_chromatograms(args):
                 coll_max = float(coll_max) / 60.0
                 ax_sky_lin.axvspan(coll_min, coll_max, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
                 ax_sky_log.axvspan(coll_min, coll_max, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
-            # Full trace: low opacity, thin (emphasizes region below 10^4 as faint)
-            ax_sky_lin.plot(rts_min, I, alpha=0.12, linewidth=1.0, color=color_rgb, zorder=5)
+            # Semi-opaque shaded fill under traces (keep chromatogram style)
+            ax_sky_lin.fill_between(rts_min, 0, I, color=color_rgb, alpha=0.35, zorder=5)
             I_log = np.maximum(I, y_floor_log)
-            ax_sky_log.plot(rts_min, I_log, alpha=0.12, linewidth=1.0, color=color_rgb, zorder=5)
+            ax_sky_log.fill_between(rts_min, y_floor_log, I_log, color=color_rgb, alpha=0.35, zorder=5)
+            # Full trace: low opacity, thin (emphasizes region below 10^4 as faint)
+            ax_sky_lin.plot(rts_min, I, alpha=0.12, linewidth=1.0, color=color_rgb, zorder=6)
+            ax_sky_log.plot(rts_min, I_log, alpha=0.12, linewidth=1.0, color=color_rgb, zorder=6)
             # Contiguous segments where I >= 10^4: thicker and more opaque
             above = (I >= INTENSITY_HIGH_THRESH).astype(np.int8)
             if np.any(above):
@@ -7912,10 +8009,29 @@ def run_chromatograms(args):
             from matplotlib.gridspec import GridSpec
             from matplotlib.ticker import MultipleLocator
             fig_zoom_all = plt.figure(figsize=(14, 16))
+            fig_zoom_all.patch.set_facecolor('black')
             gs_za = GridSpec(3, 1, figure=fig_zoom_all, height_ratios=[1, 1, 2], hspace=0.3)
             ax_z_lin = fig_zoom_all.add_subplot(gs_za[0])
             ax_z_log = fig_zoom_all.add_subplot(gs_za[1], sharex=ax_z_lin)
             ax_z_tr = fig_zoom_all.add_subplot(gs_za[2], sharex=ax_z_lin)
+            for ax in (ax_z_lin, ax_z_log, ax_z_tr):
+                ax.set_facecolor('black')
+            # RT windows (green = integration, gray = collection) — draw first
+            for entry in all_zoom:
+                min_rt_m = entry.get('min_rt')
+                max_rt_m = entry.get('max_rt')
+                cmin = entry.get('collection_min_rt')
+                cmax = entry.get('collection_max_rt')
+                if min_rt_m is not None and max_rt_m is not None:
+                    min_m, max_m = float(min_rt_m) / 60.0, float(max_rt_m) / 60.0
+                    ax_z_lin.axvspan(min_m, max_m, alpha=0.06, color='green', zorder=0)
+                    ax_z_log.axvspan(min_m, max_m, alpha=0.06, color='green', zorder=0)
+                    ax_z_tr.axvspan(min_m, max_m, alpha=0.06, color='green', zorder=0)
+                if cmin is not None and cmax is not None:
+                    cm, cx = float(cmin) / 60.0, float(cmax) / 60.0
+                    ax_z_lin.axvspan(cm, cx, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+                    ax_z_log.axvspan(cm, cx, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+                    ax_z_tr.axvspan(cm, cx, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
             y_max_zoom = 0.0
             for entry in all_zoom:
                 rts_min_z = np.asarray(entry['rts_min'], dtype=float)
@@ -7929,24 +8045,38 @@ def run_chromatograms(args):
                     color = cmap_zoom(area_norm_zoom(ta))
                 else:
                     color = (0.3, 0.3, 0.3, 0.9)
-                ax_z_lin.plot(rts_min_z, total_z, color=color, linewidth=1.5, alpha=0.8)
+                color_rgb = color[:3] if len(color) >= 3 else color
+                # Lines: lower opacity below 10^5, thicker and more opaque above
+                low_z = np.where(total_z < 1e5, total_z, np.nan)
+                high_z = np.where(total_z >= 1e5, total_z, np.nan)
+                ax_z_lin.plot(rts_min_z, low_z, color=color_rgb, linewidth=1.0, alpha=0.35, zorder=5)
+                ax_z_lin.plot(rts_min_z, high_z, color=color_rgb, linewidth=2.5, alpha=0.95, zorder=5)
                 total_log = np.maximum(total_z, 1.0)
-                ax_z_log.plot(rts_min_z, total_log, color=color, linewidth=1.5, alpha=0.8)
+                low_log = np.where(total_log < 1e5, total_log, np.nan)
+                high_log = np.where(total_log >= 1e5, total_log, np.nan)
+                ax_z_log.plot(rts_min_z, low_log, color=color_rgb, linewidth=1.0, alpha=0.35, zorder=5)
+                ax_z_log.plot(rts_min_z, high_log, color=color_rgb, linewidth=2.5, alpha=0.95, zorder=5)
             ax_z_lin.set_xlim(x_min_all_min, x_max_all_min)
             ax_z_lin.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
             ax_z_lin.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
-            ax_z_lin.set_ylabel('Intensity', fontsize=11, fontfamily='serif')
-            ax_z_lin.set_title('All peptides (linear)', fontsize=12, fontweight='bold', fontfamily='serif')
+            ax_z_lin.set_ylabel('Intensity', fontsize=11, fontfamily='serif', color='0.85')
+            ax_z_lin.set_title('All peptides (linear)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
             if y_max_zoom > 0:
                 ax_z_lin.set_ylim(0, y_max_zoom * 1.1)
-            ax_z_lin.grid(True, alpha=0.3, which='both')
+            ax_z_lin.grid(True, alpha=0.25, which='both')
+            ax_z_lin.tick_params(colors='0.85')
+            for spine in ax_z_lin.spines.values():
+                spine.set_color('0.6')
             ax_z_log.set_yscale('log')
             ax_z_log.set_xlim(x_min_all_min, x_max_all_min)
-            ax_z_log.set_ylabel('Intensity (log)', fontsize=11, fontfamily='serif')
-            ax_z_log.set_title('All peptides (log scale)', fontsize=12, fontweight='bold', fontfamily='serif')
+            ax_z_log.set_ylabel('Intensity (log)', fontsize=11, fontfamily='serif', color='0.85')
+            ax_z_log.set_title('All peptides (log scale)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
             if y_max_zoom > 0:
                 ax_z_log.set_ylim(1.0, y_max_zoom * 2.0)
-            ax_z_log.grid(True, alpha=0.3, which='both')
+            ax_z_log.grid(True, alpha=0.25, which='both')
+            ax_z_log.tick_params(colors='0.85')
+            for spine in ax_z_log.spines.values():
+                spine.set_color('0.6')
             track_h_z = 1.0
             track_gap_z = 0.12
             for i, entry in enumerate(all_zoom):
@@ -7963,29 +8093,31 @@ def run_chromatograms(args):
                     color = cmap_zoom(area_norm_zoom(ta))
                 else:
                     color = (0.4, 0.4, 0.4, 0.9)
-                ax_z_tr.fill_between(rts_min_z, y0_z, In_z * track_h_z + y0_z, color=color, alpha=0.85)
-                ax_z_tr.plot(rts_min_z, In_z * track_h_z + y0_z, color=color, linewidth=1.0)
+                ax_z_tr.plot(rts_min_z, In_z * track_h_z + y0_z, color=color, linewidth=1.2, alpha=0.9)
                 lab_z = entry.get('label') or f'#{i+1}'
                 if len(str(lab_z)) > 24:
                     lab_z = str(lab_z)[:21] + '…'
-                ax_z_tr.text(x_min_all_min, y0_z + track_h_z * 0.5, lab_z, va='center', ha='right', fontsize=7, fontfamily='serif')
+                ax_z_tr.text(x_min_all_min, y0_z + track_h_z * 0.5, lab_z, va='center', ha='right', fontsize=7, fontfamily='serif', color='0.9')
             # Tracks share x with linear/log (same time range in min); labels sit at left edge of data range
             ax_z_tr.set_ylim(-0.2, len(all_zoom) * (track_h_z + track_gap_z) - track_gap_z + 0.2)
-            ax_z_tr.set_xlabel('MS1 Retention Time (min)', fontsize=11, fontfamily='serif')
-            ax_z_tr.set_ylabel('Track (shape norm.)', fontsize=10, fontfamily='serif')
-            ax_z_tr.set_title('All peptides (per-peptide normalized)', fontsize=12, fontweight='bold', fontfamily='serif')
+            ax_z_tr.set_xlabel('MS1 Retention Time (min)', fontsize=11, fontfamily='serif', color='0.85')
+            ax_z_tr.set_ylabel('Track (shape norm.)', fontsize=10, fontfamily='serif', color='0.85')
+            ax_z_tr.set_title('All peptides (per-peptide normalized)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
             ax_z_tr.set_yticks([])
             ax_z_tr.tick_params(axis='y', left=False)
-            ax_z_tr.grid(True, alpha=0.3, axis='x')
+            ax_z_tr.tick_params(axis='x', colors='0.85')
+            ax_z_tr.grid(True, alpha=0.25, axis='x')
+            for spine in ax_z_tr.spines.values():
+                spine.set_color('0.6')
             ax_z_lin.tick_params(axis='x', labelbottom=False)
             ax_z_log.tick_params(axis='x', labelbottom=False)
             for ax in (ax_z_lin, ax_z_log, ax_z_tr):
                 for label in ax.get_xticklabels() + ax.get_yticklabels():
                     label.set_fontfamily('serif')
-            fig_zoom_all.suptitle(f'MS1 Chromatograms – All peptides (no segment split)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=13, fontweight='bold', fontfamily='serif', y=0.995)
+            fig_zoom_all.suptitle(f'MS1 Chromatograms – All peptides (no segment split)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=13, fontweight='bold', fontfamily='serif', y=0.995, color='0.9')
             plt.tight_layout(rect=[0, 0, 1, 0.97], pad=1.0)
             zoom_all_path = base_zoom + '_zoom_peptides_all_linear_log_tracks.png'
-            fig_zoom_all.savefig(zoom_all_path, dpi=150, bbox_inches='tight', facecolor='white', pad_inches=0.25)
+            fig_zoom_all.savefig(zoom_all_path, dpi=150, bbox_inches='tight', facecolor='black', pad_inches=0.25)
             plt.close(fig_zoom_all)
             print(f"[DEBUG] Zoom (all peptides, linear + log + tracks) saved to: {os.path.abspath(zoom_all_path)}")
 
@@ -7997,7 +8129,18 @@ def run_chromatograms(args):
             _lw_single = 2.0
             # 1) Linear only
             fig_lin = plt.figure(figsize=(24, 12))
+            fig_lin.patch.set_facecolor('black')
             ax_lin = fig_lin.add_subplot(1, 1, 1)
+            ax_lin.set_facecolor('black')
+            for entry in all_zoom:
+                min_rt_m = entry.get('min_rt')
+                max_rt_m = entry.get('max_rt')
+                cmin = entry.get('collection_min_rt')
+                cmax = entry.get('collection_max_rt')
+                if min_rt_m is not None and max_rt_m is not None:
+                    ax_lin.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+                if cmin is not None and cmax is not None:
+                    ax_lin.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
             for entry in all_zoom:
                 rts_min_z = np.asarray(entry['rts_min'], dtype=float)
                 total_z = np.asarray(entry['total_intensities'], dtype=float)
@@ -8007,27 +8150,44 @@ def run_chromatograms(args):
                     color = cmap_zoom(area_norm_zoom(ta))
                 else:
                     color = (0.3, 0.3, 0.3, 0.9)
-                ax_lin.plot(rts_min_z, total_z, color=color, linewidth=_lw_single, alpha=0.8)
+                color_rgb = color[:3] if len(color) >= 3 else color
+                low_z = np.where(total_z < 1e5, total_z, np.nan)
+                high_z = np.where(total_z >= 1e5, total_z, np.nan)
+                ax_lin.plot(rts_min_z, low_z, color=color_rgb, linewidth=1.0, alpha=0.35, zorder=5)
+                ax_lin.plot(rts_min_z, high_z, color=color_rgb, linewidth=2.5, alpha=0.95, zorder=5)
             ax_lin.set_xlim(x_min_all_min, x_max_all_min)
             ax_lin.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
             ax_lin.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
-            ax_lin.set_ylabel('Intensity', fontsize=_fs_axis, fontfamily='serif')
-            ax_lin.set_title(f'All peptides (linear)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif')
+            ax_lin.set_ylabel('Intensity', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+            ax_lin.set_title(f'All peptides (linear)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif', color='0.9')
             if y_max_zoom > 0:
                 ax_lin.set_ylim(0, y_max_zoom * 1.1)
-            ax_lin.grid(True, alpha=0.3)
-            ax_lin.tick_params(axis='both', labelsize=_fs_ticks)
-            ax_lin.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif')
+            ax_lin.grid(True, alpha=0.25)
+            ax_lin.tick_params(axis='both', labelsize=_fs_ticks, colors='0.85')
+            ax_lin.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
             for label in ax_lin.get_xticklabels() + ax_lin.get_yticklabels():
                 label.set_fontfamily('serif')
+            for spine in ax_lin.spines.values():
+                spine.set_color('0.6')
             plt.tight_layout(pad=1.2)
             path_lin = base_zoom + '_zoom_peptides_all_linear.png'
-            fig_lin.savefig(path_lin, dpi=_dpi_single, bbox_inches='tight', facecolor='white', pad_inches=0.25)
+            fig_lin.savefig(path_lin, dpi=_dpi_single, bbox_inches='tight', facecolor='black', pad_inches=0.25)
             plt.close(fig_lin)
             print(f"[DEBUG] Zoom all peptides (linear, high-res) saved to: {os.path.abspath(path_lin)}")
             # 2) Log only
             fig_log = plt.figure(figsize=(24, 12))
+            fig_log.patch.set_facecolor('black')
             ax_log = fig_log.add_subplot(1, 1, 1)
+            ax_log.set_facecolor('black')
+            for entry in all_zoom:
+                min_rt_m = entry.get('min_rt')
+                max_rt_m = entry.get('max_rt')
+                cmin = entry.get('collection_min_rt')
+                cmax = entry.get('collection_max_rt')
+                if min_rt_m is not None and max_rt_m is not None:
+                    ax_log.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+                if cmin is not None and cmax is not None:
+                    ax_log.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
             for entry in all_zoom:
                 rts_min_z = np.asarray(entry['rts_min'], dtype=float)
                 total_z = np.asarray(entry['total_intensities'], dtype=float)
@@ -8038,23 +8198,29 @@ def run_chromatograms(args):
                     color = cmap_zoom(area_norm_zoom(ta))
                 else:
                     color = (0.3, 0.3, 0.3, 0.9)
-                ax_log.plot(rts_min_z, total_log, color=color, linewidth=_lw_single, alpha=0.8)
+                color_rgb = color[:3] if len(color) >= 3 else color
+                low_log = np.where(total_log < 1e5, total_log, np.nan)
+                high_log = np.where(total_log >= 1e5, total_log, np.nan)
+                ax_log.plot(rts_min_z, low_log, color=color_rgb, linewidth=1.0, alpha=0.35, zorder=5)
+                ax_log.plot(rts_min_z, high_log, color=color_rgb, linewidth=2.5, alpha=0.95, zorder=5)
             ax_log.set_yscale('log')
             ax_log.set_xlim(x_min_all_min, x_max_all_min)
             ax_log.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
             ax_log.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
-            ax_log.set_ylabel('Intensity (log)', fontsize=_fs_axis, fontfamily='serif')
-            ax_log.set_title(f'All peptides (log scale)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif')
+            ax_log.set_ylabel('Intensity (log)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+            ax_log.set_title(f'All peptides (log scale)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif', color='0.9')
             if y_max_zoom > 0:
                 ax_log.set_ylim(1.0, y_max_zoom * 2.0)
-            ax_log.grid(True, alpha=0.3, which='both')
-            ax_log.tick_params(axis='both', labelsize=_fs_ticks)
-            ax_log.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif')
+            ax_log.grid(True, alpha=0.25, which='both')
+            ax_log.tick_params(axis='both', labelsize=_fs_ticks, colors='0.85')
+            ax_log.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
             for label in ax_log.get_xticklabels() + ax_log.get_yticklabels():
                 label.set_fontfamily('serif')
+            for spine in ax_log.spines.values():
+                spine.set_color('0.6')
             plt.tight_layout(pad=1.2)
             path_log = base_zoom + '_zoom_peptides_all_log.png'
-            fig_log.savefig(path_log, dpi=_dpi_single, bbox_inches='tight', facecolor='white', pad_inches=0.25)
+            fig_log.savefig(path_log, dpi=_dpi_single, bbox_inches='tight', facecolor='black', pad_inches=0.25)
             plt.close(fig_log)
             print(f"[DEBUG] Zoom all peptides (log, high-res) saved to: {os.path.abspath(path_log)}")
             # 3) Tracks only (height scales with number of peptides)
@@ -8063,7 +8229,18 @@ def run_chromatograms(args):
             label_pad_z = (x_max_all_min - x_min_all_min) * 0.08
             n_tr = len(all_zoom)
             fig_tr = plt.figure(figsize=(24, max(14, n_tr * 0.55)))
+            fig_tr.patch.set_facecolor('black')
             ax_tr = fig_tr.add_subplot(1, 1, 1)
+            ax_tr.set_facecolor('black')
+            for entry in all_zoom:
+                min_rt_m = entry.get('min_rt')
+                max_rt_m = entry.get('max_rt')
+                cmin = entry.get('collection_min_rt')
+                cmax = entry.get('collection_max_rt')
+                if min_rt_m is not None and max_rt_m is not None:
+                    ax_tr.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+                if cmin is not None and cmax is not None:
+                    ax_tr.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
             for i, entry in enumerate(all_zoom):
                 rts_min_z = np.asarray(entry['rts_min'], dtype=float)
                 total_z = np.asarray(entry['total_intensities'], dtype=float)
@@ -8078,29 +8255,92 @@ def run_chromatograms(args):
                     color = cmap_zoom(area_norm_zoom(ta))
                 else:
                     color = (0.4, 0.4, 0.4, 0.9)
-                ax_tr.fill_between(rts_min_z, y0_z, In_z * track_h_z + y0_z, color=color, alpha=0.85)
-                ax_tr.plot(rts_min_z, In_z * track_h_z + y0_z, color=color, linewidth=1.2)
+                ax_tr.plot(rts_min_z, In_z * track_h_z + y0_z, color=color, linewidth=1.2, alpha=0.9)
                 lab_z = entry.get('label') or f'#{i+1}'
                 if len(str(lab_z)) > 32:
                     lab_z = str(lab_z)[:29] + '…'
-                ax_tr.text(x_min_all_min - label_pad_z, y0_z + track_h_z * 0.5, lab_z, va='center', ha='right', fontsize=10, fontfamily='serif')
+                ax_tr.text(x_min_all_min - label_pad_z, y0_z + track_h_z * 0.5, lab_z, va='center', ha='right', fontsize=10, fontfamily='serif', color='0.9')
             ax_tr.set_xlim(x_min_all_min - label_pad_z - 0.2, x_max_all_min + 0.2)
             ax_tr.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
             ax_tr.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
             ax_tr.set_ylim(-0.2, n_tr * (track_h_z + track_gap_z) - track_gap_z + 0.2)
-            ax_tr.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif')
-            ax_tr.set_ylabel('Track (shape norm.)', fontsize=_fs_axis, fontfamily='serif')
-            ax_tr.set_title(f'All peptides (per-peptide normalized)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif')
+            ax_tr.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+            ax_tr.set_ylabel('Track (shape norm.)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+            ax_tr.set_title(f'All peptides (per-peptide normalized)  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif', color='0.9')
             ax_tr.set_yticks([])
-            ax_tr.tick_params(axis='x', labelsize=_fs_ticks)
-            ax_tr.grid(True, alpha=0.3, axis='x')
+            ax_tr.tick_params(axis='x', labelsize=_fs_ticks, colors='0.85')
+            ax_tr.grid(True, alpha=0.25, axis='x')
             for label in ax_tr.get_xticklabels():
                 label.set_fontfamily('serif')
+            for spine in ax_tr.spines.values():
+                spine.set_color('0.6')
             plt.tight_layout(pad=1.2)
             path_tr = base_zoom + '_zoom_peptides_all_tracks.png'
-            fig_tr.savefig(path_tr, dpi=_dpi_single, bbox_inches='tight', facecolor='white', pad_inches=0.25)
+            fig_tr.savefig(path_tr, dpi=_dpi_single, bbox_inches='tight', facecolor='black', pad_inches=0.25)
             plt.close(fig_tr)
             print(f"[DEBUG] Zoom all peptides (tracks, high-res) saved to: {os.path.abspath(path_tr)}")
+
+            # Tracks only: peaks with >=1% relative area
+            _sum_ta = sum(
+                float(e.get('total_area') or 0) for e in all_zoom
+                if e.get('total_area') is not None and not (isinstance(e.get('total_area'), float) and (np.isnan(e.get('total_area')) or e.get('total_area') < 0))
+            )
+            all_zoom_1pct = [
+                e for e in all_zoom
+                if _sum_ta > 0 and (float(e.get('total_area') or 0) / _sum_ta) >= 0.01
+            ]
+            if len(all_zoom_1pct) > 0:
+                n_tr_1pct = len(all_zoom_1pct)
+                fig_tr_1pct = plt.figure(figsize=(24, max(14, n_tr_1pct * 0.55)))
+                fig_tr_1pct.patch.set_facecolor('black')
+                ax_tr_1pct = fig_tr_1pct.add_subplot(1, 1, 1)
+                ax_tr_1pct.set_facecolor('black')
+                for entry in all_zoom_1pct:
+                    min_rt_m = entry.get('min_rt')
+                    max_rt_m = entry.get('max_rt')
+                    cmin = entry.get('collection_min_rt')
+                    cmax = entry.get('collection_max_rt')
+                    if min_rt_m is not None and max_rt_m is not None:
+                        ax_tr_1pct.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+                    if cmin is not None and cmax is not None:
+                        ax_tr_1pct.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+                for i, entry in enumerate(all_zoom_1pct):
+                    rts_min_z = np.asarray(entry['rts_min'], dtype=float)
+                    total_z = np.asarray(entry['total_intensities'], dtype=float)
+                    imax_z = float(np.nanmax(total_z)) if len(total_z) > 0 else 1.0
+                    if imax_z <= 0 or np.isnan(imax_z):
+                        imax_z = 1.0
+                    In_z = total_z / imax_z
+                    y0_z = i * (track_h_z + track_gap_z)
+                    ta = entry.get('total_area')
+                    if area_norm_zoom is not None and ta is not None and not (isinstance(ta, float) and (np.isnan(ta) or ta < 0)):
+                        color = cmap_zoom(area_norm_zoom(ta))
+                    else:
+                        color = (0.4, 0.4, 0.4, 0.9)
+                    ax_tr_1pct.plot(rts_min_z, In_z * track_h_z + y0_z, color=color, linewidth=1.2, alpha=0.9)
+                    lab_z = entry.get('label') or f'#{i+1}'
+                    if len(str(lab_z)) > 32:
+                        lab_z = str(lab_z)[:29] + '…'
+                    ax_tr_1pct.text(x_min_all_min - label_pad_z, y0_z + track_h_z * 0.5, lab_z, va='center', ha='right', fontsize=10, fontfamily='serif', color='0.9')
+                ax_tr_1pct.set_xlim(x_min_all_min - label_pad_z - 0.2, x_max_all_min + 0.2)
+                ax_tr_1pct.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
+                ax_tr_1pct.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
+                ax_tr_1pct.set_ylim(-0.2, n_tr_1pct * (track_h_z + track_gap_z) - track_gap_z + 0.2)
+                ax_tr_1pct.set_xlabel('MS1 Retention Time (min)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+                ax_tr_1pct.set_ylabel('Track (shape norm.)', fontsize=_fs_axis, fontfamily='serif', color='0.85')
+                ax_tr_1pct.set_title(f'Peptides ≥1% relative area (n={n_tr_1pct})  RT {seg_start_all/60:.2f}-{seg_end_all/60:.2f} min', fontsize=_fs_title, fontweight='bold', fontfamily='serif', color='0.9')
+                ax_tr_1pct.set_yticks([])
+                ax_tr_1pct.tick_params(axis='x', labelsize=_fs_ticks, colors='0.85')
+                ax_tr_1pct.grid(True, alpha=0.25, axis='x')
+                for label in ax_tr_1pct.get_xticklabels():
+                    label.set_fontfamily('serif')
+                for spine in ax_tr_1pct.spines.values():
+                    spine.set_color('0.6')
+                plt.tight_layout(pad=1.2)
+                path_tr_1pct = base_zoom + '_zoom_peptides_all_tracks_1pct.png'
+                fig_tr_1pct.savefig(path_tr_1pct, dpi=_dpi_single, bbox_inches='tight', facecolor='black', pad_inches=0.25)
+                plt.close(fig_tr_1pct)
+                print(f"[DEBUG] Zoom peptides ≥1% rel area (tracks) saved to: {os.path.abspath(path_tr_1pct)}")
 
     # Hide unused subplots (slots from picked_idx to end; only picked peptides get panels, no gaps)
     for file_idx, fig_combined in enumerate(combined_figures):
@@ -8454,27 +8694,8 @@ def run_chromatograms(args):
                 for col, val in significant_data[key].items():
                     if val is not None:
                         w[col] = val
-        peak_windows_csv = os.path.join(output_dir, 'peak_windows_all.csv')
-        df_windows = pd.DataFrame(all_peak_windows)
         dataframes_dir = getattr(args, 'dataframes_dir', None)
-        
-        # Sort by status (accepted first), then by sequence start position
-        df_windows['status_order'] = df_windows['status'].map({'accepted': 0, 'rejected': 1})
-        if 'sequence_start_pos' in df_windows.columns:
-            df_windows['seq_start'] = df_windows['sequence_start_pos'].fillna(999999)
-            df_windows = df_windows.sort_values(['status_order', 'seq_start'])
-            df_windows = df_windows.drop(['status_order', 'seq_start'], axis=1)
-        else:
-            df_windows = df_windows.sort_values(['status_order', 'peptide'])
-            df_windows = df_windows.drop('status_order', axis=1)
-        
-        df_windows.to_csv(peak_windows_csv, index=False)
-        peak_windows_csv_abs = os.path.abspath(peak_windows_csv)
-        print(f"[DEBUG] All peak windows (accepted + rejected) saved to: {peak_windows_csv_abs}")
-
         if dataframes_dir and os.path.isdir(dataframes_dir):
-            df_windows.to_csv(os.path.join(dataframes_dir, 'peak_windows_all.csv'), index=False)
-            print(f"[DEBUG] peak_windows_all.csv also saved to: {os.path.abspath(dataframes_dir)}")
             # Save chromatogram traces (same order as all_peak_windows) so RT windows / by-channel can show real peaks without re-extraction
             if traces_list and len(traces_list) == len(all_peak_windows):
                 npz_path = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
@@ -8490,40 +8711,6 @@ def run_chromatograms(args):
                 print(f"[DEBUG] chromatogram_metrics_all.csv saved to: {os.path.abspath(metrics_path)}")
         dataframes_accepted_dir = getattr(args, 'dataframes_accepted_dir', None)
         dataframes_rejected_dir = getattr(args, 'dataframes_rejected_dir', None)
-        
-        # Also save accepted-only CSV for backward compatibility (plots + dataframes accepted/)
-        if len(accepted_windows) > 0:
-            peak_windows_accepted_csv = os.path.join(output_dir, 'peak_windows.csv')
-            df_accepted = df_windows[df_windows['status'] == 'accepted'].copy()
-            df_accepted = df_accepted.drop('status', axis=1)  # Remove status column for accepted-only CSV
-            df_accepted = df_accepted.drop('rejection_reason', axis=1)  # Remove rejection_reason column
-            df_accepted.to_csv(peak_windows_accepted_csv, index=False)
-            # Clear-name copy: significant fragments and fragment pairs (5 ppm + noise %)
-            sig_frags_csv = os.path.join(output_dir, 'significant_frags_peak_windows.csv')
-            df_accepted.to_csv(sig_frags_csv, index=False)
-            peak_windows_accepted_csv_abs = os.path.abspath(peak_windows_accepted_csv)
-            print(f"[DEBUG] Accepted peak windows saved to: {peak_windows_accepted_csv_abs}")
-            if dataframes_dir and os.path.isdir(dataframes_dir):
-                df_accepted.to_csv(os.path.join(dataframes_dir, 'peak_windows.csv'), index=False)
-                df_accepted.to_csv(os.path.join(dataframes_dir, 'significant_frags_peak_windows.csv'), index=False)
-            if dataframes_accepted_dir and os.path.isdir(dataframes_accepted_dir):
-                df_accepted.to_csv(os.path.join(dataframes_accepted_dir, 'peak_windows.csv'), index=False)
-                df_accepted.to_csv(os.path.join(dataframes_accepted_dir, 'significant_frags_peak_windows.csv'), index=False)
-                print(f"[DEBUG] Accepted peak_windows.csv also saved to: {os.path.abspath(dataframes_accepted_dir)}")
-        
-        # Also save rejected-only CSV (plots rejected_dir + dataframes rejected/)
-        if len(rejected_windows) > 0:
-            peak_windows_rejected_csv = os.path.join(rejected_dir, 'peak_windows_rejected.csv')
-            df_rejected = df_windows[df_windows['status'] == 'rejected'].copy()
-            df_rejected = df_rejected.drop('status', axis=1)  # Remove status column
-            df_rejected.to_csv(peak_windows_rejected_csv, index=False)
-            peak_windows_rejected_csv_abs = os.path.abspath(peak_windows_rejected_csv)
-            print(f"[DEBUG] Rejected peak windows saved to: {peak_windows_rejected_csv_abs}")
-            if dataframes_dir and os.path.isdir(dataframes_dir):
-                df_rejected.to_csv(os.path.join(dataframes_dir, 'peak_windows_rejected.csv'), index=False)
-            if dataframes_rejected_dir and os.path.isdir(dataframes_rejected_dir):
-                df_rejected.to_csv(os.path.join(dataframes_rejected_dir, 'peak_windows_rejected.csv'), index=False)
-                print(f"[DEBUG] Rejected peak_windows_rejected.csv also saved to: {os.path.abspath(dataframes_rejected_dir)}")
 
         # If dataframes_dir provided (e.g. by run_visualization), write filtered dataset + chromatogram metrics (accepted only / rejected separate)
         if dataframes_dir and len(all_peak_windows) > 0:
@@ -8540,7 +8727,8 @@ def run_chromatograms(args):
                 'detected_peak_min_rt', 'detected_peak_max_rt', 'detected_peak_window_size',
                 'collection_min_rt', 'collection_max_rt', 'collection_window_size',
                 'spectrum_window_min_rt', 'spectrum_window_max_rt', 'spectrum_window_size',
-                'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes', 'precursor_mz', 'sequence_start_pos',
+                'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes', 'envelope_ok', 'm0_gt_m1_gt_m2',
+                'precursor_mz', 'sequence_start_pos',
                 'best_score', 'n_candidates', 'total_area', 'coelution_score'
             ]
             for w in all_peak_windows:
@@ -8632,6 +8820,47 @@ def run_chromatograms(args):
             os.makedirs(os.path.dirname(out_csv), exist_ok=True)
             df_base.to_csv(out_csv, index=False)
             print(f"[DEBUG] Filtered dataset + chromatogram metrics saved to: {os.path.abspath(out_csv)}")
+
+            # Diagnostic: coelution vs shape scatter (rejected marked)
+            try:
+                coel_vals = []
+                shape_vals = []
+                status_vals = []
+                for w in all_peak_windows:
+                    c = w.get('coelution_score')
+                    s = w.get('shape_corr') or w.get('mean_shape_corr')
+                    if c is not None and s is not None and pd.notna(c) and pd.notna(s):
+                        coel_vals.append(float(c))
+                        shape_vals.append(float(s))
+                        status_vals.append(w.get('status', 'accepted'))
+                if coel_vals and shape_vals:
+                    diagnostics_dir = os.path.join(os.path.dirname(dataframes_dir), 'diagnostics')
+                    os.makedirs(diagnostics_dir, exist_ok=True)
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    # plt already imported at module level; local import caused UnboundLocalError
+                    coel_arr = np.array(coel_vals)
+                    shape_arr = np.array(shape_vals)
+                    accepted_mask = np.array([st == 'accepted' for st in status_vals])
+                    rejected_mask = ~accepted_mask
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    if np.any(accepted_mask):
+                        ax.scatter(coel_arr[accepted_mask], shape_arr[accepted_mask], c='green', alpha=0.6, s=25, label=f'Accepted (n={np.sum(accepted_mask)})')
+                    if np.any(rejected_mask):
+                        ax.scatter(coel_arr[rejected_mask], shape_arr[rejected_mask], c='red', alpha=0.6, s=25, label=f'Rejected (n={np.sum(rejected_mask)})')
+                    ax.set_xlabel('Coelution score', fontsize=12)
+                    ax.set_ylabel('Shape correlation', fontsize=12)
+                    ax.set_title('Extraction: coelution vs shape (rejected marked)', fontsize=14)
+                    ax.legend(loc='lower left', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    diag_path = os.path.join(diagnostics_dir, 'extraction_coelution_vs_shape.png')
+                    fig.savefig(diag_path, dpi=150, bbox_inches='tight', facecolor='white')
+                    plt.close(fig)
+                    print(f"[DEBUG] Diagnostic scatter saved: {diag_path}")
+            except Exception as e:
+                print(f"[DEBUG] Could not create coelution vs shape diagnostic: {e}")
+
             # Accepted only -> accepted/ (exclude rejected)
             if dataframes_accepted_dir and os.path.isdir(dataframes_accepted_dir) and 'status' in df_base.columns:
                 df_acc = df_base[df_base['status'] == 'accepted']
@@ -8782,10 +9011,6 @@ def run_chromatograms(args):
     print(f"[DEBUG]   accepted/ -> {output_dir_abs}")
     print(f"[DEBUG]   rejected/ -> {rejected_dir_abs}")
     print(f"[DEBUG] Combined figure saved to: {output_png_abs}")
-    if len(all_peak_windows) > 0:
-        peak_windows_csv_path = os.path.join(output_dir, 'peak_windows_all.csv')
-        peak_windows_csv_abs = os.path.abspath(peak_windows_csv_path)
-        print(f"[DEBUG] All peak windows CSV saved to: {peak_windows_csv_abs}")
     accepted_count = len([w for w in all_peak_windows if w['status'] == 'accepted']) if all_peak_windows else 0
     rejected_count = len([w for w in all_peak_windows if w['status'] == 'rejected']) if all_peak_windows else 0
     print(f"[DEBUG] Total individual figures created: {len(all_peak_windows)} ({accepted_count} accepted, {rejected_count} rejected)")

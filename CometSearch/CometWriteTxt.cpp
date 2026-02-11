@@ -48,6 +48,9 @@ void CometWriteTxt::WriteTxt(FILE *fpout,
       for (i=0; i<(int)g_pvQuery.size(); ++i)
          PrintResults(i, 0, fpout, fpdb);
    }
+   
+   // Validate columns after writing
+   ValidateColumns();
 }
 
 
@@ -107,6 +110,91 @@ void CometWriteTxt::PrintTxtHeader(FILE *fpout)
    if (g_staticParams.options.iPrintAScoreProScore)
       fprintf(fpout, "\tascorepro\tascore_sitescores");
 // fprintf(fpout, "\tnum_matched_peptides");
+   fprintf(fpout, "\n");
+#endif
+}
+
+
+void CometWriteTxt::WriteCsv(FILE *fpout,
+                             FILE *fpoutd,
+                             FILE *fpdb)
+{
+   int i;
+
+   // Print out the separate decoy hits.
+   if (g_staticParams.options.iDecoySearch == 2)
+   {
+      for (i=0; i<(int)g_pvQuery.size(); ++i)
+         PrintCsvResults(i, 1, fpout, fpdb);
+      for (i=0; i<(int)g_pvQuery.size(); ++i)
+         PrintCsvResults(i, 2, fpoutd, fpdb);
+   }
+   else
+   {
+      for (i=0; i<(int)g_pvQuery.size(); ++i)
+         PrintCsvResults(i, 0, fpout, fpdb);
+   }
+   
+   // Validate columns after writing
+   ValidateColumns();
+}
+
+
+void CometWriteTxt::PrintCsvHeader(FILE *fpout)
+{
+#ifndef CRUX
+   fprintf(fpout, "CometVersion %s,", g_sCometVersion.c_str());
+   fprintf(fpout, "%s,", g_staticParams.inputFile.szBaseName);
+   fprintf(fpout, "%s,", g_staticParams.szDate);
+   fprintf(fpout, "%s\n", g_staticParams.databaseInfo.szDatabase);
+
+   // Column 1: sequence_positions
+   fprintf(fpout, "sequence_positions");
+   
+   // Column 2: plain_peptide
+   fprintf(fpout, ",plain_peptide");
+   
+   // Column 3: charge
+   fprintf(fpout, ",charge");
+   
+   // Column 4: mz (precursor m/z)
+   fprintf(fpout, ",mz");
+   
+   // Column 5: MS2_retention_time_sec
+   fprintf(fpout, ",MS2_retention_time_sec");
+   
+   // Column 6: matched fragment ions
+   fprintf(fpout, ",matched fragment ions");
+   
+   // Column 7: matched fragment ion pairs
+   fprintf(fpout, ",single_aa_overhang_fragment_pairs");
+   
+   // Rest of columns
+   fprintf(fpout, ",matched fragment ion intensities");
+   fprintf(fpout, ",matched fragment ion mz");
+   fprintf(fpout, ",single_aa_overhangs_protein_positions");
+   fprintf(fpout, ",matched fragment ion quality scores");
+   fprintf(fpout, ",scan");
+   fprintf(fpout, ",num");
+   fprintf(fpout, ",exp_neutral_mass");
+   fprintf(fpout, ",calc_neutral_mass");
+   fprintf(fpout, ",e-value");
+   fprintf(fpout, ",xcorr");
+   fprintf(fpout, ",delta_cn");
+   fprintf(fpout, ",sp_score");
+   fprintf(fpout, ",ions_matched");
+   fprintf(fpout, ",ions_total");
+   fprintf(fpout, ",modified_peptide");
+   if (g_staticParams.peffInfo.iPeffSearch)
+      fprintf(fpout, ",peff_modified_peptide");
+   fprintf(fpout, ",prev_aa");
+   fprintf(fpout, ",next_aa");
+   fprintf(fpout, ",protein");
+   fprintf(fpout, ",protein_count");
+   fprintf(fpout, ",modifications");
+   fprintf(fpout, ",sp_rank");
+   if (g_staticParams.options.iPrintAScoreProScore)
+      fprintf(fpout, ",ascorepro,ascore_sitescores");
    fprintf(fpout, "\n");
 #endif
 }
@@ -597,4 +685,547 @@ void CometWriteTxt::PrintModifications(FILE *fpout,
       fprintf(fpout, "\t");
    else
       fprintf(fpout, "-\t");
+}
+
+
+void CometWriteTxt::PrintModificationsCsv(FILE *fpout,
+                                          Results *pOutput,
+                                          int iWhichResult)
+{
+   bool bPrintMod = false;
+   bool bFirst = true;
+
+   // Quote the whole modifications column so comma-separated mods (e.g. 4_V_15.994900,12_V_15.994900) are one CSV field
+   fprintf(fpout, "\"");
+
+   // static N-terminus protein
+   if (!isEqual(g_staticParams.staticModifications.dAddNterminusProtein, 0.0)
+         && pOutput[iWhichResult].cPrevAA == '-')
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "1_S_%0.6f_N", g_staticParams.staticModifications.dAddNterminusProtein);
+      bPrintMod = true;
+   }
+
+   // static N-terminus peptide
+   if (!isEqual(g_staticParams.staticModifications.dAddNterminusPeptide, 0.0))
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "1_S_%0.6f_n", g_staticParams.staticModifications.dAddNterminusPeptide);
+      bPrintMod = true;
+   }
+
+   // variable N-terminus peptide and protein
+   if (g_staticParams.variableModParameters.bVarModSearch
+         && pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide] > 0)
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "1_V_%0.6f",
+            g_staticParams.variableModParameters.varModList[pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide]-1].dVarModMass);
+
+      if (g_staticParams.variableModParameters.varModList[pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide]-1].iVarModTermDistance == 0)
+         fprintf(fpout, "_N");
+      else
+         fprintf(fpout, "_n");
+      bPrintMod = true;
+   }
+
+   for (int i=0; i<pOutput[iWhichResult].usiLenPeptide; ++i)
+   {
+      // static modification
+      if (!isEqual(g_staticParams.staticModifications.pdStaticMods[(int)pOutput[iWhichResult].szPeptide[i]], 0.0))
+      {
+         if (!bFirst)
+            fprintf(fpout, ",");
+         else
+            bFirst=false;
+
+         fprintf(fpout, "%d_S_%0.6f",
+               i+1,
+               g_staticParams.staticModifications.pdStaticMods[(int)pOutput[iWhichResult].szPeptide[i]]);
+         bPrintMod = true;
+      }
+
+      // variable modification
+      if (g_staticParams.variableModParameters.bVarModSearch && pOutput[iWhichResult].piVarModSites[i] != 0)
+      {
+         if (!bFirst)
+            fprintf(fpout, ",");
+         else
+            bFirst=false;
+
+         if (g_staticParams.variableModParameters.bVarModSearch && pOutput[iWhichResult].piVarModSites[i] > 0)
+            fprintf(fpout, "%d_V_%0.6f", i+1, pOutput[iWhichResult].pdVarModSites[i]);  // variable mod
+         else
+            fprintf(fpout, "%d_P_%0.6f", i+1, pOutput[iWhichResult].pdVarModSites[i]);  // PEFF mod
+         bPrintMod = true;
+      }
+   }
+
+   // static C-terminus protein
+   if (!isEqual(g_staticParams.staticModifications.dAddCterminusProtein, 0.0)
+         && pOutput[iWhichResult].cNextAA == '-')
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "%d_S_%0.6f_C", pOutput[iWhichResult].usiLenPeptide, g_staticParams.staticModifications.dAddCterminusProtein);
+      bPrintMod = true;
+   }
+
+   // static C-terminus peptide
+   if (!isEqual(g_staticParams.staticModifications.dAddCterminusPeptide, 0.0))
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "%d_S_%0.6f_c", pOutput[iWhichResult].usiLenPeptide, g_staticParams.staticModifications.dAddCterminusPeptide);
+      bPrintMod = true;
+   }
+
+   // variable C-terminus peptide and protein
+   if (g_staticParams.variableModParameters.bVarModSearch
+         && pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide+1] > 0)
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      fprintf(fpout, "%d_V_%0.6f",
+            pOutput[iWhichResult].usiLenPeptide,
+            g_staticParams.variableModParameters.varModList[pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide+1]-1].dVarModMass);
+
+      if (g_staticParams.variableModParameters.varModList[pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide+1]-1].iVarModTermDistance == 0)
+         fprintf(fpout, "_C");
+      else
+         fprintf(fpout, "_c");
+      bPrintMod = true;
+   }
+
+   // PEFF amino acid substitution
+   if (!pOutput[iWhichResult].sPeffOrigResidues.empty() && pOutput[iWhichResult].iPeffOrigResiduePosition != NO_PEFF_VARIANT)
+   {
+      if (!bFirst)
+         fprintf(fpout, ",");
+      else
+         bFirst=false;
+
+      if(pOutput[iWhichResult].sPeffOrigResidues.size()>1)
+        fprintf(fpout, "%d-%d_p_%s", pOutput[iWhichResult].iPeffOrigResiduePosition + 1, pOutput[iWhichResult].iPeffOrigResiduePosition + (int)pOutput[iWhichResult].sPeffOrigResidues.size(), pOutput[iWhichResult].sPeffOrigResidues.c_str());
+      else
+        fprintf(fpout, "%d_p_%s", pOutput[iWhichResult].iPeffOrigResiduePosition + 1, pOutput[iWhichResult].sPeffOrigResidues.c_str());
+      bPrintMod = true;
+   }
+
+   if (bPrintMod)
+      fprintf(fpout, "\",");
+   else
+      fprintf(fpout, "-\",");   /* empty mods: close quoted field with "-" then comma (was "\"-," which broke CSV) */
+}
+
+
+void CometWriteTxt::PrintCsvResults(int iWhichQuery,
+                                    int iPrintTargetDecoy,
+                                    FILE *fpout,
+                                    FILE *fpdb)
+{
+#ifndef CRUX
+   if ((iPrintTargetDecoy != 2 && g_pvQuery.at(iWhichQuery)->_pResults[0].fXcorr > g_staticParams.options.dMinimumXcorr)
+         || (iPrintTargetDecoy == 2 && g_pvQuery.at(iWhichQuery)->_pDecoys[0].fXcorr > g_staticParams.options.dMinimumXcorr))
+   {
+      Query* pQuery = g_pvQuery.at(iWhichQuery);
+
+      Results *pOutput;
+      int iNumPrintLines;
+
+      if (iPrintTargetDecoy == 2)  // decoys
+      {
+         pOutput = pQuery->_pDecoys;
+         iNumPrintLines = pQuery->iDecoyMatchPeptideCount;
+      }
+      else  // combined or separate targets
+      {
+         pOutput = pQuery->_pResults;
+         iNumPrintLines = pQuery->iMatchPeptideCount;
+      }
+
+      if (iNumPrintLines > g_staticParams.options.iNumPeptideOutputLines)
+         iNumPrintLines = g_staticParams.options.iNumPeptideOutputLines;
+
+      int iMinLength = 999;
+      for (int i=0; i<iNumPrintLines; ++i)
+      {
+         int iLen = (int)strlen(pOutput[i].szPeptide);
+         if (iLen == 0)
+            break;
+         if (iLen < iMinLength)
+            iMinLength = iLen;
+      }
+
+      int iLineCount = 1;
+
+      for (int iWhichResult=0; iWhichResult<iNumPrintLines; ++iWhichResult)
+      {
+         if (pOutput[iWhichResult].fXcorr <= g_staticParams.options.dMinimumXcorr)
+            continue;
+
+         // Skip decoy peptides (only print target peptides)
+         if (pOutput[iWhichResult].pWhichProtein.empty() && !pOutput[iWhichResult].pWhichDecoyProtein.empty())
+            continue;
+
+         iLineCount++;
+
+         // Column 1: sequence_positions (start-end format, e.g., "2-20")
+         // Only target peptides should reach here (decoys are filtered above)
+         string sSequencePositions;
+         int iProteinStart = 0;
+         int iPeptideLength = pOutput[iWhichResult].usiLenPeptide;
+         
+         if (!pOutput[iWhichResult].pWhichProtein.empty())
+         {
+            // Target peptide
+            iProteinStart = pOutput[iWhichResult].pWhichProtein[0].iStartResidue;
+         }
+         
+         if (iProteinStart > 0)
+         {
+            int iProteinEnd = iProteinStart + iPeptideLength - 1;
+            sSequencePositions = to_string(iProteinStart) + "-" + to_string(iProteinEnd);
+         }
+         
+         if (!sSequencePositions.empty())
+            fprintf(fpout, "%s,", sSequencePositions.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // Column 2: plain_peptide
+         fprintf(fpout, "%s,", pOutput[iWhichResult].szPeptide);
+         
+         // Column 3: charge
+         fprintf(fpout, "%d,", pQuery->_spectrumInfoInternal.usiChargeState);
+         
+         // Column 4: mz (precursor m/z)
+         int charge = pQuery->_spectrumInfoInternal.usiChargeState;
+         double spectrum_neutral_mass = pQuery->_pepMassInfo.dExpPepMass - PROTON_MASS;
+         double spectrum_mz = (spectrum_neutral_mass + charge*PROTON_MASS) / (double)charge;
+         fprintf(fpout, "%0.6f,", spectrum_mz);
+         
+         // Column 5: retention_time_sec
+         fprintf(fpout, "%0.1f,", pQuery->_spectrumInfoInternal.fRTime);
+         
+         // Column 6: matched fragment ions
+         if (!pOutput[iWhichResult].sMatchedFragmentIons.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sMatchedFragmentIons.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // Column 7: matched fragment ion pairs
+         if (!pOutput[iWhichResult].sSingleAAOverhangFragmentPairs.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sSingleAAOverhangFragmentPairs.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // Rest of columns
+         // matched fragment ion intensities
+         if (!pOutput[iWhichResult].sMatchedFragmentIonIntensities.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sMatchedFragmentIonIntensities.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // matched fragment ion mz (same order as matched fragment ions)
+         if (!pOutput[iWhichResult].sMatchedFragmentIonMz.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sMatchedFragmentIonMz.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // single_aa_overhangs_protein_positions (mapped to protein sequence)
+         if (!pOutput[iWhichResult].sSiteSpecificResidues.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sSiteSpecificResidues.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         // matched fragment ion quality scores
+         if (!pOutput[iWhichResult].sMatchedFragmentIonQualityScores.empty())
+            fprintf(fpout, "\"%s\",", pOutput[iWhichResult].sMatchedFragmentIonQualityScores.c_str());
+         else
+            fprintf(fpout, ",");
+         
+         fprintf(fpout, "%d,", pQuery->_spectrumInfoInternal.iScanNumber);
+
+         // Print spectrum_query element.
+         if (g_staticParams.options.bMango)   // Mango specific
+         {
+            char *pStr;
+
+            // look for either \ or / separator so valid for Windows or Linux
+            if ((pStr = strrchr(g_staticParams.inputFile.szBaseName, '\\')) == NULL
+               && (pStr = strrchr(g_staticParams.inputFile.szBaseName, '/')) == NULL)
+            {
+               pStr = g_staticParams.inputFile.szBaseName;
+
+            }
+            else
+               pStr++;  // skip separation character
+
+            fprintf(fpout, "%s_%s.%05d.%05d.%d,",
+                  pStr,
+                  pQuery->_spectrumInfoInternal.szMango,
+                  pQuery->_spectrumInfoInternal.iScanNumber,
+                  pQuery->_spectrumInfoInternal.iScanNumber,
+                  pQuery->_spectrumInfoInternal.usiChargeState);
+         }
+
+         fprintf(fpout, "%d,", pOutput[iWhichResult].usiRankXcorr);
+         fprintf(fpout, "%0.6f,", pQuery->_pepMassInfo.dExpPepMass - PROTON_MASS);
+         fprintf(fpout, "%0.6f,", pOutput[iWhichResult].dPepMass - PROTON_MASS);
+         fprintf(fpout, "%0.2E,", pOutput[iWhichResult].dExpect);
+         fprintf(fpout, "%0.4f,", pOutput[iWhichResult].fXcorr);
+         fprintf(fpout, "%0.4f,", pOutput[iWhichResult].fDeltaCn);
+         fprintf(fpout, "%0.1f,", pOutput[iWhichResult].fScoreSp);
+         fprintf(fpout, "%d,", pOutput[iWhichResult].usiMatchedIons);
+         fprintf(fpout, "%d,", pOutput[iWhichResult].usiTotalIons);
+
+         // modified peptide
+
+         bool bNterm = false;
+         bool bCterm = false;
+         double dNterm = 0.0;
+         double dCterm = 0.0;
+
+         // See if n-term mod (static and/or variable) needs to be reported
+         if (pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide] > 0)
+         {
+            bNterm = true;
+            dNterm = g_staticParams.variableModParameters.varModList[(int)pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide]-1].dVarModMass;
+         }
+
+         // See if c-term mod (static and/or variable) needs to be reported
+         if (pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide+1] > 0)
+         {
+            bCterm = true;
+            dCterm = g_staticParams.variableModParameters.varModList[(int)pOutput[iWhichResult].piVarModSites[pOutput[iWhichResult].usiLenPeptide+1]-1].dVarModMass;
+         }
+
+         // generate modified_peptide string
+         if (pOutput[iWhichResult].cHasVariableMod)
+         {
+            fprintf(fpout, "%c.", pOutput[iWhichResult].cPrevAA);
+            if (bNterm)
+               fprintf(fpout, "n[%0.4f]", dNterm);
+            for (int i = 0; i < pOutput[iWhichResult].usiLenPeptide; ++i)
+            {
+               fprintf(fpout, "%c", pOutput[iWhichResult].szPeptide[i]);
+
+               if (pOutput[iWhichResult].piVarModSites[i] != 0)
+                  fprintf(fpout, "[%0.4f]", pOutput[iWhichResult].pdVarModSites[i]);
+            }
+            if (bCterm)
+               fprintf(fpout, "c[%0.4f]", dCterm);
+            fprintf(fpout, ".%c,", pOutput[iWhichResult].cNextAA);
+         }
+         else
+         {
+            fprintf(fpout, "%c.%s.%c,", pOutput[iWhichResult].cPrevAA, pOutput[iWhichResult].szPeptide, pOutput[iWhichResult].cNextAA);
+         }
+
+         // mod string with PEFF
+         if (g_staticParams.peffInfo.iPeffSearch)
+         {
+            fprintf(fpout, "%c.", pOutput[iWhichResult].cPrevAA);
+            if (bNterm)
+               fprintf(fpout, "n[%0.4f]", dNterm);
+            for (int i=0; i<pOutput[iWhichResult].usiLenPeptide; ++i)
+            {  
+               fprintf(fpout, "%c", pOutput[iWhichResult].szPeptide[i]);
+            
+               if (pOutput[iWhichResult].piVarModSites[i] < 0)
+                  fprintf(fpout, "[%s]", pOutput[iWhichResult].pszMod[i]);
+               else if (pOutput[iWhichResult].piVarModSites[i] > 0)
+                  fprintf(fpout, "[%0.4f]", pOutput[iWhichResult].pdVarModSites[i]);
+            }
+            if (bCterm)
+               fprintf(fpout, "c[%0.4f]", dCterm);
+
+            fprintf(fpout, ".%c,", pOutput[iWhichResult].cNextAA);
+         }
+
+         fprintf(fpout, "%c,", pOutput[iWhichResult].cPrevAA);
+         fprintf(fpout, "%c,", pOutput[iWhichResult].cNextAA);
+
+         unsigned int uiNumTotProteins = 0;
+
+         // print protein list
+         PrintProteins(fpout, fpdb, iWhichQuery, iWhichResult, iPrintTargetDecoy, &uiNumTotProteins);
+
+         fprintf(fpout, ",%u,", uiNumTotProteins);
+
+         // encoded modifications - PrintModifications outputs tab at end, need comma for CSV
+         // We'll manually handle the delimiter by calling a modified version
+         PrintModificationsCsv(fpout, pOutput, iWhichResult);
+
+         // sp_rank
+         fprintf(fpout, "%d", pOutput[iWhichResult].usiRankSp);
+         
+         if (g_staticParams.options.iPrintAScoreProScore)
+            fprintf(fpout, ",%0.4f,'%s'", pOutput[iWhichResult].fAScorePro, pOutput[iWhichResult].sAScoreProSiteScores.c_str());
+
+         fprintf(fpout, "\n");
+      }
+   }
+#endif
+}
+
+
+void CometWriteTxt::ValidateColumns()
+{
+   if (g_pvQuery.empty())
+      return;
+   
+   int iTotalResults = 0;
+   map<string, int> mapEmptyCount;
+   map<string, int> mapSameValueCount;
+   map<string, string> mapFirstValue;
+   
+   // Track columns to validate
+   vector<string> vColumnsToCheck;
+   vColumnsToCheck.push_back("MS1_retention_time_sec");
+   vColumnsToCheck.push_back("MS1_retention_time_min");
+   vColumnsToCheck.push_back("peptide_intensity");
+   vColumnsToCheck.push_back("MS2_retention_time_sec");
+   vColumnsToCheck.push_back("MS2_retention_time_min");
+   
+   // Initialize counters
+   for (size_t i = 0; i < vColumnsToCheck.size(); ++i)
+   {
+      mapEmptyCount[vColumnsToCheck[i]] = 0;
+      mapSameValueCount[vColumnsToCheck[i]] = 0;
+   }
+   
+   // Count results and check each query
+   for (size_t i = 0; i < g_pvQuery.size(); ++i)
+   {
+      Query* pQuery = g_pvQuery.at(i);
+      
+      if (pQuery->iMatchPeptideCount > 0)
+      {
+         Results* pOutput = pQuery->_pResults;
+         int iNumPrintLines = pQuery->iMatchPeptideCount;
+         
+         if (iNumPrintLines > g_staticParams.options.iNumPeptideOutputLines)
+            iNumPrintLines = g_staticParams.options.iNumPeptideOutputLines;
+         
+         for (int j = 0; j < iNumPrintLines; ++j)
+         {
+            if (pOutput[j].fXcorr <= g_staticParams.options.dMinimumXcorr)
+               continue;
+            
+            iTotalResults++;
+            
+            // Check MS1 retention time (if field exists)
+            // Note: fRTimeMS1 may not exist after revert, so these will be empty
+            mapEmptyCount["MS1_retention_time_sec"]++;
+            mapEmptyCount["MS1_retention_time_min"]++;
+            
+            // Check peptide intensity (precursor intensity)
+            // Note: dPrecursorIntensity may not exist after revert, so this will be empty
+            mapEmptyCount["peptide_intensity"]++;
+            
+            // Check MS2 retention time
+            float fMS2RT = pQuery->_spectrumInfoInternal.fRTime;
+            if (fMS2RT <= 0.0)
+            {
+               mapEmptyCount["MS2_retention_time_sec"]++;
+               mapEmptyCount["MS2_retention_time_min"]++;
+            }
+            else
+            {
+               char szBuffer[64];
+               snprintf(szBuffer, sizeof(szBuffer), "%.1f", fMS2RT);
+               string sMS2RT_sec = szBuffer;
+               snprintf(szBuffer, sizeof(szBuffer), "%.4f", fMS2RT / 60.0);
+               string sMS2RT_min = szBuffer;
+               
+               if (mapFirstValue["MS2_retention_time_sec"].empty())
+                  mapFirstValue["MS2_retention_time_sec"] = sMS2RT_sec;
+               else if (mapFirstValue["MS2_retention_time_sec"] != sMS2RT_sec)
+                  mapSameValueCount["MS2_retention_time_sec"] = -1;
+               
+               if (mapFirstValue["MS2_retention_time_min"].empty())
+                  mapFirstValue["MS2_retention_time_min"] = sMS2RT_min;
+               else if (mapFirstValue["MS2_retention_time_min"] != sMS2RT_min)
+                  mapSameValueCount["MS2_retention_time_min"] = -1;
+            }
+         }
+      }
+      
+      // Also check decoys if separate decoy search
+      if (g_staticParams.options.iDecoySearch == 2 && pQuery->iDecoyMatchPeptideCount > 0)
+      {
+         Results* pOutput = pQuery->_pDecoys;
+         int iNumPrintLines = pQuery->iDecoyMatchPeptideCount;
+         
+         if (iNumPrintLines > g_staticParams.options.iNumPeptideOutputLines)
+            iNumPrintLines = g_staticParams.options.iNumPeptideOutputLines;
+         
+         for (int j = 0; j < iNumPrintLines; ++j)
+         {
+            if (pOutput[j].fXcorr <= g_staticParams.options.dMinimumXcorr)
+               continue;
+            
+            iTotalResults++;
+            
+            // Same validation logic for decoys
+            mapEmptyCount["MS1_retention_time_sec"]++;
+            mapEmptyCount["MS1_retention_time_min"]++;
+            mapEmptyCount["peptide_intensity"]++;
+            
+            float fMS2RT = pQuery->_spectrumInfoInternal.fRTime;
+            if (fMS2RT <= 0.0)
+            {
+               mapEmptyCount["MS2_retention_time_sec"]++;
+               mapEmptyCount["MS2_retention_time_min"]++;
+            }
+         }
+      }
+   }
+   
+   // Print validation summary
+   if (iTotalResults > 0)
+   {
+      fprintf(stderr, "\nColumn validation summary (out of %d results):\n", iTotalResults);
+      
+      for (size_t i = 0; i < vColumnsToCheck.size(); ++i)
+      {
+         string sCol = vColumnsToCheck[i];
+         int iEmpty = mapEmptyCount[sCol];
+         int iSame = mapSameValueCount[sCol];
+         
+         if (iEmpty > 0)
+         {
+            fprintf(stderr, "  - %s: %d empty (%.1f%%)\n", sCol.c_str(), iEmpty, 100.0 * iEmpty / iTotalResults);
+         }
+         
+         if (iSame == 0 && iEmpty < iTotalResults)
+         {
+            fprintf(stderr, "  - %s: all non-empty values are the same (value: %s)\n", sCol.c_str(), mapFirstValue[sCol].c_str());
+         }
+      }
+   }
 }

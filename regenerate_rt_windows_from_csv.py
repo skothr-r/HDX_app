@@ -3088,9 +3088,16 @@ def run_rt_windows(args):
         _sum_initial = float(_sum_initial)
     except (TypeError, ValueError):
         _sum_initial = 0.0
+    def _is_valuable(p):
+        v = p.get('valuable_sequence')
+        if v == 1 or (isinstance(v, (int, float)) and v == 1):
+            return True
+        if isinstance(v, str) and str(v).strip() == '1':
+            return True
+        return False
     for p in all_accepted_for_rt_windows:
         rel = (float(p.get('total_area') or 0) / _sum_initial) if _sum_initial > 0 else 0.0
-        p['_protected_high_relative_area'] = rel >= RELATIVE_AREA_PROTECTED
+        p['_protected_high_relative_area'] = rel >= RELATIVE_AREA_PROTECTED or _is_valuable(p)
     n_before_env = len(all_accepted_for_rt_windows)
     all_accepted_for_rt_windows = [p for p in all_accepted_for_rt_windows if p.get('_protected_high_relative_area') or _envelope_ok(p)]
     n_env_excluded = n_before_env - len(all_accepted_for_rt_windows)
@@ -3245,6 +3252,13 @@ def run_rt_windows(args):
         print(f"[diagnostic] Before channel assignment: no valid window start in {len(kept)} kept peaks")
     # Distinct sets of 3 channels; within each set same peak cannot repeat; within each channel no overlap.
     # Goal: maximally fill each channel; repeating peptides across different sets of 3 is encouraged later.
+    # Prioritize valuable_sequence=1 and high relative area for first channels (workflow Step 9)
+    def _valuable_sort_key(p):
+        v = p.get('valuable_sequence')
+        is_val = v == 1 or (isinstance(v, (int, float)) and v == 1) or (isinstance(v, str) and str(v).strip() == '1')
+        rel = p.get('relative_area_within_selection') or 0
+        return (0 if is_val else 1, -rel)
+    kept = sorted(kept, key=_valuable_sort_key)
     num_channels = assign_peptides_to_channels_by_layers(kept, channels_per_layer=3)
     num_channels = max(1, num_channels)
     n_layers = (num_channels + 2) // 3
