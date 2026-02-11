@@ -1,0 +1,25 @@
+
+
+Search Engine: Comet
+    Handles c/z ions (ETD) and mixed ion series (UVPD)
+    
+
+[Crux] Statistical Analysis: Percolator
+    Crux = command-line proteomics operating system
+            manages feature extraction
+            splits data for Percolator
+            estimates FDR
+        Using the Crux build of Percolator allows us to run Percolator and get outputs compatible with Comet?
+    
+    Percolator: Machine learning PSM scoring
+        Uses Comet PSM features statistical scoring
+        --> Confidence Metrics (Accuracy)
+            Q-value: 
+            PEP: 
+
+Feature Extraction: OpenMS
+        --> Quality Metrics (Precision)
+            Ratio Stability
+            Relative Area
+            Coellution
+            
