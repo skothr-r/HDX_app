@@ -53,14 +53,8 @@ def peak_drift_buffer_sec(cmin, cmax, frac=PEAK_DRIFT_BUFFER_FRAC_DEFAULT,
                           min_sec=PEAK_DRIFT_BUFFER_MIN_SEC_DEFAULT,
                           max_sec=PEAK_DRIFT_BUFFER_MAX_SEC_DEFAULT,
                           default=PEAK_DRIFT_BUFFER_DEFAULT_SEC):
-    """Buffer (seconds) to add on each side of collection window; scales with collection width. Used for peak drift window."""
-    try:
-        w = float(cmax) - float(cmin)
-    except (TypeError, ValueError):
-        return default
-    if w <= 0 or not (w == w):
-        return default
-    return max(min_sec, min(max_sec, frac * w))
+    """Buffer (seconds) to add on each side of collection window. Fixed +30 seconds on either side."""
+    return default
 
 
 def _set_total_area_colorbar_ticks(cbar):
@@ -5721,14 +5715,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     WHITESPACE_BAR_COLOR = (1.0, 1.0, 1.0, 1.0)  # explicit white bar in gap between windows
 
     def _peak_drift_buffer_sec(coll_min, coll_max):
-        """Buffer (seconds) each side; relative to collection width, with min/max (match regenerate_rt_windows_from_csv)."""
-        try:
-            w = float(coll_max) - float(coll_min)
-        except (TypeError, ValueError):
-            return PEAK_DRIFT_BUFFER_SEC
-        if w <= 0 or not (w == w):
-            return PEAK_DRIFT_BUFFER_SEC
-        return max(PEAK_DRIFT_BUFFER_MIN_SEC, min(PEAK_DRIFT_BUFFER_MAX_SEC, PEAK_DRIFT_BUFFER_FRAC * w))
+        """Buffer (seconds) each side. Fixed +30 seconds on either side."""
+        return PEAK_DRIFT_BUFFER_SEC
 
     def _identifier_lines(p, drift_min=None, drift_max=None):
         """Return list of identifier lines for a peptide (sequence, charge, mods, m/z, integration, collection, peak drift, positions). drift_min/drift_max optional (computed per-channel with max spacing)."""
@@ -6019,7 +6007,7 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
         ax.set_yticklabels([f'Channel {ch + 1} ({len(peptides_ch)} peptides)'], fontsize=10)
         ax.grid(axis='x', alpha=0.3, linestyle='--')
         n_ch = len(peptides_ch)
-        # Full drift window per peptide (collection ± buffer); assignment ensures non-overlapping
+        # Use collection windows only (no drift - drift is instrument, not for channel assignment/display)
         channel_data = []
         for i, p in enumerate(peptides_ch):
             min_rt, max_rt = _get_window(p)
@@ -6030,27 +6018,16 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
                 pad = max(10.0, (max_rt - min_rt) * 0.15)
                 coll_min = min_rt - pad
                 coll_max = max_rt + pad
-            buf_sec = _peak_drift_buffer_sec(coll_min, coll_max)
-            drift_min = coll_min - buf_sec
-            drift_max = coll_max + buf_sec
-            if drift_max <= drift_min:
-                drift_max = drift_min + max(1.0, (coll_max - coll_min) * 0.1)
-            rt_min_global = min(rt_min_global, drift_min)
-            rt_max_global = max(rt_max_global, drift_max)
-            channel_data.append({'p': p, 'min_rt': min_rt, 'max_rt': max_rt, 'coll_min': coll_min, 'coll_max': coll_max, 'drift_min': drift_min, 'drift_max': drift_max})
-        # Draw drift (black), collection (grey), integration (colored), labels — full windows, no white over them
+            rt_min_global = min(rt_min_global, coll_min)
+            rt_max_global = max(rt_max_global, coll_max)
+            channel_data.append({'p': p, 'min_rt': min_rt, 'max_rt': max_rt, 'coll_min': coll_min, 'coll_max': coll_max})
+        # Draw collection (grey), integration (colored) — no drift bars (drift is instrument, not channel)
         for i, d in enumerate(channel_data):
-            p, min_rt, max_rt, coll_min, coll_max, drift_min, drift_max = d['p'], d['min_rt'], d['max_rt'], d['coll_min'], d['coll_max'], d['drift_min'], d['drift_max']
+            p, min_rt, max_rt, coll_min, coll_max = d['p'], d['min_rt'], d['max_rt'], d['coll_min'], d['coll_max']
             is_repeat = p.get('is_repeat_in_channel')
             draw_coll_min = coll_min
             draw_coll_max = coll_max
             coll_w = max(0.0, draw_coll_max - draw_coll_min)
-            # Left drift bar: crop to 0 so peptides with buffer below 0 are still shown
-            drift_left_draw = max(0.0, drift_min)
-            if drift_left_draw < coll_min and (coll_min - drift_left_draw) > 1e-6:
-                ax.barh(y_center, coll_min - drift_left_draw, height=bar_height, left=drift_left_draw, color=PEAK_DRIFT_BLACK, alpha=0.85, edgecolor='none', align='center', zorder=0)
-            if drift_max > coll_max and (drift_max - coll_max) > 1e-6:
-                ax.barh(y_center, drift_max - coll_max, height=bar_height, left=coll_max, color=PEAK_DRIFT_BLACK, alpha=0.85, edgecolor='none', align='center', zorder=0)
             coll_left_draw = max(0.0, draw_coll_min)
             if coll_w > 1e-6 and draw_coll_max > coll_left_draw:
                 ax.barh(y_center, draw_coll_max - coll_left_draw, height=bar_height, left=coll_left_draw, color=COLLECTION_GRAY, alpha=0.6, edgecolor='none', align='center', zorder=0.5)
@@ -6068,8 +6045,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
             if is_repeat:
                 label_str = label_str + " (repeat)" if label_str else "repeat"
             ax.text(int_left_draw + w / 2.0, y_center, label_str, fontsize=8, ha='center', va='center', color='k' if is_repeat else 'white', clip_on=True, path_effects=path_effects if not is_repeat else None)
-            x_anchor = max(0.0, drift_min) + 2.0
-            lines = _identifier_lines(p, drift_min=drift_min, drift_max=drift_max)
+            x_anchor = max(0.0, coll_min) + 2.0
+            lines = _identifier_lines(p, drift_min=coll_min, drift_max=coll_max)
             if i % 2 == 0:
                 y_ref = y_label_below
                 va = 'top'
@@ -6088,7 +6065,7 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     for ax in list(axes) + [ax_overlay]:
         ax.set_xlim(x_min, x_max)
     log_suffix = ' [log scale]' if use_log_scale else ''
-    axes[0].set_title(f'{protein_id} - RT integration windows by channel (no overlap within channel){log_suffix}\nBlack = peak drift (extends toward midpoint between peptides, gap left); gray = collection; colored = integration (by total_area)', fontsize=12, fontweight='bold', pad=10)
+    axes[0].set_title(f'{protein_id} - RT integration windows by channel (no overlap within channel){log_suffix}\nGray = collection window; colored = integration (by total_area)', fontsize=12, fontweight='bold', pad=10)
     # Big stage label: Passed / Excluded (figure coordinates, top-left of axes area)
     if stage_label is not None or n_passed is not None or n_excluded is not None:
         label_parts = []

@@ -35,30 +35,32 @@ Output: comet_frags_perc_openMS_confidence_accuracy.csv
 extract_chromatograms_from_comet_frags_csv_mzml.py
 Define input files, set default: mzml, and comet_frags_perc_openMS_confidence_accuracy.csv 
 but provide flags to provide custom inputs
-Do all the extraction steps necessary from the mzML --> Add values to csv
-as you go. 
+Do all the extraction steps necessary from the mzML --> Add values to csv as you go. 
 Output: comet_frags_perc_openMS_confidence_accuracy_extraction.csv
-Add all of the metrics we get during chromatogram extraction, including total_area, apex_peak, etc (we save them in the current version) we are jsut changing the name of the output csv. 
-Make the individual chromatogram plots in a directory for visual inspection
-Keep these as is they look great. 
-Store the integration windows of each peak in the output csv. 
-Calculate the collection window from the integration window
-Calculate the peak drift buffer window from the collection window. 
-Save the integration, collection, and integration windows in the output csv
-Record the fragment signals and the max signal in the ms2 scan for further filtering. 
+Add all of the metrics we get during chromatogram extraction, including total_area, apex_peak, etc.
+Make the individual chromatogram plots in a directory for visual inspection.
+Store the integration, collection, and peak drift windows in the output csv.
+Record the fragment signals and the max signal in the ms2 scan for further filtering.
 
-7. Filter by isotopic envelope (M0 > M1, M1 > M2):
+Integration window: Peak boundaries found by walking left/right from apex until intensity falls below
+  max(3% of apex, 3× noise estimate, 10th percentile) or a valley (neighboring peak). Then expanded via
+  log-space noise threshold for HDX tails.
+Collection window: Integration window + extension each side; extension = max(30s, 50% of integration width).
+Peak drift buffer: Fixed +30 seconds on each side of the collection window.
+Does NOT reject for envelope—computes envelope_ok and m0_gt_m1_gt_m2 for Step 7.
+Individual chromatogram plots: all-peptides overlay (linear) y-axis scaled to peak of interest (not dominated by larger peaks). 
+
+7. Filter by isotopic envelope (M+0 > M+1 or M+1 > M+2):
 cmd: filter_envelope.py
 Input: comet_frags_perc_openMS_confidence_accuracy_extraction.csv
 Keeps only rows where the isotopic envelope passes: M+0 > M+1 OR M+1 > M+2 (on summed MS1 in the peak window).
-Uses m0_gt_m1_gt_m2 or envelope_ok from chromatogram extraction (written to extraction CSV).
+Uses m0_gt_m1_gt_m2 or envelope_ok from Step 6 (computed during extraction; not rejected there).
 Output: comet_frags_perc_openMS_confidence_accuracy_extraction_envelope.csv
 
 8. Refine Significant Fragments:
 cmd: refine_significant_frags.py
 Inputs: comet_frags_perc_openMS_confidence_accuracy_extraction_envelope.csv
 The matched frags must be .5% max signal in the MS2
-and Must NOT be a noise spike (no plateau filter)
 Replace those old significant_frags and related columns with the refined data only. 
 rows that dont pass these filters (and have 0 significant fragments) should be removed from the csv
 Output: comet_frags_perc_openMS_confidence_accuracy_extraction_envelope_significance.csv
@@ -85,7 +87,8 @@ Determine number of channels by finding enough channels to accomodate all fragme
 Fit fragments into sets of 3 channels, each set of three called a  "method", prioritizinng by % relative area
 Do not repeat a peak within a method (3 channels) 
 Do not include overlapping RT windows within a channel. 
-Do not overlap integration, collection, or peak drift windows within a single channel. 
+Do not overlap integration, collection, or peak drift windows within a single channel.
+Peak drift window = collection window ± 30 seconds (fixed buffer each side). 
 Fit as many of the high signal peptides (>5% relative area) into the first three channels as possible. Start with the highest percent relative area peaks and the ones protected due to their valuable sequence coverage. 
 Once you organize the windows most compactly into the first 3 channels, back fill with lower signal peptides (between 1% to 5% relative area)
 Then, backfill with any peptides below 1% relative area

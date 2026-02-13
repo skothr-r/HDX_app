@@ -567,7 +567,8 @@ def assign_peptides_to_channels_by_layers(peptides, channels_per_layer=3):
     # Add layers: place unplaced first, then fill gaps with repeats from previous layers
     repeat_copies = []
     max_rt_sec = max((t[2] for t in with_drift), default=7200)
-    while unplaced:
+    MAX_LAYERS = 20  # cap to prevent infinite loop when many peptides overlap
+    while unplaced and len(layers) < MAX_LAYERS:
         new_layer = [[] for _ in range(CH)]
         # (1) Place as many unplaced as fit in this layer
         still_unplaced = []
@@ -586,7 +587,11 @@ def assign_peptides_to_channels_by_layers(peptides, channels_per_layer=3):
             best_ch = min(valid, key=lambda x: (x[0], x[1]))[1]
             new_layer[best_ch].append((p, d_lo, d_hi))
             placed = True
+        prev_unplaced_len = len(unplaced)
         unplaced = still_unplaced
+        if len(unplaced) >= prev_unplaced_len and len(unplaced) > 0:
+            # No progress: remaining peptides overlap each other; stop adding layers
+            break
         # (2) Fill gaps in new_layer with repeats from all previous layers
         prev_peptides = []
         for li, layer in enumerate(layers):
@@ -751,38 +756,41 @@ def _reshuffle_layer_channels(layer, CH):
     return
 
 
-def assign_peptides_to_channels(peptides, num_channels, gap_sec=None):
+def assign_peptides_to_channels(peptides, num_channels, gap_sec=None, preserve_order=False, use_collection_bounds=False):
     """
-    Assign in time order (earliest first). Reserve the full window (peak drift + collection + integration)
-    for each peptide: no overlap of full drift windows within a channel. Among channels where the
-    peptide's full window fits (drift_min >= last drift_max), prefer the channel with the earliest
-    end time. Mutates p['channel']. Returns peptides.
+    Assign peptides to channels. No overlap within a channel.
+    When use_collection_bounds=True: use collection window (cmin, cmax) for overlap - next peptide's
+    collection_min >= previous collection_max + gap_sec in channel. Collection windows never overlap.
+    When False: use drift window (collection ± 30s) - next drift_min >= previous drift_max. More spacing.
+    Among channels where the peptide fits, prefer the channel with the earliest end time.
+    When no channel fits without overlap, set channel=-1 (caller should filter these out).
+    When preserve_order=True, process in input order (e.g. total_area desc); otherwise sort by start (earliest first).
     """
-    if gap_sec is not None:
-        pass  # kept for API; full-window assignment ignores gap_sec (no extra gap)
+    min_gap = max(0.0, float(gap_sec)) if gap_sec is not None else 0.0
     with_bounds = []
     for p in peptides:
-        drift_lo, drift_hi = _get_drift_bounds(p)
-        with_bounds.append((p, drift_lo, drift_hi))
-    # Sort by start of full window (earliest first)
-    with_bounds.sort(key=lambda x: (x[1] if x[1] is not None else 0.0, x[2] if x[2] is not None else 0.0))
-    # Per channel: next peptide's full window must not overlap (drift_min >= this channel's last drift_max)
+        if use_collection_bounds:
+            lo, hi = _get_collection_bounds(p)
+            with_bounds.append((p, lo, hi))
+        else:
+            drift_lo, drift_hi = _get_drift_bounds(p)
+            with_bounds.append((p, drift_lo, drift_hi))
+    if not preserve_order:
+        with_bounds.sort(key=lambda x: (x[1] if x[1] is not None else 0.0, x[2] if x[2] is not None else 0.0))
     channel_end_times = [-float('inf')] * num_channels
-    for p, drift_lo, drift_hi in with_bounds:
-        if drift_lo is None or drift_hi is None:
-            drift_lo = 0.0
-            drift_hi = 1.0
-        if drift_lo >= drift_hi:
-            drift_hi = drift_lo + 1.0
-        candidates = [ch for ch in range(num_channels) if drift_lo >= channel_end_times[ch]]
+    for p, lo, hi in with_bounds:
+        if lo is None or hi is None:
+            lo, hi = 0.0, 1.0
+        if lo >= hi:
+            hi = lo + 1.0
+        # No overlap: next peptide's start must be >= previous end + gap
+        candidates = [ch for ch in range(num_channels) if lo >= channel_end_times[ch] + min_gap]
         if candidates:
             ch = min(candidates, key=lambda k: channel_end_times[k])
             p['channel'] = ch
-            channel_end_times[ch] = drift_hi
+            channel_end_times[ch] = hi
         else:
-            ch = min(range(num_channels), key=lambda k: channel_end_times[k])
-            p['channel'] = ch
-            channel_end_times[ch] = drift_hi
+            p['channel'] = -1
     return peptides
 
 
@@ -2153,17 +2161,10 @@ PEAK_DRIFT_OVERLAP_FRAC = 0.0  # no overlap: drift windows are separated by at l
 def _peak_drift_buffer_sec(cmin, cmax):
     """
     Compute peak drift buffer (seconds) on each side of the collection window.
-    Relative to collection width (like log-noise scaling): wider peaks get more buffer, narrower get less, with min/max bounds.
+    Fixed +30 seconds on either side.
     Returns buffer in seconds to add on left and right (same value).
     """
-    try:
-        w = float(cmax) - float(cmin)
-    except (TypeError, ValueError):
-        return PEAK_DRIFT_BUFFER_SEC
-    if w <= 0 or not (w == w):
-        return PEAK_DRIFT_BUFFER_SEC
-    buf = max(PEAK_DRIFT_BUFFER_MIN_SEC, min(PEAK_DRIFT_BUFFER_MAX_SEC, PEAK_DRIFT_BUFFER_FRAC * w))
-    return buf
+    return PEAK_DRIFT_BUFFER_SEC
 
 
 def _get_drift_bounds(p):

@@ -69,7 +69,7 @@ FILTER_TEST_SAMPLE_SIZE = 30          # when --test: randomly sample this many p
 FILTER_WINDOWS_HOW_MESSAGE = (
     "RT integration windows: For each peptide, the MS1 chromatogram is extracted around the precursor RT. "
     "The peak apex (max intensity) is found in a search window; boundaries are set by walking left/right from "
-    "the apex until intensity falls below max(1% of apex, 3× noise estimate) or a local minimum (valley). "
+    "the apex until intensity falls below max(3% of apex, 3× noise estimate, 10th percentile) or a valley (neighboring peak). "
     "That (min_rt, max_rt) is the integration window used for total_area, apex_intensity, and the RT grid."
 )
 

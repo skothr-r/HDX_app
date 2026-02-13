@@ -42,7 +42,7 @@ def main():
     ap.add_argument('--output-dir', '-o', default=None,
                     help='Output directory (default: same as input CSV directory)')
     ap.add_argument('--test', action='store_true',
-                    help='Test mode: sample 30 peptides only')
+                    help='Test mode: random sample of 30 peptides (faster run)')
     args = ap.parse_args()
 
     if not os.path.exists(args.csv):
