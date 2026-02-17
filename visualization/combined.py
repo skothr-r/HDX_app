@@ -1012,7 +1012,7 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
                     'rejection_reason': row.get('rejection_reason', ''),
                     'detected_peak_min_rt': row.get('detected_peak_min_rt'),
                     'detected_peak_max_rt': row.get('detected_peak_max_rt'),
-                    'detected_peak_window_size': row.get('detected_peak_window_window_size'),
+                    'detected_peak_window_size': row.get('detected_peak_window_size'),
                     'spectrum_window_min_rt': row.get('spectrum_window_min_rt'),
                     'spectrum_window_max_rt': row.get('spectrum_window_max_rt'),
                     'spectrum_window_size': row.get('spectrum_window_size'),
@@ -4635,17 +4635,17 @@ def create_fragment_pair_grid_from_peptides(peptides, single_aa_overhangs, prote
     print(f"  - Fragment length range (global): 1 to {max_fragment_length_global}")
 
 
-def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id, protein_length, output_file, results_dir, channel_only=False):
+def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id, protein_length, output_file, results_dir, channel_only=False, families_only=False, interactive_zoom=False):
     """
-    Full protein on x-axis, one block per unique (sequence, charge, mods) on y-axis.
-    Multiple scans of the same peptide merge into one block; different charges or modifications
-    of the same sequence each get their own block (a family can have multiple blocks).
+    Full protein on x-axis, one block per unique peptide sequence on y-axis.
+    Multiple PSMs (same or different charge/modifications) merge into one block.
     Overhangs and fragment pairs use significant data when available (5 ppm + >0.5% intensity).
     Each block: c-fragment rows, main sequence row (deep red = single-AA overhang; elsewhere shaded by summed fragment intensity across scans so darkest where many overlapping fragments have high signal), z-fragment rows.
     When fragment_intensity_c/z are present (from CSV matched fragment ion intensities), main-row darkness = normalized summed intensity; otherwise fallback to coverage count. Fragment rows use transparent blue-black and less saturated yellow at single-AA overhang; letters are Times New Roman, bold, large.
     Writes two files: ..._unique_peptides.png (ordered by position), ..._unique_peptides_by_total_area.png (ordered by total_area).
-    Each row = one unique peptide (sequence + charge + modifications).
+    Each row = one unique peptide sequence (PSMs with different charge/modifications merged).
     When channel_only=True (per-channel view): only the main grid and by_total_area/lowres are written; no family or segment breakdown plots.
+    When families_only=True: only the higher-def family segment plots are written (groups of overlapping sequences); skips main grid, by_total_area, lowres.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -4736,34 +4736,20 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
         except (TypeError, ValueError):
             return -1.0
 
-    def _canon_charge(c):
-        try:
-            return int(c) if c not in (None, '') else 0
-        except (TypeError, ValueError):
-            return 0
-
-    def _canon_mods(m):
-        if m in (None, ''):
-            return '-'
-        s = str(m).strip()
-        return s if s and s.lower() not in ('nan', '-') else '-'
-
-    # One block per unique peptide (sequence, charge, mods); multiple scans of same peptide merge into one block. Different charge or modifications = separate row.
-    # A family (same sequence) can have multiple blocks — each (sequence, charge, mods) gets its own block.
+    # One block per unique peptide sequence; multiple PSMs (same or different charge/modifications) merge into one block.
+    print(f"  [Grid] Grouping {len(peptides)} peptides by sequence...", flush=True)
     from collections import defaultdict
     groups_by_peptide = defaultdict(list)
     for p in peptides:
         plain = _plain_sequence(p)
         if not plain:
             continue
-        charge = _canon_charge(p.get('charge'))
-        mods = _canon_mods(p.get('modifications'))
-        key = (plain, charge, mods)
-        groups_by_peptide[key].append(p)
+        groups_by_peptide[plain].append(p)
 
     blocks = []
     for _key, group_psms in groups_by_peptide.items():
-        rep = group_psms[0]
+        # Representative: PSM with highest total_area (merge across charge/mod variants)
+        rep = max(group_psms, key=lambda p: _total_area(p))
         start, end, clean = _bounds(rep)
         if start is None or end is None or clean is None:
             continue
@@ -4803,7 +4789,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
         blocks.append((rep, start, end, L, clean, overhang, c_list, z_list, total_area, c_intensities, z_intensities))
 
     if blocks:
-        print(f"  Unique peptide grid: {len(peptides)} PSMs -> {len(blocks)} blocks (sequence+charge+mods; significant fragment pairs when available)")
+        print(f"  [Grid] Unique peptide grid: {len(peptides)} PSMs -> {len(blocks)} unique sequences (significant fragment pairs when available)", flush=True)
     if not blocks:
         print("  No accepted peptides with valid protein boundaries; skipping accepted-peptides protein grid")
         return
@@ -4878,6 +4864,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             if n_match > min_len // 2:  # majority: more than half of shorter peptide's residues match
                 family_edges.append((i, j))
     family_components = _union_find_components(num_peptides, family_edges)
+    print(f"  [Grid] Computed {len(family_components)} peptide families", flush=True)
     # Sort families by min(start) so leftmost protein region first; within family sort by (start, -length)
     families = []
     for comp in family_components:
@@ -4888,6 +4875,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
     families.sort(key=lambda f: f[1])  # by x_lo
 
     # Order by position (start, then -length)
+    print(f"  [Grid] Drawing position-ordered full grid...", flush=True)
     order_position = sorted(range(num_peptides), key=lambda i: (blocks[i][1], -blocks[i][3]))
     # Order by total_area (descending so large area at top)
     order_area = sorted(range(num_peptides), key=lambda i: (-blocks[i][8], blocks[i][1], -blocks[i][3]))  # total_area at index 8
@@ -5145,9 +5133,9 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             rect_outline = Rectangle((-1, bstart), protein_length + 1, block_heights[idx], linewidth=1.5, edgecolor='black', facecolor='none', zorder=3)
             ax.add_patch(rect_outline)
 
-        ax.set_ylabel('Unique peptides (one row per sequence+charge+mods; fragments below)', fontsize=10, fontweight='bold', fontfamily='serif')
+        ax.set_ylabel('Unique peptides (one row per sequence; fragments below)', fontsize=10, fontweight='bold', fontfamily='serif')
         ax.set_xlabel('Protein position', fontsize=10, fontweight='bold', fontfamily='serif')
-        ax.set_title(f'{protein_id} – Unique peptides and fragments\n(one row per sequence+charge+modifications; deep red = overhang; yellow = single-AA overhang in fragment rows)\n{title_suffix}', fontsize=11, fontweight='bold', fontfamily='serif')
+        ax.set_title(f'{protein_id} – Unique peptides and fragments\n(one row per sequence; deep red = overhang; yellow = single-AA overhang in fragment rows)\n{title_suffix}', fontsize=11, fontweight='bold', fontfamily='serif')
         from matplotlib.patches import Patch
         ax.legend(handles=[
             Patch(facecolor=OVERHANG_RED, edgecolor='gray', label='Single-AA overhang (main row)'),
@@ -5165,7 +5153,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             _set_total_area_colorbar_ticks(cbar)
         plt.savefig(out_path, dpi=use_dpi, bbox_inches='tight', pad_inches=0.25)
         plt.close()
-        print(f"  Saved: {out_path} (DPI {use_dpi}, {w:.0f}x{h:.0f} in)")
+        print(f"  [Grid] Saved: {os.path.basename(out_path)} (DPI {use_dpi}, {w:.0f}x{h:.0f} in)", flush=True)
 
     def draw_one_figure_segment(block_order, out_path, title_suffix, x_lo, x_hi):
         """Draw the grid restricted to protein positions [x_lo, x_hi] (1-based), only blocks overlapping that range."""
@@ -5336,28 +5324,34 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             _set_total_area_colorbar_ticks(cbar)
         plt.savefig(out_path, dpi=seg_dpi, bbox_inches='tight', pad_inches=0.25)
         plt.close()
-        print(f"  Saved segment {x_lo}–{x_hi}: {out_path}")
+        print(f"  [Grid] Saved segment {x_lo}–{x_hi}: {os.path.basename(out_path)}", flush=True)
 
-    # Position-ordered (full resolution)
-    draw_one_figure(order_position, output_file, 'rows ordered by protein position')
-    # Total-area-ordered
-    out_by_area = output_file.replace('_unique_peptides.png', '_unique_peptides_by_total_area.png')
-    if out_by_area == output_file:
-        out_by_area = output_file.replace('.png', '_by_total_area.png')
-    draw_one_figure(order_area, out_by_area, 'rows ordered by total area')
-    # Low-resolution full overview (position-ordered)
-    out_lowres = output_file.replace('_unique_peptides.png', '_unique_peptides_lowres.png')
-    if out_lowres == output_file:
-        out_lowres = output_file.replace('.png', '_lowres.png')
-    draw_one_figure(order_position, out_lowres, 'rows ordered by protein position (overview)', dpi=LOWRES_DPI)
+    # Position-ordered (full resolution) — skip when families_only
+    if not families_only:
+        draw_one_figure(order_position, output_file, 'rows ordered by protein position')
+        print(f"  [Grid] Drawing total-area-ordered grid...", flush=True)
+        # Total-area-ordered
+        out_by_area = output_file.replace('_unique_peptides.png', '_unique_peptides_by_total_area.png')
+        if out_by_area == output_file:
+            out_by_area = output_file.replace('.png', '_by_total_area.png')
+        draw_one_figure(order_area, out_by_area, 'rows ordered by total area')
+        print(f"  [Grid] Drawing low-res overview...", flush=True)
+        # Low-resolution full overview (position-ordered)
+        out_lowres = output_file.replace('_unique_peptides.png', '_unique_peptides_lowres.png')
+        if out_lowres == output_file:
+            out_lowres = output_file.replace('.png', '_lowres.png')
+        draw_one_figure(order_position, out_lowres, 'rows ordered by protein position (overview)', dpi=LOWRES_DPI)
 
-    # Family plots only for combined/total view (not for per-channel)
-    if not channel_only:
+    # Family plots only for combined/total view (not for per-channel); always run when families_only
+    if (not channel_only or families_only) and families:
+        print(f"  [Grid] Drawing {len(families)} family segment plots...", flush=True)
         base_seg = output_file.rsplit('.', 1)[0]  # strip .png
         for fam_idx, (family_block_indices, x_lo, x_hi) in enumerate(families, start=1):
             n_pep = len(family_block_indices)
             fam_path = f"{base_seg}_family{fam_idx}_pos{x_lo}-{x_hi}.png"
+            print(f"  [Grid]   Family {fam_idx}/{len(families)}: pos {x_lo}–{x_hi} ({n_pep} peptides)", flush=True)
             draw_one_figure_segment(family_block_indices, fam_path, f'family {fam_idx} (pos {x_lo}–{x_hi}, {n_pep} peptides)', x_lo, x_hi)
+    print(f"  [Grid] Unique peptide grid complete.", flush=True)
 
 
 def create_rt_overlay_only_plot(peptides, output_file, protein_id, total_area_range=None, stage_label=None, peptide_traces=None, rt_max_sec=None):
@@ -5467,7 +5461,7 @@ def create_rt_overlay_only_plot(peptides, output_file, protein_id, total_area_ra
     rt_max_global = -float('inf')
 
     width = max(40, 36)
-    height = 16.0
+    height = 32.0
     fig, ax_overlay = plt.subplots(1, 1, figsize=(width, height))
     # Black background for overlay
     fig.patch.set_facecolor('black')
@@ -5770,8 +5764,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     y_center = 0.5
     bar_height = 0.6
     width = max(40, 36)  # wider so overlay time axis is readable
-    height_overlay = 16.0  # much larger overlay panel (was 6.0)
-    height_per_channel = 4.0
+    height_overlay = 32.0  # much larger overlay panel for legibility
+    height_per_channel = 8.0
     fig, axes_all = plt.subplots(1 + num_channels, 1, figsize=(width, height_overlay + height_per_channel * num_channels), sharex=True)
     ax_overlay = axes_all[0]
     axes = axes_all[1:1 + num_channels]

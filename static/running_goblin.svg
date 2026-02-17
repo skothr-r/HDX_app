@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 55" width="80" height="55">
+  <style>
+    @keyframes run-right {
+      0%, 100% { transform: translateX(0) translateY(0); }
+      25% { transform: translateX(4px) translateY(-2px); }
+      50% { transform: translateX(8px) translateY(0); }
+      75% { transform: translateX(4px) translateY(-2px); }
+    }
+    @keyframes leg-back {
+      0%, 100% { transform: rotate(-28deg); }
+      50% { transform: rotate(22deg); }
+    }
+    @keyframes leg-front {
+      0%, 100% { transform: rotate(22deg); }
+      50% { transform: rotate(-28deg); }
+    }
+    @keyframes arm-back {
+      0%, 100% { transform: rotate(-35deg); }
+      50% { transform: rotate(28deg); }
+    }
+    @keyframes arm-front {
+      0%, 100% { transform: rotate(28deg); }
+      50% { transform: rotate(-35deg); }
+    }
+    .hobbit { animation: run-right 0.4s ease-in-out infinite; }
+    .leg-b { transform-origin: 44px 44px; animation: leg-back 0.2s ease-in-out infinite; }
+    .leg-f { transform-origin: 44px 44px; animation: leg-front 0.2s ease-in-out infinite; }
+    .arm-b { transform-origin: 42px 30px; animation: arm-back 0.2s ease-in-out infinite; }
+    .arm-f { transform-origin: 42px 30px; animation: arm-front 0.2s ease-in-out infinite; }
+  </style>
+  <g class="hobbit">
+    <!-- Side-view hobbit: faces right, running right. Big pointy ears. -->
+    <!-- Back ear (big, pointy, elvish) -->
+    <path d="M 18 6 L 12 0 L 20 8" fill="#c4a574" stroke="#a08050" stroke-width="0.5"/>
+    <!-- Second ear tip (slightly visible behind head) -->
+    <path d="M 22 4 L 20 0 L 24 6" fill="#c4a574"/>
+    <!-- Head (profile, round hobbit face) -->
+    <ellipse cx="34" cy="16" rx="11" ry="13" fill="#c4a574"/>
+    <!-- Nose (profile, prominent) -->
+    <ellipse cx="40" cy="16" rx="5" ry="6" fill="#b8956a"/>
+    <!-- Eye (one visible in profile) -->
+    <ellipse cx="38" cy="14" rx="2.5" ry="3" fill="#2c1810"/>
+    <circle cx="38" cy="13" r="0.6" fill="#fff"/>
+    <!-- Curly hobbit hair -->
+    <path d="M 22 12 Q 30 6 38 10" fill="none" stroke="#5c4033" stroke-width="2" stroke-linecap="round"/>
+    <!-- Tunic (medieval short tunic, side view) -->
+    <path d="M 30 28 L 28 48 L 44 48 L 46 28 Z" fill="#3d5c36" stroke="#2d4428" stroke-width="0.5"/>
+    <!-- Tunic collar -->
+    <path d="M 32 28 L 34 32 L 42 32 L 44 28" fill="#4a6b42"/>
+    <!-- Belt -->
+    <rect x="30" y="36" width="16" height="3" rx="1" fill="#5c4033"/>
+    <!-- Arm back (pumping) -->
+    <line class="arm-b" x1="42" y1="30" x2="28" y2="24" stroke="#c4a574" stroke-width="3.5" stroke-linecap="round"/>
+    <!-- Arm front -->
+    <line class="arm-f" x1="42" y1="30" x2="52" y2="26" stroke="#c4a574" stroke-width="3.5" stroke-linecap="round"/>
+    <!-- Leg back -->
+    <line class="leg-b" x1="44" y1="48" x2="34" y2="55" stroke="#6b5344" stroke-width="3.5" stroke-linecap="round"/>
+    <!-- Leg front -->
+    <line class="leg-f" x1="44" y1="48" x2="54" y2="55" stroke="#6b5344" stroke-width="3.5" stroke-linecap="round"/>
+  </g>
+</svg>

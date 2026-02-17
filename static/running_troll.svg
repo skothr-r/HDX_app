@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 60" width="80" height="60">
+  <style>
+    @keyframes run {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(2px) translateY(-1px); }
+      50% { transform: translateX(4px); }
+      75% { transform: translateX(2px) translateY(-1px); }
+    }
+    @keyframes leg-left {
+      0%, 100% { transform: rotate(-12deg); }
+      50% { transform: rotate(12deg); }
+    }
+    @keyframes leg-right {
+      0%, 100% { transform: rotate(12deg); }
+      50% { transform: rotate(-12deg); }
+    }
+    @keyframes arm-pump {
+      0%, 100% { transform: rotate(15deg); }
+      50% { transform: rotate(-15deg); }
+    }
+    .troll { animation: run 0.5s ease-in-out infinite; }
+    .leg-l { transform-origin: 40px 48px; animation: leg-left 0.25s ease-in-out infinite; }
+    .leg-r { transform-origin: 40px 48px; animation: leg-right 0.25s ease-in-out infinite; }
+    .arm-l { transform-origin: 36px 30px; animation: arm-pump 0.25s ease-in-out infinite; }
+    .arm-r { transform-origin: 44px 30px; animation: arm-pump 0.25s ease-in-out infinite reverse; }
+  </style>
+  <g class="troll">
+    <!-- Head (troll: big, lumpy, warty) -->
+    <ellipse cx="40" cy="16" rx="14" ry="12" fill="#6b8e6b"/>
+    <ellipse cx="35" cy="14" rx="3" ry="3" fill="#5a7d5a"/>
+    <ellipse cx="48" cy="15" rx="2" ry="2" fill="#5a7d5a"/>
+    <!-- Big troll nose -->
+    <ellipse cx="42" cy="20" rx="8" ry="6" fill="#5a7d5a"/>
+    <!-- Eyes (small, beady) -->
+    <circle cx="34" cy="14" r="2" fill="#1a1a1a"/>
+    <circle cx="46" cy="14" r="2" fill="#1a1a1a"/>
+    <!-- Body (stout) -->
+    <ellipse cx="40" cy="38" rx="12" ry="10" fill="#7a9e7a"/>
+    <!-- Arms (thick) -->
+    <line class="arm-l" x1="36" y1="30" x2="24" y2="42" stroke="#6b8e6b" stroke-width="5" stroke-linecap="round"/>
+    <line class="arm-r" x1="44" y1="30" x2="56" y2="42" stroke="#6b8e6b" stroke-width="5" stroke-linecap="round"/>
+    <!-- Legs (short, sturdy) -->
+    <line class="leg-l" x1="38" y1="48" x2="30" y2="58" stroke="#6b8e6b" stroke-width="5" stroke-linecap="round"/>
+    <line class="leg-r" x1="42" y1="48" x2="50" y2="58" stroke="#6b8e6b" stroke-width="5" stroke-linecap="round"/>
+  </g>
+</svg>

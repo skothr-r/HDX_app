@@ -1,0 +1,20 @@
+# Conda environment for the HDX Filtering Streamlit app
+# Install: conda env create -f environment_hdx_app.yml
+# Activate: conda activate hdx_app
+# Run: streamlit run hdx_filter_app.py
+
+name: hdx_app
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - libjpeg-turbo  # Avoid Homebrew libjpeg conflict with PIL/libtiff on macOS
+  - pyopenms
+  - streamlit>=1.41.0
+  - pandas>=1.5.0
+  - numpy>=1.21.0
+  - plotly>=5.0.0
+  - matplotlib>=3.5.0
+  - scipy
