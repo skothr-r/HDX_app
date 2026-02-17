@@ -28,35 +28,61 @@ except ImportError:
     HAS_PANDAS = False
     print("Warning: pandas not available, using manual CSV parsing")
 
+def _find_percolator():
+    """Return path to Percolator executable, or None if not found.
+    Checks PATH first, then bundled percolator.linux (for Streamlit Cloud).
+    """
+    import shutil
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # PATH first
+    exe = shutil.which('percolator')
+    if exe:
+        return exe
+    # Bundled Linux binary (Streamlit Cloud) - check multiple locations
+    if sys.platform.startswith('linux'):
+        candidates = [
+            os.path.join(script_dir, 'percolator.linux'),
+            os.path.join(os.path.dirname(script_dir), 'percolator.linux'),  # parent (repo root)
+            os.path.join(os.getcwd(), 'percolator.linux'),
+        ]
+        # Streamlit Cloud: app root may be /mount/src/<app_name>
+        for env in ('STREAMLIT_APP_ROOT', 'PWD'):
+            root = os.environ.get(env)
+            if root:
+                candidates.append(os.path.join(root, 'percolator.linux'))
+        for bundled in candidates:
+            if bundled and os.path.exists(bundled) and os.access(bundled, os.X_OK):
+                return bundled
+    return None
+
+
 def check_percolator():
     """Check if Percolator is available."""
-    import shutil
-    
-    # First check if command exists
-    if not shutil.which('percolator'):
+    exe = _find_percolator()
+    if not exe:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         print("Percolator not found in PATH.")
+        print(f"  Checked script dir: {script_dir}")
+        print(f"  percolator.linux exists: {os.path.exists(os.path.join(script_dir, 'percolator.linux'))}")
         print("To install Percolator:")
         print("  Option 1: conda install -c bioconda percolator")
         print("  Option 2: Download from https://github.com/percolator/percolator/releases")
         return False
-    
-    # Try to run percolator to verify it works (it will show usage/version info)
+
     try:
-        result = subprocess.run(['percolator'], 
+        result = subprocess.run([exe],
                               capture_output=True, text=True, timeout=5)
-        # Percolator shows version info in stderr when run without args
         if 'Percolator version' in result.stderr or 'Percolator version' in result.stdout:
-            version_line = [line for line in (result.stderr + result.stdout).split('\n') 
+            version_line = [line for line in (result.stderr + result.stdout).split('\n')
                           if 'Percolator version' in line]
             if version_line:
                 print(f"Found Percolator: {version_line[0].strip()}")
                 return True
-        # If we got here, percolator exists but output format is unexpected
         print("Found Percolator (version check format unexpected)")
         return True
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
-    
+
     print("Percolator not found in PATH.")
     print("To install Percolator:")
     print("  Option 1: conda install -c bioconda percolator")
@@ -138,9 +164,13 @@ def run_percolator(pin_file, output_prefix=None, test_fdr=None):
         # -U: keep all PSMs (do not deduplicate per scan); without this only one PSM per (ScanNr, ExpMass) is output
         # -m: output tab-delimited PSM results to file
         # -t: testFDR; default 0.01; use 1.0 to report q-values for all PSMs (no FDR filtering)
-        cmd = ['percolator', '-Y', '-U', '-m', output_prefix, pin_file]
+        percolator_exe = _find_percolator()
+        if not percolator_exe:
+            print("Percolator not found.")
+            return None
+        cmd = [percolator_exe, '-Y', '-U', '-m', output_prefix, pin_file]
         if test_fdr is not None:
-            cmd = ['percolator', '-Y', '-U', '-t', str(test_fdr), '-m', output_prefix, pin_file]
+            cmd = [percolator_exe, '-Y', '-U', '-t', str(test_fdr), '-m', output_prefix, pin_file]
             print(f"  Using -t {test_fdr} to include more PSMs in output")
         print(f"Command: {' '.join(cmd)}")
         
