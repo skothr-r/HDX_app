@@ -13,6 +13,7 @@ Run: streamlit run hdx_filter_app.py
 import os
 import subprocess
 import sys
+import tempfile
 from html import escape
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +32,13 @@ import matplotlib.pyplot as plt
 
 # Default paths — data/data_hdx holds mzML + FASTA; pipeline CSVs saved there
 DEFAULT_DATA_DIR = os.path.join(_SCRIPT_DIR, 'data', 'data_hdx')
+
+
+def _upload_dir() -> str:
+    """Directory for uploaded files (works on Streamlit Cloud where local data/ is empty)."""
+    d = os.path.join(tempfile.gettempdir(), 'hdx_app_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
 
 # Default Comet executable: project root (build with `make`)
 def _default_comet_exe() -> str:
@@ -401,14 +409,14 @@ def main():
         [data-testid="stToolbar"] {
             background-color: #002d6b !important;
         }
-        /* HDXpress branding on header — large title + subtitle lines, span across banner */
+        /* HDXapp branding on header — large title + subtitle lines, span across banner */
         [data-testid="stHeader"] {
             padding: 0.3rem 0.75rem !important;
             display: flex !important;
             align-items: center !important;
         }
         [data-testid="stHeader"]::before {
-            content: "HDXpress - The Guttman Lab\\A Department of Medicinal Chemistry - School of Pharmacology - University of Washington - Seattle";
+            content: "HDXapp - The Guttman Lab\\A Department of Medicinal Chemistry - School of Pharmacology - University of Washington - Seattle";
             white-space: pre-line;
             font-family: "Times New Roman", Times, serif !important;
             color: #FFF8E7 !important;
@@ -651,6 +659,26 @@ def main():
     params_path = default_params if os.path.exists(default_params) else (params_files[0] if params_files else None)
 
     with st.sidebar.expander('Files', expanded=True, icon='▶'):
+        # File upload for deployed app (Streamlit Cloud has no local data dir)
+        uploaded_csv = st.file_uploader('Upload CSV', type=['csv'], key='csv_upload',
+                                       help='Upload a CSV file. Required on the web app — Data dir paths do not work there.')
+        if not csv_files and not uploaded_csv:
+            st.caption('No CSV in Data dir. **Upload a CSV above** to load data and see all tabs.')
+        if uploaded_csv is not None:
+            upload_d = _upload_dir()
+            saved_path = os.path.join(upload_d, os.path.basename(uploaded_csv.name) or 'uploaded.csv')
+            with open(saved_path, 'wb') as f:
+                f.write(uploaded_csv.getvalue())
+            if 'uploaded_csv_path' not in st.session_state or st.session_state.uploaded_csv_path != saved_path:
+                st.session_state.uploaded_csv_path = saved_path
+            csv_path_from_upload = saved_path
+        else:
+            if 'uploaded_csv_path' in st.session_state and os.path.exists(st.session_state.uploaded_csv_path):
+                csv_path_from_upload = st.session_state.uploaded_csv_path
+            else:
+                csv_path_from_upload = None
+                if 'uploaded_csv_path' in st.session_state:
+                    del st.session_state.uploaded_csv_path
         mzml_display = st.selectbox('mzML', mzml_options, index=mzml_default_idx, key='mzml_sel')
         fasta_display = st.selectbox('FASTA', fasta_options, index=fasta_default_idx, key='fasta_sel')
         csv_display = st.selectbox('CSV', csv_options, index=csv_default_idx, key='csv_sel')
@@ -670,7 +698,9 @@ def main():
 
     mzml_path = mzml_files[mzml_options.index(mzml_display) - 1] if mzml_display != '— None —' and mzml_files else None
     fasta_path = fasta_files[fasta_options.index(fasta_display) - 1] if fasta_display != '— None —' and fasta_files else None
-    csv_path = csv_files[csv_options.index(csv_display)] if csv_display != '— No CSV files found —' and csv_files else None
+    csv_path = csv_path_from_upload if csv_path_from_upload else (
+        csv_files[csv_options.index(csv_display)] if csv_display != '— No CSV files found —' and csv_files else None
+    )
 
     # Run pipeline scripts (each outputs CSV + plots)
     def _build_env_and_cmd(cmd: list, needs_visualization: bool) -> tuple[dict, list]:
@@ -760,8 +790,12 @@ def main():
     if csv_path is None or not os.path.exists(csv_path):
         if not pipeline_mode:
             st.session_state.pending_run = None
-            st.error('Select a valid CSV file, or select mzML + FASTA to run the Comet → Percolator → OpenMS pipeline.')
-            st.info('CSV is required for filtering. mzML and FASTA are required for the pipeline.')
+            st.error('Load a CSV file to see the tabs and run the pipeline.')
+            st.info(
+                '**On the web app:** Use **Upload CSV** in the sidebar (Files section). '
+                'Data dir paths only work when running locally — the server cannot access your computer.'
+            )
+            st.info('**Locally:** Put CSV files in the Data dir, or use Upload CSV.')
             return
         df = pd.DataFrame()
         n_orig = 0
