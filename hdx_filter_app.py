@@ -42,7 +42,11 @@ def _upload_dir() -> str:
 
 # Default Comet executable: project root (build with `make`)
 def _default_comet_exe() -> str:
-    for name in ('comet.exe', 'comet'):
+    # Prefer platform-specific binary (comet.linux.exe on Streamlit Cloud)
+    candidates = ['comet.exe', 'comet']
+    if sys.platform.startswith('linux'):
+        candidates = ['comet.linux.exe', 'comet.exe', 'comet']
+    for name in candidates:
         path = os.path.join(_SCRIPT_DIR, name)
         if os.path.exists(path) and os.access(path, os.X_OK):
             return path
