@@ -622,15 +622,19 @@ def main():
     default_data = os.path.abspath(DEFAULT_DATA_DIR)
     has_files_in_default = any(_find_files(default_data, MZML_EXT + FASTA_EXT + CSV_EXT))
     default_out = default_data if has_files_in_default else upload_dir_default
+    # When default dir is empty (e.g. Streamlit Cloud), show upload path so users know where to add files
+    data_dir_default = default_data if has_files_in_default else upload_dir_default
     with st.sidebar.expander('Input', expanded=True, icon='▶'):
-        data_dir_input = st.text_input('Data directory', default_data, autocomplete='off',
-                                       help='Path to folder containing FASTA and mzML. App finds them automatically.')
+        data_dir_input = st.text_input('Data directory', data_dir_default, autocomplete='off',
+                                       help='Path to folder containing FASTA and mzML. When empty, use the upload section below.')
         output_dir = st.text_input('Out dir', default_out, autocomplete='off',
                                    help='Pipeline outputs go here.')
 
     # When dir is empty: offer upload to populate it (web app)
     upload_d = _upload_dir()
     with st.sidebar.expander('Upload (when directory is empty)', expanded=not has_files_in_default):
+        if not has_files_in_default:
+            st.caption('Add FASTA and mzML here. Files are saved to the data directory above.')
         if uploaded_fasta := st.file_uploader('FASTA', type=['fasta', 'fa', 'faa', 'fas'], key='fasta_upload'):
             p = os.path.join(upload_d, os.path.basename(uploaded_fasta.name) or 'uploaded.fasta')
             with open(p, 'wb') as f:
@@ -655,7 +659,7 @@ def main():
         if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
             data_dir = upload_dir
     if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
-        st.sidebar.caption('No FASTA or mzML in directory. Upload above to populate it.')
+        st.sidebar.caption('No FASTA or mzML in directory. Use the upload section below to add files.')
 
     def _rel_display(path: str) -> str:
         try:
@@ -1008,9 +1012,9 @@ def main():
             with pf1:
                 enable_conf = st.checkbox('Prefilter (Proline, Mods, Q/PEP)', True, key='enable_conf')
             with pf2:
-                q_thresh = st.slider('Q-value', 0.001, 0.2, 0.05, 0.005, key='q_thresh')
+                q_thresh = st.slider('Q-value', 0.001, 0.2, 0.05, 0.001, key='q_thresh')
             with pf3:
-                pep_thresh = st.slider('PEP', 0.001, 0.2, 0.05, 0.005, key='pep_thresh')
+                pep_thresh = st.slider('PEP', 0.001, 0.2, 0.05, 0.001, key='pep_thresh')
             with pf4:
                 reject_proline = st.checkbox('Proline', True, key='reject_pro')
             with pf5:
