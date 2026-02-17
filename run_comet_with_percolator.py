@@ -13,10 +13,11 @@ Usage:
 """
 
 import argparse
-import subprocess
-import sys
 import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -255,6 +256,8 @@ Example:
     parser.add_argument('--fasta', required=True, help='FASTA database file')
     parser.add_argument('--params', required=True, help='Comet parameter file')
     parser.add_argument('--comet-exe', help='Path to Comet executable (default: auto-detect)')
+    parser.add_argument('--output-dir', help='Directory for output [fasta]_comet.csv and .pin')
+    parser.add_argument('--output-base', help='Base name for output (default: FASTA basename)')
     parser.add_argument('--output-csv', help='Output CSV file name (default: auto-detect from input)')
     parser.add_argument('--skip-percolator', action='store_true',
                        help='Skip Percolator step (only run Comet)')
@@ -293,6 +296,19 @@ Example:
     
     csv_file = comet_output['csv']
     pin_file = comet_output.get('pin')
+
+    # Copy to [fasta]_comet.csv and [fasta]_comet.pin if --output-dir given
+    if args.output_dir:
+        out_base = args.output_base or os.path.splitext(os.path.basename(args.fasta))[0]
+        dst_csv = os.path.join(args.output_dir, f"{out_base}_comet.csv")
+        dst_pin = os.path.join(args.output_dir, f"{out_base}_comet.pin")
+        os.makedirs(args.output_dir, exist_ok=True)
+        if os.path.exists(csv_file):
+            shutil.copy2(csv_file, dst_csv)
+            csv_file = dst_csv
+        if pin_file and os.path.exists(pin_file):
+            shutil.copy2(pin_file, dst_pin)
+            pin_file = dst_pin
     
     # Step 2: Run Percolator (unless skipped)
     percolator_output = None

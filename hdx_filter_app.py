@@ -1261,15 +1261,14 @@ def main():
         st.caption('Run Comet search on mzML + FASTA. Outputs [fasta]_comet.csv and .pin for Percolator.')
         run_comet = st.button('Run Comet', key='run_comet', help='Comet search only — outputs [fasta]_comet.csv and .pin')
         if run_comet and mzml_path and fasta_path and params_path and os.path.exists(params_path):
+            fasta_base = os.path.splitext(os.path.basename(fasta_path))[0]
+            comet_csv = os.path.join(out_dir, fasta_base + '_comet.csv')
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'run_comet_with_percolator.py'),
-                   '--mzml', mzml_path, '--fasta', fasta_path, '--params', params_path, '--skip-percolator']
+                   '--mzml', mzml_path, '--fasta', fasta_path, '--params', params_path,
+                   '--skip-percolator', '--output-dir', out_dir, '--output-base', fasta_base]
             if comet_exe_path and comet_exe_path.strip():
                 cmd.extend(['--comet-exe', comet_exe_path.strip()])
-            fasta_base = os.path.splitext(os.path.basename(fasta_path))[0]
-            mzml_base = os.path.splitext(os.path.basename(mzml_path))[0]
-            comet_csv = os.path.join(out_dir, fasta_base + '_comet.csv')
-            _queue_run(cmd, 'Comet', '_comet.csv', run_cwd=out_dir, output_path=comet_csv,
-                       comet_rename=(mzml_base, fasta_base))
+            _queue_run(cmd, 'Comet', '_comet.csv', run_cwd=out_dir, output_path=comet_csv)
         elif run_comet and (not mzml_path or not fasta_path):
             st.warning('Select mzML and FASTA in the sidebar.')
         elif run_comet and (not params_path or not os.path.exists(params_path)):
