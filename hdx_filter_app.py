@@ -654,7 +654,7 @@ def main():
     data_dir = (data_dir_input or default_data).strip()
     if not os.path.isdir(data_dir):
         data_dir = default_data
-    upload_dir = st.session_state.get('uploaded_data_dir', '')
+    upload_dir = st.session_state.get('uploaded_data_dir', '') or upload_dir_default
     if upload_dir and os.path.isdir(upload_dir) and any(_find_files(upload_dir, MZML_EXT + FASTA_EXT)):
         if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
             data_dir = upload_dir
