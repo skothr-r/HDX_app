@@ -148,7 +148,9 @@ def run_comet(mzml_file, fasta_file, params_file, comet_exe=None):
         print(f"Command: {' '.join(cmd)}")
         print()
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        # Run Comet from mzML dir so output lands there
+        mzml_dir = os.path.dirname(os.path.abspath(mzml_file))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, cwd=mzml_dir)
         
         if result.returncode != 0:
             print("Error running Comet:")
@@ -160,26 +162,55 @@ def run_comet(mzml_file, fasta_file, params_file, comet_exe=None):
 
         print("Comet search completed successfully")
 
-        # Comet writes to cwd (app sets run_cwd=out_dir)
+        # Comet writes next to input file; also check cwd
         cwd = os.getcwd()
+        mzml_dir = os.path.dirname(os.path.abspath(mzml_file))
         base_name = os.path.splitext(os.path.basename(mzml_file))[0]
-        csv_file = os.path.join(cwd, f"{base_name}.csv")
-        pin_file = os.path.join(cwd, f"{base_name}.pin")
+        search_dirs = list(dict.fromkeys([cwd, mzml_dir]))
 
-        if not os.path.exists(csv_file):
-            csv_file_pp = os.path.join(cwd, f"{base_name}_PP.csv")
-            if os.path.exists(csv_file_pp):
-                csv_file = csv_file_pp
-            else:
-                print("Error: Could not find CSV output file")
-                return None
+        csv_file = None
+        for d in search_dirs:
+            for name in (f"{base_name}.csv", f"{base_name}_PP.csv"):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    csv_file = p
+                    break
+            if csv_file:
+                break
 
-        if not os.path.exists(pin_file):
-            pin_file_pp = os.path.join(cwd, f"{base_name}_PP.pin")
-            if os.path.exists(pin_file_pp):
-                pin_file = pin_file_pp
-            else:
-                pin_file = None
+        if not csv_file:
+            # Fallback: Comet may output .txt only; convert to .csv
+            txt_file = None
+            for d in search_dirs:
+                for name in (f"{base_name}.txt", f"{base_name}_PP.txt"):
+                    p = os.path.join(d, name)
+                    if os.path.exists(p):
+                        txt_file = p
+                        break
+                if txt_file:
+                    break
+            if txt_file:
+                csv_file = os.path.join(os.path.dirname(txt_file), f"{base_name}.csv")
+                with open(txt_file, 'r') as f_in, open(csv_file, 'w') as f_out:
+                    for line in f_in:
+                        f_out.write(line.rstrip().replace('\t', ',') + '\n')
+                print(f"Converted {os.path.basename(txt_file)} to {os.path.basename(csv_file)}")
+
+        if not csv_file or not os.path.exists(csv_file):
+            print("Error: Could not find CSV output file")
+            print(f"  Searched in: {search_dirs}")
+            print(f"  Looking for: {base_name}.csv or {base_name}_PP.csv")
+            return None
+
+        pin_file = None
+        for d in search_dirs:
+            for name in (f"{base_name}.pin", f"{base_name}_PP.pin"):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    pin_file = p
+                    break
+            if pin_file:
+                break
 
         return {
             'csv': csv_file,
