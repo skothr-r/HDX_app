@@ -732,7 +732,7 @@ def main():
 
     out_dir = (output_dir.strip() if output_dir else '') or (
         os.path.dirname(csv_path) if csv_path else
-        (_upload_dir() if (mzml_path_from_upload or fasta_path_from_upload) else data_dir)
+        (upload_dir if upload_dir and data_dir == upload_dir else data_dir)
     )
     os.makedirs(out_dir, exist_ok=True)
     for sub in ['diagnostics', 'extraction', 'rejected_extraction', 'envelope', 'envelope_rejected', 'sequence_coverage', 'channel_assignment', 'fragmentation_source']:
@@ -777,23 +777,38 @@ def main():
     if csv_path is None or not os.path.exists(csv_path):
         if not pipeline_mode:
             st.session_state.pending_run = None
-            st.error('Upload **FASTA** and **mzML** in the sidebar.')
+            st.error('Upload **FASTA** and **mzML** in the sidebar to get started.')
             st.info('That\'s all you need. The pipeline (Comet → Percolator → OpenMS) will generate the rest.')
-            return
-        df = pd.DataFrame()
-        n_orig = 0
-        n_final = 0
-        base = ''
-        step_conf_base = ''
-        step_counts = []
-        has_extraction = False
-        has_envelope = False
-        has_sig_frags = False
-        has_coelution = False
-        has_confidence = False
-        qcol = None
-        pepcol = None
-        df_orig = pd.DataFrame()
+            # Still show tabs so user sees the structure
+            df = pd.DataFrame()
+            n_orig = 0
+            n_final = 0
+            base = ''
+            step_conf_base = ''
+            step_counts = []
+            has_extraction = False
+            has_envelope = False
+            has_sig_frags = False
+            has_coelution = False
+            has_confidence = False
+            qcol = None
+            pepcol = None
+            df_orig = pd.DataFrame()
+        else:
+            df = pd.DataFrame()
+            n_orig = 0
+            n_final = 0
+            base = ''
+            step_conf_base = ''
+            step_counts = []
+            has_extraction = False
+            has_envelope = False
+            has_sig_frags = False
+            has_coelution = False
+            has_confidence = False
+            qcol = None
+            pepcol = None
+            df_orig = pd.DataFrame()
     else:
         df = load_csv(csv_path)
         # Optionally merge shape_corr from chromatogram_metrics if missing
