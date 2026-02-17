@@ -687,6 +687,17 @@ def main():
     csv_files = _find_files(data_dir, CSV_EXT)
     mzml_path = mzml_files[0] if mzml_files else None
     fasta_path = fasta_files[0] if fasta_files else None
+    # Override: when session has both uploads, use their paths directly (Streamlit Cloud)
+    if st.session_state.get('uploaded_fasta') and st.session_state.get('uploaded_mzml'):
+        ud = st.session_state.get('uploaded_data_dir', '') or upload_dir_default
+        if ud and os.path.isdir(ud):
+            fasta_name = st.session_state.uploaded_fasta[0]
+            mzml_name = st.session_state.uploaded_mzml[0]
+            fp = os.path.join(ud, fasta_name)
+            mp = os.path.join(ud, mzml_name)
+            if os.path.exists(fp) and os.path.exists(mp):
+                fasta_path = fp
+                mzml_path = mp
     csv_default_idx = 0
     if csv_files:
         for i, p in enumerate(csv_files):
