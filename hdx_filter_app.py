@@ -631,25 +631,37 @@ def main():
                                    help='Pipeline outputs go here.')
 
     # When dir is empty: offer upload to populate it (web app)
+    # On Streamlit Cloud, disk is ephemeral — store bytes in session_state and re-write each run
     upload_d = _upload_dir()
     with st.sidebar.expander('Upload (when directory is empty)', expanded=not has_files_in_default):
         if not has_files_in_default:
             st.caption('Add FASTA and mzML here. Files are saved to the data directory above.')
         if uploaded_fasta := st.file_uploader('FASTA', type=['fasta', 'fa', 'faa', 'fas'], key='fasta_upload'):
-            p = os.path.join(upload_d, os.path.basename(uploaded_fasta.name) or 'uploaded.fasta')
-            with open(p, 'wb') as f:
-                f.write(uploaded_fasta.getvalue())
+            data = uploaded_fasta.getvalue()
+            st.session_state.uploaded_fasta = (os.path.basename(uploaded_fasta.name) or 'uploaded.fasta', data)
             st.session_state.uploaded_data_dir = upload_d
         if uploaded_mzml := st.file_uploader('mzML', type=['mzml', 'mzML'], key='mzml_upload'):
-            p = os.path.join(upload_d, os.path.basename(uploaded_mzml.name) or 'uploaded.mzML')
-            with open(p, 'wb') as f:
-                f.write(uploaded_mzml.getvalue())
+            data = uploaded_mzml.getvalue()
+            st.session_state.uploaded_mzml = (os.path.basename(uploaded_mzml.name) or 'uploaded.mzML', data)
             st.session_state.uploaded_data_dir = upload_d
         if uploaded_csv := st.file_uploader('CSV (optional)', type=['csv'], key='csv_upload'):
             p = os.path.join(upload_d, os.path.basename(uploaded_csv.name) or 'uploaded.csv')
             with open(p, 'wb') as f:
                 f.write(uploaded_csv.getvalue())
             st.session_state.uploaded_data_dir = upload_d
+    # Re-write session-stored uploads to disk each run (needed for Streamlit Cloud ephemeral filesystem)
+    if up := st.session_state.get('uploaded_fasta'):
+        name, data = up
+        p = os.path.join(upload_d, name)
+        with open(p, 'wb') as f:
+            f.write(data)
+        st.session_state.uploaded_data_dir = upload_d
+    if up := st.session_state.get('uploaded_mzml'):
+        name, data = up
+        p = os.path.join(upload_d, name)
+        with open(p, 'wb') as f:
+            f.write(data)
+        st.session_state.uploaded_data_dir = upload_d
     # Use upload dir when input dir is empty and we have uploads
     data_dir = (data_dir_input or default_data).strip()
     if not os.path.isdir(data_dir):
@@ -660,6 +672,8 @@ def main():
             data_dir = upload_dir
     if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
         st.sidebar.caption('No FASTA or mzML in directory. Use the upload section below to add files.')
+    elif st.session_state.get('uploaded_fasta') or st.session_state.get('uploaded_mzml'):
+        st.sidebar.caption('FASTA and mzML loaded from upload.')
 
     def _rel_display(path: str) -> str:
         try:
