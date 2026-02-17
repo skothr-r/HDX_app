@@ -688,7 +688,14 @@ def main():
 
     mzml_files = _find_files(data_dir, MZML_EXT)
     fasta_files = _find_files(data_dir, FASTA_EXT)
-    csv_files = _find_files(data_dir, CSV_EXT)
+    csv_files = list(_find_files(data_dir, CSV_EXT))
+    # Include output dir so pipeline outputs (Comet, Percolator, OpenMS) are discoverable
+    output_dir_val = (output_dir.strip() if output_dir else '') or ''
+    if output_dir_val and os.path.isdir(output_dir_val) and output_dir_val != data_dir:
+        for p in _find_files(output_dir_val, CSV_EXT):
+            if p not in csv_files:
+                csv_files.append(p)
+        csv_files = sorted(csv_files)
     mzml_path = mzml_files[0] if mzml_files else None
     fasta_path = fasta_files[0] if fasta_files else None
     # Override: when session has both uploads, use their paths directly (Streamlit Cloud)
@@ -703,11 +710,19 @@ def main():
                 fasta_path = fp
                 mzml_path = mp
     csv_default_idx = 0
+    last_out_preview = st.session_state.get('last_step_output')
     if csv_files:
         for i, p in enumerate(csv_files):
             if os.path.basename(p).endswith('_comet_perc_openMS.csv'):
                 csv_default_idx = i
                 break
+        # Prefer last step output when it exists in the list (e.g. Percolator just ran)
+        if last_out_preview and os.path.exists(last_out_preview):
+            norm_last = os.path.normpath(os.path.abspath(last_out_preview))
+            for i, p in enumerate(csv_files):
+                if os.path.normpath(os.path.abspath(p)) == norm_last:
+                    csv_default_idx = i
+                    break
     csv_path = csv_files[csv_default_idx] if csv_files else None
 
     params_files = _find_files(data_dir, ('.params',))
@@ -798,7 +813,8 @@ def main():
     # Always show which CSV is loaded (visible in sidebar on every tab)
     if csv_path and os.path.exists(csv_path):
         _last_name = st.session_state.get('last_step_name')
-        if last_out and csv_path == last_out and _last_name:
+        _paths_match = last_out and os.path.normpath(os.path.abspath(csv_path)) == os.path.normpath(os.path.abspath(last_out))
+        if _paths_match and _last_name:
             st.sidebar.success(f"📁 **Auto-loaded:** {os.path.basename(csv_path)} (from **{_last_name}** step)")
             if st.sidebar.button('Revert to dropdown', key='clear_auto_sidebar', help='Use CSV from Files dropdown instead'):
                 st.session_state.last_step_output = None
@@ -939,7 +955,8 @@ def main():
     # Auto-load banner — visible above all tabs when CSV was loaded from previous step
     last_out = st.session_state.get('last_step_output')
     last_name = st.session_state.get('last_step_name') or 'previous step'
-    if last_out and os.path.exists(last_out) and csv_path == last_out:
+    _banner_match = last_out and csv_path and os.path.normpath(os.path.abspath(csv_path)) == os.path.normpath(os.path.abspath(last_out))
+    if _banner_match and os.path.exists(csv_path):
         bc, bbtn = st.columns([6, 1])
         with bc:
             st.info(f"📁 **Auto-loaded:** {os.path.basename(csv_path)} from **{last_name}** step. Shown in all tabs below.")
@@ -1315,7 +1332,10 @@ def main():
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'add_ms1_data_openms.py'), openms_csv_in, mzml_path, openms_csv_out]
             _queue_run(cmd, 'OpenMS MS1', '_comet_perc_openMS.csv', output_path=openms_csv_out)
         elif run_openms and (not openms_csv_in or not mzml_path):
-            st.warning('Run Comet and Percolator first. Select mzML in sidebar.')
+            if not openms_csv_in:
+                st.warning('Run Comet and Percolator first.')
+            if not mzml_path or not os.path.exists(mzml_path):
+                st.warning('Select mzML in sidebar.')
         if run_seqpos and openms_csv_in and fasta_path and os.path.exists(fasta_path):
             seqpos_out = os.path.join(out_dir, os.path.splitext(os.path.basename(openms_csv_in))[0] + '_positions.csv')
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'add_sequence_positions.py'), openms_csv_in, fasta_path, seqpos_out]
