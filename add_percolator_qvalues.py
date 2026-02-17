@@ -60,10 +60,7 @@ def check_percolator():
     """Check if Percolator is available."""
     exe = _find_percolator()
     if not exe:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         print("Percolator not found in PATH.")
-        print(f"  Checked script dir: {script_dir}")
-        print(f"  percolator.linux exists: {os.path.exists(os.path.join(script_dir, 'percolator.linux'))}")
         print("To install Percolator:")
         print("  Option 1: conda install -c bioconda percolator")
         print("  Option 2: Download from https://github.com/percolator/percolator/releases")
