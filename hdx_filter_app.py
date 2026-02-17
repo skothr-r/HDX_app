@@ -617,15 +617,47 @@ def main():
         pyopenms_ok = False
         st.warning('pyopenms not found. Steps 5, 6, and 8 require it. Use: conda activate hdx_app (or set DYLD_LIBRARY_PATH on macOS).')
 
-    # Sidebar: file selection (ChimeraX-style compact)
+    # Sidebar: directory + optional upload (when dir is empty)
+    upload_dir_default = _upload_dir()
+    default_data = os.path.abspath(DEFAULT_DATA_DIR)
+    has_files_in_default = any(_find_files(default_data, MZML_EXT + FASTA_EXT + CSV_EXT))
+    default_out = default_data if has_files_in_default else upload_dir_default
     with st.sidebar.expander('Input', expanded=True, icon='▶'):
-        data_dir = st.text_input('Data dir', os.path.abspath(DEFAULT_DATA_DIR), autocomplete='off')
-        output_dir = st.text_input('Out dir', os.path.abspath(DEFAULT_DATA_DIR),
-                                   help='Pipeline CSVs saved here. Same as Data dir for [fasta]_comet.csv, _comet_perc.csv, _comet_perc_openMS.csv',
-                                   autocomplete='off')
+        data_dir_input = st.text_input('Data directory', default_data, autocomplete='off',
+                                       help='Path to folder containing FASTA and mzML. App finds them automatically.')
+        output_dir = st.text_input('Out dir', default_out, autocomplete='off',
+                                   help='Pipeline outputs go here.')
+
+    # When dir is empty: offer upload to populate it (web app)
+    upload_d = _upload_dir()
+    with st.sidebar.expander('Upload (when directory is empty)', expanded=not has_files_in_default):
+        if uploaded_fasta := st.file_uploader('FASTA', type=['fasta', 'fa', 'faa', 'fas'], key='fasta_upload'):
+            p = os.path.join(upload_d, os.path.basename(uploaded_fasta.name) or 'uploaded.fasta')
+            with open(p, 'wb') as f:
+                f.write(uploaded_fasta.getvalue())
+            st.session_state.uploaded_data_dir = upload_d
+        if uploaded_mzml := st.file_uploader('mzML', type=['mzml', 'mzML'], key='mzml_upload'):
+            p = os.path.join(upload_d, os.path.basename(uploaded_mzml.name) or 'uploaded.mzML')
+            with open(p, 'wb') as f:
+                f.write(uploaded_mzml.getvalue())
+            st.session_state.uploaded_data_dir = upload_d
+        if uploaded_csv := st.file_uploader('CSV (optional)', type=['csv'], key='csv_upload'):
+            p = os.path.join(upload_d, os.path.basename(uploaded_csv.name) or 'uploaded.csv')
+            with open(p, 'wb') as f:
+                f.write(uploaded_csv.getvalue())
+            st.session_state.uploaded_data_dir = upload_d
+    # Use upload dir when input dir is empty and we have uploads
+    data_dir = (data_dir_input or default_data).strip()
+    if not os.path.isdir(data_dir):
+        data_dir = default_data
+    upload_dir = st.session_state.get('uploaded_data_dir', '')
+    if upload_dir and os.path.isdir(upload_dir) and any(_find_files(upload_dir, MZML_EXT + FASTA_EXT)):
+        if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
+            data_dir = upload_dir
+    if not any(_find_files(data_dir, MZML_EXT + FASTA_EXT)):
+        st.sidebar.caption('No FASTA or mzML in directory. Upload above to populate it.')
 
     def _rel_display(path: str) -> str:
-        """Display path relative to data_dir, or full path if outside."""
         try:
             rel = os.path.relpath(path, data_dir)
             return rel if not rel.startswith('..') else path
@@ -635,72 +667,24 @@ def main():
     mzml_files = _find_files(data_dir, MZML_EXT)
     fasta_files = _find_files(data_dir, FASTA_EXT)
     csv_files = _find_files(data_dir, CSV_EXT)
-
-    mzml_options = ['— None —'] + [_rel_display(p) for p in mzml_files]
-    fasta_options = ['— None —'] + [_rel_display(p) for p in fasta_files]
-    csv_options = [_rel_display(p) for p in csv_files] if csv_files else ['— No CSV files found —']
+    mzml_path = mzml_files[0] if mzml_files else None
+    fasta_path = fasta_files[0] if fasta_files else None
     csv_default_idx = 0
     if csv_files:
         for i, p in enumerate(csv_files):
             if os.path.basename(p).endswith('_comet_perc_openMS.csv'):
                 csv_default_idx = i
                 break
-    mzml_default_idx = 1 if mzml_files else 0  # Auto-select first mzML
-    fasta_default_idx = 1 if fasta_files else 0  # Auto-select first FASTA
+    csv_path = csv_files[csv_default_idx] if csv_files else None
 
     params_files = _find_files(data_dir, ('.params',))
-    # Preferred: comet.params.new in project root (HDX workflow)
     default_params = os.path.join(_SCRIPT_DIR, 'comet.params.new')
-    params_options = []
-    if os.path.exists(default_params):
-        params_options.append(os.path.basename(default_params) + ' (project)')
-    params_options += [_rel_display(p) for p in params_files]
-    params_default_idx = 0  # comet.params.new (project) when present
     params_path = default_params if os.path.exists(default_params) else (params_files[0] if params_files else None)
 
-    with st.sidebar.expander('Files', expanded=True, icon='▶'):
-        # File upload for deployed app (Streamlit Cloud has no local data dir)
-        uploaded_csv = st.file_uploader('Upload CSV', type=['csv'], key='csv_upload',
-                                       help='Upload a CSV file. Required on the web app — Data dir paths do not work there.')
-        if not csv_files and not uploaded_csv:
-            st.caption('No CSV in Data dir. **Upload a CSV above** to load data and see all tabs.')
-        if uploaded_csv is not None:
-            upload_d = _upload_dir()
-            saved_path = os.path.join(upload_d, os.path.basename(uploaded_csv.name) or 'uploaded.csv')
-            with open(saved_path, 'wb') as f:
-                f.write(uploaded_csv.getvalue())
-            if 'uploaded_csv_path' not in st.session_state or st.session_state.uploaded_csv_path != saved_path:
-                st.session_state.uploaded_csv_path = saved_path
-            csv_path_from_upload = saved_path
-        else:
-            if 'uploaded_csv_path' in st.session_state and os.path.exists(st.session_state.uploaded_csv_path):
-                csv_path_from_upload = st.session_state.uploaded_csv_path
-            else:
-                csv_path_from_upload = None
-                if 'uploaded_csv_path' in st.session_state:
-                    del st.session_state.uploaded_csv_path
-        mzml_display = st.selectbox('mzML', mzml_options, index=mzml_default_idx, key='mzml_sel')
-        fasta_display = st.selectbox('FASTA', fasta_options, index=fasta_default_idx, key='fasta_sel')
-        csv_display = st.selectbox('CSV', csv_options, index=csv_default_idx, key='csv_sel')
-        if params_options:
-            params_display = st.selectbox('Comet params', params_options, index=params_default_idx, key='params_sel')
-            if params_display.endswith(' (project)'):
-                params_path = default_params
-            else:
-                offset = 1 if os.path.exists(default_params) else 0
-                idx = params_options.index(params_display) - offset
-                params_path = params_files[idx] if 0 <= idx < len(params_files) else params_path
-        else:
-            params_path = None
+    with st.sidebar.expander('Advanced', expanded=False, icon='▶'):
         comet_exe_path = st.text_input('Comet exe', _default_comet_exe(),
                                        help='Path to comet.exe (build with `make` in project root)',
                                        autocomplete='off')
-
-    mzml_path = mzml_files[mzml_options.index(mzml_display) - 1] if mzml_display != '— None —' and mzml_files else None
-    fasta_path = fasta_files[fasta_options.index(fasta_display) - 1] if fasta_display != '— None —' and fasta_files else None
-    csv_path = csv_path_from_upload if csv_path_from_upload else (
-        csv_files[csv_options.index(csv_display)] if csv_display != '— No CSV files found —' and csv_files else None
-    )
 
     # Run pipeline scripts (each outputs CSV + plots)
     def _build_env_and_cmd(cmd: list, needs_visualization: bool) -> tuple[dict, list]:
@@ -746,7 +730,10 @@ def main():
         out_path = output_path or (input_path and _step_output_path(input_path, out_dir, out_suffix))
         st.session_state.pending_run = (cmd, step_name, out_suffix, needs_visualization, out_path, run_cwd, comet_rename)
 
-    out_dir = (output_dir.strip() if output_dir else '') or (os.path.dirname(csv_path) if csv_path else data_dir)
+    out_dir = (output_dir.strip() if output_dir else '') or (
+        os.path.dirname(csv_path) if csv_path else
+        (_upload_dir() if (mzml_path_from_upload or fasta_path_from_upload) else data_dir)
+    )
     os.makedirs(out_dir, exist_ok=True)
     for sub in ['diagnostics', 'extraction', 'rejected_extraction', 'envelope', 'envelope_rejected', 'sequence_coverage', 'channel_assignment', 'fragmentation_source']:
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
@@ -790,12 +777,8 @@ def main():
     if csv_path is None or not os.path.exists(csv_path):
         if not pipeline_mode:
             st.session_state.pending_run = None
-            st.error('Load a CSV file to see the tabs and run the pipeline.')
-            st.info(
-                '**On the web app:** Use **Upload CSV** in the sidebar (Files section). '
-                'Data dir paths only work when running locally — the server cannot access your computer.'
-            )
-            st.info('**Locally:** Put CSV files in the Data dir, or use Upload CSV.')
+            st.error('Upload **FASTA** and **mzML** in the sidebar.')
+            st.info('That\'s all you need. The pipeline (Comet → Percolator → OpenMS) will generate the rest.')
             return
         df = pd.DataFrame()
         n_orig = 0
