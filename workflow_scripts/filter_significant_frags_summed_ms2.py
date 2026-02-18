@@ -147,19 +147,19 @@ def main():
         skip = 0
     df = pd.read_csv(args.input, sep=',', skiprows=skip, engine='python', quotechar='"', on_bad_lines='warn')
 
-    min_rt_col = 'detected_peak_min_rt' if 'detected_peak_min_rt' in df.columns else 'min_rt'
-    max_rt_col = 'detected_peak_max_rt' if 'detected_peak_max_rt' in df.columns else 'max_rt'
+    min_rt_col = 'MS1_RT_integration_start_sec' if 'MS1_RT_integration_start_sec' in df.columns else ('detected_peak_min_rt' if 'detected_peak_min_rt' in df.columns else 'min_rt')
+    max_rt_col = 'MS1_RT_integration_stop_sec' if 'MS1_RT_integration_stop_sec' in df.columns else ('detected_peak_max_rt' if 'detected_peak_max_rt' in df.columns else 'max_rt')
     if min_rt_col not in df.columns:
-        min_rt_col = 'collection_min_rt'
+        min_rt_col = 'MS1_RT_collection_start_sec' if 'MS1_RT_collection_start_sec' in df.columns else 'collection_min_rt'
     if max_rt_col not in df.columns:
-        max_rt_col = 'collection_max_rt'
+        max_rt_col = 'MS1_RT_collection_stop_sec' if 'MS1_RT_collection_stop_sec' in df.columns else 'collection_max_rt'
     if min_rt_col not in df.columns:
         min_rt_col = 'anchor_rt'
     if max_rt_col not in df.columns:
         max_rt_col = 'anchor_rt'
 
     if min_rt_col not in df.columns or max_rt_col not in df.columns:
-        print("Error: CSV must have RT window columns (detected_peak_min_rt/max_rt, collection_min_rt/max_rt, or anchor_rt).")
+        print("Error: CSV must have RT window columns (MS1_RT_integration_*_sec, MS1_RT_collection_*_sec, detected_peak_*, collection_*, or anchor_rt).")
         sys.exit(1)
 
     # Ensure output columns exist (significant_frags = pass all 3 criteria)
@@ -217,7 +217,7 @@ def main():
         min_rt = row.get(min_rt_col)
         max_rt = row.get(max_rt_col)
         if pd.isna(min_rt) or pd.isna(max_rt) or min_rt is None or max_rt is None:
-            min_rt = row.get('anchor_rt') or row.get('MS1_retention_time_sec')
+            min_rt = row.get('anchor_rt') or row.get('MS1_RT_sec') or row.get('MS1_retention_time_sec')
             max_rt = min_rt
         min_rt = float(min_rt) if min_rt is not None and not pd.isna(min_rt) else None
         max_rt = float(max_rt) if max_rt is not None and not pd.isna(max_rt) else None
@@ -309,6 +309,22 @@ def main():
             df.at[idx, 'single_aa_overhangs_protein_positions'] = overhang_str
 
     df = df.drop(index=rows_to_drop).reset_index(drop=True)
+    # Standardize legacy retention_time headers to RT headers.
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df.columns:
+            if new in df.columns:
+                df[new] = df[old].where(pd.notna(df[old]), df[new])
+                df = df.drop(columns=[old])
+            else:
+                df = df.rename(columns={old: new})
     n_after = len(df)
 
     n_passed = len([x for x in scatter_data if x[2]])
@@ -363,6 +379,42 @@ def main():
             _log(f"[Significant fragmentation] Diagnostic: {os.path.basename(diag_path)}")
         except Exception as e:
             _log(f"[Significant fragmentation] Warning: Could not create scatter: {e}")
+
+    # Preserve shared workflow row organization across downstream tabs.
+    pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
+    rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df.columns else None)
+    if pos_col or seq_col:
+        def _start_len(row):
+            if pos_col:
+                s = str(row.get(pos_col, '')).strip()
+                if s and '-' in s:
+                    try:
+                        a, b = s.split('-', 1)
+                        start = int(str(a).strip())
+                        end = int(str(b).strip().split(',')[0])
+                        return start, max(0, end - start + 1)
+                    except Exception:
+                        pass
+            seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+            return 999999, (len(seq) if seq else 999999)
+        sl = df.apply(_start_len, axis=1, result_type='expand')
+        df['_sort_start'] = sl[0]
+        df['_sort_len'] = sl[1]
+        df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
+        df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
+        df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
+        df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
+
+    if 'MS1_mz_error' in df.columns and 'MS1_mz_error_ppm' not in df.columns:
+        df = df.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df.columns]
+    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df.columns]
+    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df.columns]
+    ms2_cols = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df.columns]
+    if front_cols or ms1_cols or frag_tail or ms2_cols:
+        lead_cols = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
+        df = df[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
 
     _log(f"[Significant fragmentation] Writing: {os.path.abspath(out_csv)}")
     df.to_csv(out_csv, index=False)

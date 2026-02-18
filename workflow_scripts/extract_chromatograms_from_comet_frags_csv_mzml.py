@@ -30,6 +30,7 @@ if _PROJECT_ROOT not in sys.path:
 DEFAULT_CSV = os.path.join(_PROJECT_ROOT, 'data', 'comet_frags_perc_openMS_prefilter.csv')
 DEFAULT_MZML = os.path.join(_PROJECT_ROOT, 'data', 'WT_nep2_0MUrea_08.mzML')
 EXTRACTION_SUFFIX = '_extraction'
+EXTRACTION_TEST_SUFFIX = '_extraction_test'
 
 
 def main():
@@ -119,10 +120,13 @@ def main():
     _log("[Step 6] Starting chromatogram extraction (this may take several minutes)...")
     run_chromatograms(ns)
 
-    # Copy merged CSV to workflow naming: *_extraction.csv
+    # Copy merged CSV to workflow naming: *_extraction.csv or *_extraction_test.csv when --test
     metrics_name = f'{base_clean}_with_chromatogram_metrics.csv'
     metrics_path = os.path.join(dataframes_dir, metrics_name)
-    extraction_name = f'{base_clean}{EXTRACTION_SUFFIX}.csv'
+    extraction_suffix = EXTRACTION_TEST_SUFFIX if args.test else EXTRACTION_SUFFIX
+    # When test and input ends with _extraction, output x_prefilter_extraction_test (not x_prefilter_extraction_extraction_test)
+    out_base = base_clean[:-len('_extraction')] if args.test and base_clean.endswith('_extraction') else base_clean
+    extraction_name = f'{out_base}{extraction_suffix}.csv'
     extraction_path = os.path.join(out_dir, extraction_name)
 
     if os.path.exists(metrics_path):

@@ -61,9 +61,9 @@ import numpy as np
 _np_trapz = getattr(np, 'trapezoid', None) or getattr(np, 'trapz')
 import matplotlib
 import matplotlib.pyplot as plt
-# Set all fonts to Times New Roman
+# Serif font: DejaVu Serif first (Linux/Streamlit Cloud), Times New Roman on macOS/Windows
 matplotlib.rcParams['font.family'] = 'serif'
-matplotlib.rcParams['font.serif'] = ['Times New Roman']
+matplotlib.rcParams['font.serif'] = ['DejaVu Serif', 'Times New Roman', 'Liberation Serif', 'serif']
 matplotlib.rcParams['font.size'] = 10
 # Allow many figures open at once (combined figures + one per peptide); we close each peptide fig after save (0 = disable warning)
 matplotlib.rcParams['figure.max_open_warning'] = 0
@@ -396,11 +396,15 @@ def theoretical_c_z_z1_ion_mz(sequence, fragment_charge=1):
 
 def parse_comet_c_z_z1_matched_ions(group):
     """
-    Parse comet_matched_frags (was 'matched fragment ions') from Comet CSV (from group DataFrame).
+    Parse significant fragment ions from CSV (prefer canonical significant columns).
     Return set of ion names that are c, z, or z+1 only (e.g. {'c4', 'z6', 'z1_7'}).
-    Comet format: c2, z4, z1_6 (z+1 fragment 6).
+    Ion format: c2, z4, z1_6 (z+1 fragment 6).
     """
-    col = 'comet_matched_frags' if 'comet_matched_frags' in group.columns else 'matched fragment ions'
+    col = None
+    for candidate in ['significant_frags', 'refined_significant_frags', 'significant_fragment_ions']:
+        if candidate in group.columns:
+            col = candidate
+            break
     if col not in group.columns:
         return set()
     out = set()
@@ -841,11 +845,20 @@ def _get_c_z_z1_lists_from_csv(group, L):
 
 def get_comet_c_z_z1_ion_mz_from_csv(group):
     """
-    If CSV has comet_matched_frags and comet_matched_frags_mz (same order), return
-    list of (mz, display_label) for c/z/z+1 only, using Comet's m/z. Otherwise return None.
+    If CSV has significant_frags and significant_frags_mz (same order), return
+    list of (mz, display_label) for c/z/z+1 only. Otherwise return None.
     """
-    col_ions = 'comet_matched_frags' if 'comet_matched_frags' in group.columns else 'matched fragment ions'
-    col_mz = 'comet_matched_frags_mz' if 'comet_matched_frags_mz' in group.columns else 'matched fragment ion mz'
+    col_ions = None
+    col_mz = None
+    if 'significant_frags' in group.columns and 'significant_frags_mz' in group.columns:
+        col_ions = 'significant_frags'
+        col_mz = 'significant_frags_mz'
+    elif 'refined_significant_frags' in group.columns and 'refined_significant_frags_mz' in group.columns:
+        col_ions = 'refined_significant_frags'
+        col_mz = 'refined_significant_frags_mz'
+    elif 'significant_fragment_ions' in group.columns and 'significant_fragment_mz' in group.columns:
+        col_ions = 'significant_fragment_ions'
+        col_mz = 'significant_fragment_mz'
     if col_ions not in group.columns or col_mz not in group.columns:
         return None
     # Use first row that has both columns (they are per-PSM; order is same within a row)
@@ -1001,7 +1014,7 @@ def create_ms2_spectrum_figure(row, mzml_path, figsize=(12, 6), ppm_ms2=5.0):
         return None
     
     clean_peptide = re.sub(r'\[.*?\]', '', peptide) if peptide else ''
-    sig_frags_val = row.get('significant_frags') or row.get('significant_fragment_ions') or row.get('comet_matched_frags') or ''
+    sig_frags_val = row.get('significant_frags') or row.get('significant_fragment_ions') or row.get('refined_significant_frags') or ''
     if pd.isna(sig_frags_val) or not str(sig_frags_val).strip():
         return None
     
@@ -2829,7 +2842,7 @@ def create_chromatogram_subplot_figure(row, rts, intensity_matrix, min_rt=None, 
     return fig
 
 
-def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, peptide_key=None, figsize=(10, 5)):
+def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, peptide_key=None, figsize=(10, 5), return_metrics=False):
     """
     Create a standalone summed MS1 spectrum figure (same style as individual chromatogram extraction plots).
     Sums MS1 spectra across the integration/collection window and plots with isotope labels.
@@ -2861,18 +2874,43 @@ def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, 
     y_max_spec = np.max(spec_ints) * 1.1 if len(spec_ints) > 0 else 1.0
     y_min_spec = 0
     matched_iso_indices = []
+    observed_iso = {}
     for iso_idx, iso_mz in enumerate(isotope_mzs):
         if iso_idx >= len(iso_colors):
             break
         iso_tolerance = iso_mz * 5e-6
         iso_mask = (spec_mzs >= iso_mz - iso_tolerance) & (spec_mzs <= iso_mz + iso_tolerance)
         if np.any(iso_mask):
+            iso_mzs_obs = spec_mzs[iso_mask]
             iso_intensities = spec_ints[iso_mask]
-            max_iso_intensity = np.max(iso_intensities) if len(iso_intensities) > 0 else 0
+            max_idx_local = int(np.argmax(iso_intensities)) if len(iso_intensities) > 0 else 0
+            max_iso_intensity = float(iso_intensities[max_idx_local]) if len(iso_intensities) > 0 else 0.0
+            obs_mz = float(iso_mzs_obs[max_idx_local]) if len(iso_mzs_obs) > 0 else float(iso_mz)
+            ppm_err = ((obs_mz - iso_mz) / iso_mz) * 1e6 if iso_mz else np.nan
             matched_iso_indices.append(iso_idx)
+            observed_iso[iso_idx] = {
+                'theoretical_mz': float(iso_mz),
+                'observed_mz': obs_mz,
+                'max_intensity': max_iso_intensity,
+                'ppm_error': float(ppm_err) if not np.isnan(ppm_err) else np.nan,
+            }
             line_color = iso_colors[iso_idx % len(iso_colors)]
             ax.vlines(iso_mz, 0, max_iso_intensity, colors=line_color, linewidth=2.5, alpha=0.95, zorder=20,
                      label=f'M+{iso_idx}')
+            # Label each matched isotope with ppm error based on highest-intensity peak within +/-5 ppm.
+            if max_iso_intensity > 0 and not np.isnan(ppm_err):
+                y_text = min(y_max_spec * 0.97, max_iso_intensity * 1.05 + y_max_spec * 0.02)
+                ax.text(
+                    iso_mz,
+                    y_text,
+                    f"M+{iso_idx} {ppm_err:+.1f} ppm",
+                    ha='center',
+                    va='bottom',
+                    fontsize=9,
+                    color=line_color,
+                    fontfamily='serif',
+                    zorder=30,
+                )
     ax.set_xlabel('m/z', fontsize=15, fontfamily='serif', color='0.85')
     ax.set_ylabel('Intensity', fontsize=15, fontfamily='serif', color='0.85')
     title_rt_range = f'{min_rt:.1f}-{max_rt:.1f}s'
@@ -2892,6 +2930,20 @@ def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, 
             y_max_spec * 0.95, 'Isotope matching: ±5 ppm', fontsize=12, ha='left', va='top', fontfamily='serif',
             bbox=dict(boxstyle='round,pad=0.35', facecolor='lightblue', alpha=0.8, edgecolor='black', linewidth=0.8), zorder=25)
     plt.tight_layout()
+    if return_metrics:
+        m0 = observed_iso.get(0, {}).get('max_intensity', 0.0)
+        m1 = observed_iso.get(1, {}).get('max_intensity', 0.0)
+        m2 = observed_iso.get(2, {}).get('max_intensity', 0.0)
+        has_required_isotopes = all(i in observed_iso for i in (0, 1, 2))
+        envelope_ok = bool(has_required_isotopes and ((m0 > m1) or (m1 > m2)))
+        metrics = {
+            'matched_iso_indices': sorted(matched_iso_indices),
+            'observed_iso': observed_iso,
+            'has_required_isotopes': has_required_isotopes,
+            'm0_gt_m1_gt_m2': bool((m0 > m1) or (m1 > m2)) if has_required_isotopes else False,
+            'passes_envelope': envelope_ok,
+        }
+        return fig, metrics
     return fig
 
 
@@ -3126,7 +3178,7 @@ def run_plots_from_dataframe(args):
         return
 
     df = pd.read_csv(metrics_csv)
-    # Optionally restrict to peptides in filter CSV (extraction output) to thin down plots
+    # Optionally restrict to peptides in filter CSV to reduce plotted set
     if filter_csv and os.path.exists(filter_csv):
         try:
             with open(filter_csv, 'r') as f:
@@ -3154,7 +3206,7 @@ def run_plots_from_dataframe(args):
             n_before = len(df)
             df = df[mask].copy()
             df = df.drop(columns=['_mods'], errors='ignore')
-            print(f"[DEBUG] Filter CSV: {len(df)} / {n_before} peptides to plot (thinned by extraction output)")
+            print(f"[DEBUG] Filter CSV: {len(df)} / {n_before} peptides to plot (restricted to peptides present in {os.path.basename(filter_csv)})")
     data = np.load(traces_path)
 
     def _has_modifications(m):
@@ -3350,6 +3402,19 @@ def run_chromatograms(args):
         skip_rows = 0
     
     df = pd.read_csv(comet_csv, sep=',', skiprows=skip_rows, engine='python', quotechar='"', on_bad_lines='warn')
+    # Compatibility aliases for renamed workflow identifiers/RT columns.
+    if 'peptide_sequence' in df.columns and 'plain_peptide' not in df.columns:
+        df['plain_peptide'] = df['peptide_sequence']
+    if 'protein_position' in df.columns and 'sequence_positions' not in df.columns:
+        df['sequence_positions'] = df['protein_position']
+    if 'MS2_RT_sec' in df.columns and 'MS2_retention_time_sec' not in df.columns:
+        df['MS2_retention_time_sec'] = df['MS2_RT_sec']
+    if 'MS2_RT_minutes' in df.columns and 'MS2_retention_time_min' not in df.columns:
+        df['MS2_retention_time_min'] = df['MS2_RT_minutes']
+    if 'MS1_RT_sec' in df.columns and 'MS1_retention_time_sec' not in df.columns:
+        df['MS1_retention_time_sec'] = df['MS1_RT_sec']
+    if 'MS1_RT_minutes' in df.columns and 'MS1_retention_time_min' not in df.columns:
+        df['MS1_retention_time_min'] = df['MS1_RT_minutes']
     print(f"[DEBUG] CSV loaded: {len(df)} rows")
     try:
         from visualization.csv_validation import validate_and_log
@@ -4331,8 +4396,9 @@ def run_chromatograms(args):
         if 'ppm' in r.lower() and 'theoretical' in r.lower():
             return 'Peak m/z >6 ppm from theoretical'
         return 'Other'
-    # Significant-fragment data (5 ppm + 0.5% intensity): populated in pass 1 when we have MS2; merged into output CSVs
-    significant_data = {}  # key (plain_peptide, charge, mods_norm) -> {significant_fragment_ions, significant_fragment_pairs, significant_single_aa_overhangs, significant_single_aa_overhangs_protein_positions}
+    # Significant-fragment data (5 ppm + 0.5% intensity): populated in pass 1 when we have MS2; merged into output CSVs.
+    # Keep one canonical overhang mapping column: single_aa_overhangs_protein_positions.
+    significant_data = {}  # key (plain_peptide, charge, mods_norm) -> {significant_fragment_ions, significant_fragment_pairs, single_aa_overhangs_protein_positions}
     def _norm_mods_sig(m):
         if m is None or (isinstance(m, float) and pd.isna(m)):
             return '-'
@@ -4550,7 +4616,7 @@ def run_chromatograms(args):
                     """Count number of matched fragments from various column formats"""
                     frag_count = 0
                     # Try different possible column names
-                    for col_name in ['comet_matched_frags', 'matched fragment ions', 'ions_matched', 'num_matched_ions', 'matched_ions']:
+                    for col_name in ['significant_frags', 'significant_fragment_ions', 'refined_significant_frags']:
                         if col_name in group.columns:
                             frag_val = row[col_name] if isinstance(row, pd.Series) else row.get(col_name, '')
                             if pd.notna(frag_val) and frag_val != '':
@@ -5643,6 +5709,36 @@ def run_chromatograms(args):
                             if max_intensity > 0 and np.max(iso_intensities) > max_intensity * 0.01:
                                 matched_indices.append(iso_idx)
                     return matched_indices
+
+                def get_isotope_peak_metrics(spec_mzs_arr, spec_ints_arr, isotope_mzs_list, ppm_tol=5.0):
+                    """
+                    For each theoretical isotope m/z, find the highest-intensity observed peak within +/-ppm_tol.
+                    Returns dict: iso_idx -> {'observed_mz','intensity','ppm_error'}.
+                    """
+                    metrics = {}
+                    if spec_mzs_arr is None or spec_ints_arr is None or isotope_mzs_list is None:
+                        return metrics
+                    if len(spec_mzs_arr) == 0 or len(spec_ints_arr) == 0:
+                        return metrics
+                    for iso_idx, iso_mz in enumerate(isotope_mzs_list):
+                        iso_tolerance = iso_mz * ppm_tol * 1e-6
+                        iso_mask = (spec_mzs_arr >= iso_mz - iso_tolerance) & (spec_mzs_arr <= iso_mz + iso_tolerance)
+                        if not np.any(iso_mask):
+                            continue
+                        iso_mzs_near = spec_mzs_arr[iso_mask]
+                        iso_ints_near = spec_ints_arr[iso_mask]
+                        if len(iso_ints_near) == 0:
+                            continue
+                        idx_max = int(np.argmax(iso_ints_near))
+                        obs_mz = float(iso_mzs_near[idx_max])
+                        obs_int = float(iso_ints_near[idx_max])
+                        ppm_err = (obs_mz - iso_mz) / iso_mz * 1e6 if iso_mz > 0 else np.nan
+                        metrics[iso_idx] = {
+                            'observed_mz': obs_mz,
+                            'intensity': obs_int,
+                            'ppm_error': ppm_err,
+                        }
+                    return metrics
         
                 def get_observed_centroid_near_theoretical(spec_mzs_arr, spec_ints_arr, theoretical_mz, ppm_tolerance=20.0):
                     """Find m/z at max intensity within ±ppm_tolerance of theoretical_mz. Returns (observed_mz, ppm_diff) or (None, None)."""
@@ -5666,6 +5762,8 @@ def run_chromatograms(args):
                 # Initialize spectrum variables (needed for rejected peptide collection)
                 spec_mzs_windowed = None
                 spec_ints_windowed = None
+                spec_mzs_windowed_integration = None
+                spec_ints_windowed_integration = None
                 spectrum_rt_min = None
                 spectrum_rt_max = None
                 using_anchor_window = False
@@ -5708,6 +5806,9 @@ def run_chromatograms(args):
                         mask = (spec_mzs >= mz_min_window) & (spec_mzs <= mz_max_window)
                         spec_mzs_windowed = spec_mzs[mask]
                         spec_ints_windowed = spec_ints[mask]
+                        # Keep a strict integration-window copy for envelope logic written to CSV.
+                        spec_mzs_windowed_integration = spec_mzs_windowed.copy()
+                        spec_ints_windowed_integration = spec_ints_windowed.copy()
                         if len(spec_mzs_windowed) > 0 and isotope_mzs and len(isotope_mzs) > 0:
                             n_matches = count_isotopic_matches(spec_mzs_windowed, spec_ints_windowed, isotope_mzs, ppm_tol=5.0)
                             matched_iso_indices = get_matched_isotope_indices(spec_mzs_windowed, spec_ints_windowed, isotope_mzs, ppm_tol=5.0)
@@ -5880,10 +5981,23 @@ def run_chromatograms(args):
                             return False, f"Summed MS1 must contain M0, M+1, and M+2 (missing: {', '.join(missing_names)}; matched: {', '.join(matched_iso_names)})"
                         return True, None
     
-                    # Check summed spectrum (chromatogram extraction window): require M0, M+1, M+2
-                    summed_passed, summed_reason = check_isotopic_matches_passed(matched_iso_indices_final, "summed spectrum")
-                    has_required_in_window = all(i in matched_iso_indices_final for i in REQUIRED_ISOTOPE_INDICES)
-                    envelope_ok = False  # set True below when envelope check passes
+                    # Check summed spectrum in the INTEGRATION WINDOW (detected_peak_min_rt..max_rt) only.
+                    # Core envelope logic (for CSV columns):
+                    #   1) M0, M+1, M+2 present (highest-intensity peak within +/-5 ppm per isotope)
+                    #   2) M0 > M+1 OR M+1 > M+2 using those matched intensities
+                    core_peak_metrics = get_isotope_peak_metrics(
+                        spec_mzs_windowed_integration, spec_ints_windowed_integration, isotope_mzs, ppm_tol=5.0
+                    )
+                    core_matched_indices = sorted(core_peak_metrics.keys())
+                    summed_passed, summed_reason = check_isotopic_matches_passed(core_matched_indices, "summed spectrum (integration window)")
+                    has_required_in_window = all(i in core_matched_indices for i in REQUIRED_ISOTOPE_INDICES)
+                    I0 = float(core_peak_metrics.get(0, {}).get('intensity', 0.0))
+                    I1 = float(core_peak_metrics.get(1, {}).get('intensity', 0.0))
+                    I2 = float(core_peak_metrics.get(2, {}).get('intensity', 0.0))
+                    m0_gt_m1 = has_required_in_window and I0 > 0 and I1 > 0 and I0 > I1
+                    m1_gt_m2 = has_required_in_window and I1 > 0 and I2 > 0 and I1 > I2
+                    m0_gt_m1_gt_m2 = bool(m0_gt_m1 or m1_gt_m2)
+                    envelope_ok = m0_gt_m1_gt_m2
 
                     # When re-extracting with a primary/alternate filter CSV, trust m0_gt_m1_gt_m2 from the filter
                     # (those peptides already passed M+0 > M+1 or M+1 > M+2 in the initial run; re-checking in a different
@@ -5918,31 +6032,8 @@ def run_chromatograms(args):
                             is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
                             rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
                     else:
-                        # Envelope: M+0 > M+1 OR M+1 > M+2 (compute for Step 7; do NOT reject here).
-                        envelope_ok = False
-                        if not summed_passed or not has_required_in_window:
-                            pass
-                        elif (spec_mzs_windowed is not None and spec_ints_windowed is not None and
-                                isotope_mzs is not None and len(isotope_mzs) >= 2):
-                            iso_intensities = []
-                            for iso_idx in [0, 1, 2] if len(isotope_mzs) >= 3 else [0, 1]:
-                                if iso_idx >= len(isotope_mzs):
-                                    break
-                                iso_mz = isotope_mzs[iso_idx]
-                                iso_tolerance = iso_mz * 5e-6  # 5 ppm
-                                iso_mask = (spec_mzs_windowed >= iso_mz - iso_tolerance) & (spec_mzs_windowed <= iso_mz + iso_tolerance)
-                                if np.any(iso_mask):
-                                    iso_intensities.append(np.max(spec_ints_windowed[iso_mask]))
-                                else:
-                                    iso_intensities.append(0.0)
-                            if len(iso_intensities) >= 2:
-                                I0, I1 = iso_intensities[0], iso_intensities[1]
-                                m0_gt_m1 = I0 > 0 and I1 > 0 and I0 > I1
-                                m1_gt_m2 = False
-                                if len(iso_intensities) >= 3:
-                                    I2 = iso_intensities[2]
-                                    m1_gt_m2 = I1 > 0 and I2 > 0 and I1 > I2
-                                envelope_ok = m0_gt_m1 or m1_gt_m2
+                        # Do not reject for envelope here; Step 7 handles filtering.
+                        # Keep extraction acceptance independent from envelope ordering.
                         # Do NOT reject for envelope here; Step 7 (filter_envelope.py) handles that
                         is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
                         rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
@@ -6538,13 +6629,12 @@ def run_chromatograms(args):
                             sig_ions_str = ', '.join(sorted(placed_ion_labels))
                             sig_pairs_str = ', '.join(significant_pairs_for_display) if significant_pairs_for_display else ''
                             _oph = overhang_positions_from_placed if overhang_positions_from_placed is not None else set()
-                            sig_overhang_peptide = ', '.join(f'{pos}{clean_peptide_ms2[pos-1]}' for pos in sorted(_oph) if 1 <= pos <= len(clean_peptide_ms2))
                             sig_overhang_protein = ', '.join(f'{_sig_start + pos - 1}{clean_peptide_ms2[pos-1]}' if _sig_start and _sig_start > 0 else f'{pos}{clean_peptide_ms2[pos-1]}' for pos in sorted(_oph) if 1 <= pos <= len(clean_peptide_ms2))
                             significant_data[sig_key] = {
                                 'significant_fragment_ions': sig_ions_str,
                                 'significant_fragment_pairs': sig_pairs_str,
-                                'significant_single_aa_overhangs': sig_overhang_peptide,
-                                'significant_single_aa_overhangs_protein_positions': sig_overhang_protein,
+                                # Canonical single-AA overhang mapping column (protein positions).
+                                'single_aa_overhangs_protein_positions': sig_overhang_protein,
                             }
                     else:
                         ax_spec_ms2.text(0.5, 0.5, 'No MS2 spectra\nin integration window', ha='center', va='center', fontsize=11, fontfamily='serif', transform=ax_spec_ms2.transAxes)
@@ -8172,24 +8262,8 @@ def run_chromatograms(args):
                 mz_vals = group['mz'].dropna().unique().tolist() if 'mz' in group.columns else []
                 rt_range = max(ms1_rts_table) - min(ms1_rts_table) if len(ms1_rts_table) > 1 else 0
         
-                # Envelope: M+0 > M+1 OR M+1 > M+2 on summed MS1 in peak window (simple two-isotope ordering)
-                m0_gt_m1_gt_m2 = None
-                try:
-                    si = best_peak.get('start_idx')
-                    ei = best_peak.get('end_idx')
-                    if si is not None and ei is not None and intensity_matrix is not None and ei > si:
-                        isotope_sums = np.sum(intensity_matrix[int(si):int(ei), :], axis=0)
-                        m0_gt_m1 = False
-                        m1_gt_m2 = False
-                        if len(isotope_sums) >= 2:
-                            s0, s1 = float(isotope_sums[0]), float(isotope_sums[1])
-                            m0_gt_m1 = s0 > 0 and s1 > 0 and s0 > s1
-                        if len(isotope_sums) >= 3:
-                            s1_, s2 = float(isotope_sums[1]), float(isotope_sums[2])
-                            m1_gt_m2 = s1_ > 0 and s2 > 0 and s1_ > s2
-                        m0_gt_m1_gt_m2 = m0_gt_m1 or m1_gt_m2
-                except (TypeError, ValueError, IndexError):
-                    pass
+                # m0_gt_m1_gt_m2 / envelope_ok are computed above from strict summed-MS1
+                # integration-window logic (highest peak within +/-5 ppm for M0/M+1/M+2).
                 apex_intensity_val = best_peak.get('apex_intensity') if best_peak else None
         
                 peak_window_data = {
@@ -8220,9 +8294,15 @@ def run_chromatograms(args):
                 'spectrum_window_max_rt': spectrum_rt_max,
                 'spectrum_window_size': (spectrum_rt_max - spectrum_rt_min) if (spectrum_rt_min and spectrum_rt_max) else None,
                 'using_anchor_window': using_anchor_window,
-                'n_isotopic_matches': n_matches_final,
-                'matched_isotopes': ', '.join([f'M+{i}' for i in sorted(matched_iso_indices_final)]) if matched_iso_indices_final else '',
+                'n_isotopic_matches': len(core_matched_indices),
+                'matched_isotopes': ', '.join([f'M+{i}' for i in core_matched_indices]) if core_matched_indices else '',
                 'm0_gt_m1_gt_m2': m0_gt_m1_gt_m2,
+                'm0_intensity': I0 if has_required_in_window else 0.0,
+                'm1_intensity': I1 if has_required_in_window else 0.0,
+                'm2_intensity': I2 if has_required_in_window else 0.0,
+                'm0_ppm_error': core_peak_metrics.get(0, {}).get('ppm_error'),
+                'm1_ppm_error': core_peak_metrics.get(1, {}).get('ppm_error'),
+                'm2_ppm_error': core_peak_metrics.get(2, {}).get('ppm_error'),
                 'precursor_mz': precursor_mz,
                 'sequence_start_pos': seq_start_pos,
                 'ms1_trace_ok': True,  # Had >=1 scan (within 5 ppm in pipeline); for backfill eligibility in regenerate_rt_windows
@@ -8465,6 +8545,103 @@ def run_chromatograms(args):
             'precursor_mz', 'sequence_start_pos', 'ppm_at_apex',
             'best_score', 'n_candidates', 'total_area', 'coelution_score', 'shape_corr'
         ]
+        def _format_extraction_output_columns(df_out):
+            """Apply extraction output naming + ordering conventions for UI clarity."""
+            df_fmt = df_out.copy()
+
+            # Use extracted precursor m/z as theoretical_mz in outputs.
+            if 'precursor_mz' in df_fmt.columns:
+                if 'theoretical_mz' in df_fmt.columns:
+                    df_fmt['theoretical_mz'] = df_fmt['precursor_mz'].where(
+                        pd.notna(df_fmt['precursor_mz']),
+                        df_fmt['theoretical_mz']
+                    )
+                    df_fmt = df_fmt.drop(columns=['precursor_mz'])
+                else:
+                    df_fmt = df_fmt.rename(columns={'precursor_mz': 'theoretical_mz'})
+            # Standardize legacy retention_time headers to RT headers.
+            rt_name_map = {
+                'MS1_retention_time_sec': 'MS1_RT_sec',
+                'MS1_retention_time_min': 'MS1_RT_minutes',
+                'MS1_retention_time_intensity': 'MS1_RT_intensity',
+                'MS2_retention_time_sec': 'MS2_RT_sec',
+                'MS2_retention_time_min': 'MS2_RT_minutes',
+                'retention_time_sec': 'RT_sec',
+                'retention_time_min': 'RT_minutes',
+            }
+            for old, new in rt_name_map.items():
+                if old in df_fmt.columns:
+                    if new in df_fmt.columns:
+                        df_fmt[new] = df_fmt[old].where(pd.notna(df_fmt[old]), df_fmt[new])
+                        df_fmt = df_fmt.drop(columns=[old])
+                    else:
+                        df_fmt = df_fmt.rename(columns={old: new})
+
+            # Rename RT window columns (seconds)
+            rt_rename = {
+                'detected_peak_min_rt': 'MS1_RT_integration_start_sec',
+                'detected_peak_max_rt': 'MS1_RT_integration_stop_sec',
+                'collection_min_rt': 'MS1_RT_collection_start_sec',
+                'collection_max_rt': 'MS1_RT_collection_stop_sec',
+            }
+            for old, new in rt_rename.items():
+                if old in df_fmt.columns:
+                    if new in df_fmt.columns:
+                        df_fmt[new] = df_fmt[old].where(pd.notna(df_fmt[old]), df_fmt[new])
+                        df_fmt = df_fmt.drop(columns=[old])
+                    else:
+                        df_fmt = df_fmt.rename(columns={old: new})
+
+            # Add RT window columns (minutes)
+            sec_to_min = [
+                ('MS1_RT_integration_start_sec', 'MS1_RT_integration_start_minutes'),
+                ('MS1_RT_integration_stop_sec', 'MS1_RT_integration_stop_minutes'),
+                ('MS1_RT_collection_start_sec', 'MS1_RT_collection_start_minutes'),
+                ('MS1_RT_collection_stop_sec', 'MS1_RT_collection_stop_minutes'),
+            ]
+            for sec_col, min_col in sec_to_min:
+                if sec_col in df_fmt.columns and min_col not in df_fmt.columns:
+                    df_fmt[min_col] = pd.to_numeric(df_fmt[sec_col], errors='coerce') / 60.0
+
+            # Reorder block 1: immediately after observed_mz
+            block_after_observed = [c for c in ['theoretical_mz', 'total_area', 'matched_isotopes'] if c in df_fmt.columns]
+            if 'observed_mz' in df_fmt.columns and block_after_observed:
+                cols = list(df_fmt.columns)
+                rest = [c for c in cols if c not in block_after_observed]
+                insert_idx = rest.index('observed_mz') + 1
+                cols_new = rest[:insert_idx] + block_after_observed + rest[insert_idx:]
+                df_fmt = df_fmt[cols_new]
+
+            # Reorder block 2: immediately after all Q/PEP columns
+            rt_block = [
+                c for c in [
+                    'MS1_RT_integration_start_sec', 'MS1_RT_integration_stop_sec',
+                    'MS1_RT_collection_start_sec', 'MS1_RT_collection_stop_sec',
+                    'MS1_RT_integration_start_minutes', 'MS1_RT_integration_stop_minutes',
+                    'MS1_RT_collection_start_minutes', 'MS1_RT_collection_stop_minutes',
+                ] if c in df_fmt.columns
+            ]
+            qpep_candidates = ['perc_qvalue', 'perc_PEP', 'qvalue', 'pep', 'percolator_qvalue', 'percolator_PEP', 'q-value', 'PEP']
+            if rt_block:
+                cols = list(df_fmt.columns)
+                rest = [c for c in cols if c not in rt_block]
+                qpep_idx = [i for i, c in enumerate(rest) if c in qpep_candidates]
+                if qpep_idx:
+                    insert_idx = max(qpep_idx) + 1
+                    cols_new = rest[:insert_idx] + rt_block + rest[insert_idx:]
+                    df_fmt = df_fmt[cols_new]
+
+            frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df_fmt.columns]
+            ms2_tail = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df_fmt.columns]
+            if 'MS1_mz_error' in df_fmt.columns and 'MS1_mz_error_ppm' not in df_fmt.columns:
+                df_fmt = df_fmt.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+            front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df_fmt.columns]
+            ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df_fmt.columns]
+            if front_cols or ms1_cols or frag_tail or ms2_tail:
+                lead_cols = [c for c in df_fmt.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_tail]
+                df_fmt = df_fmt[front_cols + ms1_cols + lead_cols + frag_tail + ms2_tail]
+
+            return df_fmt
         windows_lookup = {}
         for w in all_peak_windows:
             pep = str(w.get('peptide', '')).strip()
@@ -8479,15 +8656,44 @@ def run_chromatograms(args):
             skip_rows = 0
         df_base = pd.read_csv(comet_csv, sep=',', skiprows=skip_rows, engine='python', quotechar='"', on_bad_lines='warn')
         base_name = os.path.splitext(os.path.basename(comet_csv))[0]
+        # In test mode, keep only rows that were actually processed so extraction-test
+        # outputs do not appear mostly empty after merge-back.
+        if getattr(args, 'test', False):
+            def _row_key_for_filter(row_obj):
+                pep = ''
+                for col in ['peptide_sequence', 'plain_peptide', 'sequence']:
+                    v = row_obj.get(col, '')
+                    if pd.notna(v) and str(v).strip():
+                        pep = str(v).strip()
+                        break
+                ch = int(row_obj.get('charge', 0)) if pd.notna(row_obj.get('charge')) else 0
+                mod = _norm_mods_df(row_obj.get('modifications', '-'))
+                return (pep, ch, mod)
+            keep_mask = df_base.apply(lambda r: _row_key_for_filter(r) in windows_lookup, axis=1)
+            n_before = len(df_base)
+            df_base = df_base.loc[keep_mask].copy()
+            print(f"[DEBUG] Test mode merge: keeping {len(df_base)} of {n_before} rows with extracted metrics")
+
         for c in chrom_cols:
             if c not in df_base.columns:
                 df_base[c] = None
-        for c in ['significant_fragment_ions', 'significant_fragment_pairs', 'significant_single_aa_overhangs', 'significant_single_aa_overhangs_protein_positions']:
+        for c in ['significant_fragment_ions', 'significant_fragment_pairs', 'single_aa_overhangs_protein_positions']:
             if c not in df_base.columns:
                 df_base[c] = None
+        # Reset canonical significant columns so stale legacy values are not carried forward.
+        for c in ['significant_fragment_ions', 'significant_fragment_pairs', 'single_aa_overhangs_protein_positions']:
+            df_base[c] = None
+        def _row_peptide_key_val(row_obj):
+            # Canonical name first; fallback to legacy names.
+            for col in ['peptide_sequence', 'plain_peptide', 'sequence']:
+                v = row_obj.get(col, '')
+                if pd.notna(v) and str(v).strip():
+                    return str(v).strip()
+            return ''
+
         for idx, row in df_base.iterrows():
             key = (
-                str(row.get('plain_peptide', '')).strip(),
+                _row_peptide_key_val(row),
                 int(row.get('charge', 0)) if pd.notna(row.get('charge')) else 0,
                 _norm_mods_df(row.get('modifications', '-'))
             )
@@ -8499,8 +8705,11 @@ def run_chromatograms(args):
                 for col, val in significant_data[key].items():
                     if val is not None and col in df_base.columns:
                         df_base.at[idx, col] = val
+        for legacy_col in ['significant_single_aa_overhangs', 'significant_single_aa_overhangs_protein_positions']:
+            if legacy_col in df_base.columns:
+                df_base = df_base.drop(columns=[legacy_col])
         merged_csv = os.path.join(dataframes_dir, f'{base_name}_with_chromatogram_metrics.csv')
-        df_base.to_csv(merged_csv, index=False)
+        _format_extraction_output_columns(df_base).to_csv(merged_csv, index=False)
         print(f"[DEBUG] Merged extraction CSV saved to: {os.path.abspath(merged_csv)}")
         # Human-readable summary
         out_abs = os.path.abspath(extract_output_dir)
@@ -10081,17 +10290,45 @@ def run_chromatograms(args):
                             return np.nan
                     parsed = df_base.loc[missing_seq_start, 'sequence_positions'].map(_parse_start)
                     df_base.loc[missing_seq_start, 'sequence_start_pos'] = parsed
-            # Significant = Comet fragments passing 5 ppm + noise %. Columns: fragments, pairs, sequence positions covered by single-AA overhang (peptide and protein).
-            sig_cols = ['significant_fragment_ions', 'significant_fragment_pairs', 'significant_single_aa_overhangs', 'significant_single_aa_overhangs_protein_positions']
+            # In test mode, keep only rows that were actually processed so extraction-test
+            # outputs do not appear mostly empty after merge-back.
+            if getattr(args, 'test', False):
+                def _row_key_for_filter(row_obj):
+                    pep = ''
+                    for col in ['peptide_sequence', 'plain_peptide', 'sequence']:
+                        v = row_obj.get(col, '')
+                        if pd.notna(v) and str(v).strip():
+                            pep = str(v).strip()
+                            break
+                    ch = int(row_obj.get('charge', 0)) if pd.notna(row_obj.get('charge')) else 0
+                    mod = _norm_mods_df(row_obj.get('modifications', '-'))
+                    return (pep, ch, mod)
+                keep_mask = df_base.apply(lambda r: _row_key_for_filter(r) in windows_lookup, axis=1)
+                n_before = len(df_base)
+                df_base = df_base.loc[keep_mask].copy()
+                print(f"[DEBUG] Test mode merge: keeping {len(df_base)} of {n_before} rows with extracted metrics")
+
+            # Significant = Comet fragments passing 5 ppm + noise %. Columns: fragments, pairs, and canonical protein-position overhang mapping.
+            sig_cols = ['significant_fragment_ions', 'significant_fragment_pairs', 'single_aa_overhangs_protein_positions']
             for c in chrom_cols:
                 if c not in df_base.columns:
                     df_base[c] = None
             for c in sig_cols:
                 if c not in df_base.columns:
                     df_base[c] = None
+            for c in sig_cols:
+                df_base[c] = None
+            def _row_peptide_key_val(row_obj):
+                # Canonical name first; fallback to legacy names.
+                for col in ['peptide_sequence', 'plain_peptide', 'sequence']:
+                    v = row_obj.get(col, '')
+                    if pd.notna(v) and str(v).strip():
+                        return str(v).strip()
+                return ''
+
             for idx, row in df_base.iterrows():
                 key = (
-                    str(row.get('plain_peptide', '')).strip(),
+                    _row_peptide_key_val(row),
                     int(row.get('charge', 0)) if pd.notna(row.get('charge')) else 0,
                     _norm_mods_df(row.get('modifications', '-'))
                 )
@@ -10103,10 +10340,95 @@ def run_chromatograms(args):
                     for col, val in significant_data[key].items():
                         if val is not None and col in df_base.columns:
                             df_base.at[idx, col] = val
+            # Remove legacy duplicate columns that caused off-by-one confusion in downstream views.
+            for legacy_col in ['significant_single_aa_overhangs', 'significant_single_aa_overhangs_protein_positions']:
+                if legacy_col in df_base.columns:
+                    df_base = df_base.drop(columns=[legacy_col])
+            if '_format_extraction_output_columns' not in locals():
+                def _format_extraction_output_columns(df_out):
+                    df_fmt = df_out.copy()
+                    if 'precursor_mz' in df_fmt.columns:
+                        if 'theoretical_mz' in df_fmt.columns:
+                            df_fmt['theoretical_mz'] = df_fmt['precursor_mz'].where(
+                                pd.notna(df_fmt['precursor_mz']),
+                                df_fmt['theoretical_mz']
+                            )
+                            df_fmt = df_fmt.drop(columns=['precursor_mz'])
+                        else:
+                            df_fmt = df_fmt.rename(columns={'precursor_mz': 'theoretical_mz'})
+                    rt_name_map = {
+                        'MS1_retention_time_sec': 'MS1_RT_sec',
+                        'MS1_retention_time_min': 'MS1_RT_minutes',
+                        'MS1_retention_time_intensity': 'MS1_RT_intensity',
+                        'MS2_retention_time_sec': 'MS2_RT_sec',
+                        'MS2_retention_time_min': 'MS2_RT_minutes',
+                        'retention_time_sec': 'RT_sec',
+                        'retention_time_min': 'RT_minutes',
+                    }
+                    for old, new in rt_name_map.items():
+                        if old in df_fmt.columns:
+                            if new in df_fmt.columns:
+                                df_fmt[new] = df_fmt[old].where(pd.notna(df_fmt[old]), df_fmt[new])
+                                df_fmt = df_fmt.drop(columns=[old])
+                            else:
+                                df_fmt = df_fmt.rename(columns={old: new})
+                    rt_rename = {
+                        'detected_peak_min_rt': 'MS1_RT_integration_start_sec',
+                        'detected_peak_max_rt': 'MS1_RT_integration_stop_sec',
+                        'collection_min_rt': 'MS1_RT_collection_start_sec',
+                        'collection_max_rt': 'MS1_RT_collection_stop_sec',
+                    }
+                    for old, new in rt_rename.items():
+                        if old in df_fmt.columns:
+                            if new in df_fmt.columns:
+                                df_fmt[new] = df_fmt[old].where(pd.notna(df_fmt[old]), df_fmt[new])
+                                df_fmt = df_fmt.drop(columns=[old])
+                            else:
+                                df_fmt = df_fmt.rename(columns={old: new})
+                    for sec_col, min_col in [
+                        ('MS1_RT_integration_start_sec', 'MS1_RT_integration_start_minutes'),
+                        ('MS1_RT_integration_stop_sec', 'MS1_RT_integration_stop_minutes'),
+                        ('MS1_RT_collection_start_sec', 'MS1_RT_collection_start_minutes'),
+                        ('MS1_RT_collection_stop_sec', 'MS1_RT_collection_stop_minutes'),
+                    ]:
+                        if sec_col in df_fmt.columns and min_col not in df_fmt.columns:
+                            df_fmt[min_col] = pd.to_numeric(df_fmt[sec_col], errors='coerce') / 60.0
+                    block_after_observed = [c for c in ['theoretical_mz', 'total_area', 'matched_isotopes'] if c in df_fmt.columns]
+                    if 'observed_mz' in df_fmt.columns and block_after_observed:
+                        cols = list(df_fmt.columns)
+                        rest = [c for c in cols if c not in block_after_observed]
+                        insert_idx = rest.index('observed_mz') + 1
+                        df_fmt = df_fmt[rest[:insert_idx] + block_after_observed + rest[insert_idx:]]
+                    rt_block = [
+                        c for c in [
+                            'MS1_RT_integration_start_sec', 'MS1_RT_integration_stop_sec',
+                            'MS1_RT_collection_start_sec', 'MS1_RT_collection_stop_sec',
+                            'MS1_RT_integration_start_minutes', 'MS1_RT_integration_stop_minutes',
+                            'MS1_RT_collection_start_minutes', 'MS1_RT_collection_stop_minutes',
+                        ] if c in df_fmt.columns
+                    ]
+                    qpep_candidates = ['perc_qvalue', 'perc_PEP', 'qvalue', 'pep', 'percolator_qvalue', 'percolator_PEP', 'q-value', 'PEP']
+                    if rt_block:
+                        cols = list(df_fmt.columns)
+                        rest = [c for c in cols if c not in rt_block]
+                        qpep_idx = [i for i, c in enumerate(rest) if c in qpep_candidates]
+                        if qpep_idx:
+                            insert_idx = max(qpep_idx) + 1
+                            df_fmt = df_fmt[rest[:insert_idx] + rt_block + rest[insert_idx:]]
+                    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df_fmt.columns]
+                    ms2_tail = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df_fmt.columns]
+                    if 'MS1_mz_error' in df_fmt.columns and 'MS1_mz_error_ppm' not in df_fmt.columns:
+                        df_fmt = df_fmt.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+                    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df_fmt.columns]
+                    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df_fmt.columns]
+                    if front_cols or ms1_cols or frag_tail or ms2_tail:
+                        lead_cols = [c for c in df_fmt.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_tail]
+                        df_fmt = df_fmt[front_cols + ms1_cols + lead_cols + frag_tail + ms2_tail]
+                    return df_fmt
             # Full (filtered set + metrics) to dataframes_dir root
             out_csv = os.path.join(dataframes_dir, f'{base_name}_with_chromatogram_metrics.csv')
             os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-            df_base.to_csv(out_csv, index=False)
+            _format_extraction_output_columns(df_base).to_csv(out_csv, index=False)
             print(f"[DEBUG] Filtered dataset + chromatogram metrics saved to: {os.path.abspath(out_csv)}")
 
             # Diagnostic: coelution vs shape scatter (rejected marked)
@@ -10316,14 +10638,14 @@ def run_chromatograms(args):
                 df_acc = df_base[df_base['status'] == 'accepted']
                 if len(df_acc) > 0:
                     out_acc = os.path.join(dataframes_accepted_dir, f'{base_name}_chromatograms_accepted.csv')
-                    df_acc.to_csv(out_acc, index=False)
+                    _format_extraction_output_columns(df_acc).to_csv(out_acc, index=False)
                     print(f"[DEBUG] Accepted only (chromatograms) saved to: {os.path.abspath(out_acc)}")
             # Rejected only -> rejected/
             if dataframes_rejected_dir and os.path.isdir(dataframes_rejected_dir) and 'status' in df_base.columns:
                 df_rej = df_base[df_base['status'] == 'rejected']
                 if len(df_rej) > 0:
                     out_rej = os.path.join(dataframes_rejected_dir, f'{base_name}_chromatograms_rejected.csv')
-                    df_rej.to_csv(out_rej, index=False)
+                    _format_extraction_output_columns(df_rej).to_csv(out_rej, index=False)
                     print(f"[DEBUG] Rejected only (chromatograms) saved to: {os.path.abspath(out_rej)}")
 
             # Windows integration CSVs: one row per unique (plain_peptide, charge, modifications), identifiers first then integration/collection/drift windows then all other run_visualization stats
@@ -10380,11 +10702,11 @@ def run_chromatograms(args):
                     except Exception as e:
                         print(f"[DEBUG] Validation warning: {e}")
                     out_acc_wi = os.path.join(dataframes_dir, f'{base_name}_accepted_windows_integration.csv')
-                    df_acc_wi.to_csv(out_acc_wi, index=False)
+                    _format_extraction_output_columns(df_acc_wi).to_csv(out_acc_wi, index=False)
                     print(f"[DEBUG] Accepted windows integration (one row per peptide) saved to: {os.path.abspath(out_acc_wi)}")
                     if dataframes_accepted_dir and os.path.isdir(dataframes_accepted_dir):
                         out_acc_wi_acc = os.path.join(dataframes_accepted_dir, f'{base_name}_accepted_windows_integration.csv')
-                        df_acc_wi.to_csv(out_acc_wi_acc, index=False)
+                        _format_extraction_output_columns(df_acc_wi).to_csv(out_acc_wi_acc, index=False)
                 df_rej_wi = _build_windows_integration_df(df_base[df_base['status'] == 'rejected'] if 'status' in df_base.columns else None)
                 if df_rej_wi is not None and len(df_rej_wi) > 0:
                     try:
@@ -10400,11 +10722,11 @@ def run_chromatograms(args):
                     except Exception as e:
                         print(f"[DEBUG] Validation warning: {e}")
                     out_rej_wi = os.path.join(dataframes_dir, f'{base_name}_rejected_windows_integration.csv')
-                    df_rej_wi.to_csv(out_rej_wi, index=False)
+                    _format_extraction_output_columns(df_rej_wi).to_csv(out_rej_wi, index=False)
                     print(f"[DEBUG] Rejected windows integration (one row per peptide) saved to: {os.path.abspath(out_rej_wi)}")
                     if dataframes_rejected_dir and os.path.isdir(dataframes_rejected_dir):
                         out_rej_wi_rej = os.path.join(dataframes_rejected_dir, f'{base_name}_rejected_windows_integration.csv')
-                        df_rej_wi.to_csv(out_rej_wi_rej, index=False)
+                        _format_extraction_output_columns(df_rej_wi).to_csv(out_rej_wi_rej, index=False)
 
         # If a filter CSV was used, merge quantification and collection window columns into it and save
         if filter_csv and len(all_peak_windows) > 0:
@@ -10449,7 +10771,7 @@ def run_chromatograms(args):
                             if c in w and w[c] is not None:
                                 df_filter_read.at[idx, c] = w[c]
                 # Write back to the existing filter CSV (add/update window columns in place)
-                df_filter_read.to_csv(filter_csv, index=False)
+                _format_extraction_output_columns(df_filter_read).to_csv(filter_csv, index=False)
                 print(f"[DEBUG] Quantification and collection windows added to: {os.path.abspath(filter_csv)}")
             else:
                 print(f"[DEBUG] Filter CSV missing 'plain_peptide'; skipping merge into filtered_peptides.csv")

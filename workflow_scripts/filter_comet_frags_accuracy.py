@@ -121,10 +121,16 @@ def main():
         df = df.rename(columns={'matched fragment ions': 'comet_matched_frags'})
     if 'matched fragment ion mz' in df.columns and 'comet_matched_frags_mz' not in df.columns:
         df = df.rename(columns={'matched fragment ion mz': 'comet_matched_frags_mz'})
+    if 'matched fragment ion intensities' in df.columns and 'comet_matched_frags_intensities' not in df.columns:
+        df = df.rename(columns={'matched fragment ion intensities': 'comet_matched_frags_intensities'})
+    if 'comet_amtched_frags_intensities' in df.columns and 'comet_matched_frags_intensities' not in df.columns:
+        df = df.rename(columns={'comet_amtched_frags_intensities': 'comet_matched_frags_intensities'})
+    if 'matched fragment ion quality scores' in df.columns and 'comet_matched_frags_quality_scores' not in df.columns:
+        df = df.rename(columns={'matched fragment ion quality scores': 'comet_matched_frags_quality_scores'})
 
     col_ions = 'comet_matched_frags'
     col_mz = 'comet_matched_frags_mz'
-    col_int = 'matched fragment ion intensities'
+    col_int = 'comet_matched_frags_intensities'
     col_pairs = 'single_aa_overhang_fragment_pairs'
     col_positions = 'single_aa_overhangs_protein_positions'
     if 'significant_frags' not in df.columns:
@@ -142,7 +148,7 @@ def main():
 
     for idx in df.index:
         row = df.loc[idx]
-        peptide = row.get('plain_peptide') or row.get('sequence') or ''
+        peptide = row.get('peptide_sequence') or row.get('plain_peptide') or row.get('sequence') or ''
         if not peptide or not isinstance(peptide, str):
             continue
         ions_val = row.get(col_ions, '')
@@ -183,7 +189,7 @@ def main():
     has_int = col_int in df.columns
     for idx in df.index:
         row = df.loc[idx]
-        peptide = row.get('plain_peptide') or row.get('sequence') or ''
+        peptide = row.get('peptide_sequence') or row.get('plain_peptide') or row.get('sequence') or ''
         if not peptide or not isinstance(peptide, str):
             continue
         ions_val = row.get(col_ions, '')
@@ -235,7 +241,7 @@ def main():
         if col_positions not in df.columns:
             df[col_positions] = ''
         df.at[idx, col_pairs] = pairs_str
-        seq_start = row.get('sequence_start_pos') or row.get('sequence_positions')
+        seq_start = row.get('sequence_start_pos') or row.get('protein_position') or row.get('sequence_positions')
         start = None
         if pd.notna(seq_start) and str(seq_start).strip():
             try:
@@ -373,6 +379,22 @@ def main():
                         print(f"Warning: Could not create delta histogram: {e2}")
         except Exception as e:
             print(f"Warning: Could not create diagnostic scatter: {e}")
+
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df_filtered.columns:
+            if new in df_filtered.columns:
+                df_filtered[new] = df_filtered[old].where(pd.notna(df_filtered[old]), df_filtered[new])
+                df_filtered = df_filtered.drop(columns=[old])
+            else:
+                df_filtered = df_filtered.rename(columns={old: new})
 
     df_filtered.to_csv(out_csv, index=False)
     n_scans_dropped = n_total - n_pass

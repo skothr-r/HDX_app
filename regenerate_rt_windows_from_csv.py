@@ -459,9 +459,10 @@ def _rt_center(p):
 def _n_significant_fragments(p):
     """
     Number of significant fragments for tie-breaking (higher = prefer when signal ties).
-    Uses ions_matched if available, else number of single-AA overhang positions (fragment-supported).
+    Uses significant_frag_count if available, else number of single-AA overhang
+    positions (fragment-supported).
     """
-    v = p.get('ions_matched')
+    v = p.get('significant_frag_count')
     if v is not None:
         try:
             n = int(float(v))
@@ -2646,23 +2647,23 @@ def run_rt_windows(args):
                 except (TypeError, ValueError):
                     pass
 
-        # Matched fragment count for MS2 (ions_matched, num_matched_ions, or count from "matched fragment ions")
-        ions_matched = None
-        for col in ['ions_matched', 'num_matched_ions', 'matched_peaks']:
+        # Significant fragment count for MS2 (significant-only workflow).
+        significant_frag_count = None
+        for col in ['significant_frag_count']:
             if col in df.columns and pd.notna(row.get(col)):
                 try:
-                    ions_matched = int(float(row[col]))
+                    significant_frag_count = int(float(row[col]))
                     break
                 except (TypeError, ValueError):
                     pass
-        if ions_matched is None:
-            for col in ['matched fragment ions', 'matched_fragment_ions']:
+        if significant_frag_count is None:
+            for col in ['significant_frags', 'refined_significant_frags', 'significant_fragment_ions']:
                 if col in df.columns:
                     val = row.get(col)
                     if pd.notna(val) and str(val).strip():
                         parts = [x.strip() for x in str(val).split(',') if x.strip()]
                         if parts:
-                            ions_matched = len(parts)
+                            significant_frag_count = len(parts)
                             break
 
         # Prefer significant_single_aa_overhangs_protein_positions (5 ppm + >0.5% intensity) when present,
@@ -2754,7 +2755,7 @@ def run_rt_windows(args):
             'percolator_PEP': percolator_PEP,
             'evalue': evalue,
             'n_candidates': n_candidates,
-            'ions_matched': ions_matched,
+            'significant_frag_count': significant_frag_count,
             'matched fragment ions': row.get('matched fragment ions') if 'matched fragment ions' in df.columns else None,
             'matched fragment ion intensities': row.get('matched fragment ion intensities') if 'matched fragment ion intensities' in df.columns else None,
             'significant_single_aa_overhangs_protein_positions': significant_single_aa_overhangs_protein_positions,
@@ -2859,16 +2860,17 @@ def run_rt_windows(args):
         mz_observed_min = min(mz_vals) if mz_vals else None
         mz_observed_max = max(mz_vals) if mz_vals else None
         mz_observed_std = float(np.std(mz_vals)) if len(mz_vals) > 1 else None
-        # Ions matched: max across PSMs (peptide passes ">= N fragments" if any PSM had >= N)
-        ions_matched_vals = []
+        # Significant fragment count: max across PSMs (peptide passes ">= N fragments"
+        # if any PSM had >= N)
+        sig_frag_count_vals = []
         for p in group:
-            v = p.get('ions_matched')
+            v = p.get('significant_frag_count')
             if v is not None and not (isinstance(v, float) and pd.isna(v)):
                 try:
-                    ions_matched_vals.append(int(float(v)))
+                    sig_frag_count_vals.append(int(float(v)))
                 except (TypeError, ValueError):
                     pass
-        ions_matched_max = max(ions_matched_vals) if ions_matched_vals else None
+        sig_frag_count_max = max(sig_frag_count_vals) if sig_frag_count_vals else None
         has_significant_fragment_pairs_merged = any(p.get('_has_significant_fragment_pairs') for p in group)
         fragment_intensity_c, fragment_intensity_z = _aggregate_fragment_intensities(group)
         # Merge overhang/fragment keys for unique-peptides grid (per-channel and combined)
@@ -2949,7 +2951,7 @@ def run_rt_windows(args):
             '_scan_count_total': scan_count_total_merged,
             '_scan_count_passed': passed_psms,
             'n_candidates': max([p.get('n_candidates') for p in group if p.get('n_candidates') is not None]) if any(p.get('n_candidates') is not None for p in group) else first.get('n_candidates'),
-            'ions_matched': ions_matched_max,
+            'significant_frag_count': sig_frag_count_max,
             '_has_significant_fragment_pairs': has_significant_fragment_pairs_merged,
             'fragment_intensity_c': fragment_intensity_c,
             'fragment_intensity_z': fragment_intensity_z,
@@ -3090,6 +3092,9 @@ def run_rt_windows(args):
     except (TypeError, ValueError):
         _sum_initial = 0.0
     def _is_valuable(p):
+        # protect_peptide (True/False) or valuable_sequence (1) — prioritize for channel assignment, avoid dropping
+        if p.get('protect_peptide') in (True, 1, 'True', 'true', '1'):
+            return True
         v = p.get('valuable_sequence')
         if v == 1 or (isinstance(v, (int, float)) and v == 1):
             return True
@@ -3133,22 +3138,22 @@ def run_rt_windows(args):
     n_protected = sum(1 for p in peptides_stage1 if p.get('_protected_high_relative_area'))
     if n_protected:
         print(f"  Protected (≥{RELATIVE_AREA_PROTECTED*100:.0f}% relative total area, exempt from stages 2–6): {n_protected} peptides")
-    # Stage 2: require at least MIN_FRAGMENTS_MATCHED fragments matched in MS2 spectrum (skip if no ions_matched in data)
+    # Stage 2: require at least MIN_FRAGMENTS_MATCHED significant fragments (skip if no significant fragment counts in data)
     print("[Stage 2/6] Running: require ≥{} fragments matched. Next: Stage 3 (q-value/PEP).".format(MIN_FRAGMENTS_MATCHED))
-    has_ions_matched = any(p.get('ions_matched') is not None for p in peptides_stage1)
-    if has_ions_matched:
-        stage2_passed = [p for p in peptides_stage1 if p.get('_protected_high_relative_area') or (p.get('ions_matched') or 0) >= MIN_FRAGMENTS_MATCHED]
+    has_sig_frag_count = any(p.get('significant_frag_count') is not None for p in peptides_stage1)
+    if has_sig_frag_count:
+        stage2_passed = [p for p in peptides_stage1 if p.get('_protected_high_relative_area') or (p.get('significant_frag_count') or 0) >= MIN_FRAGMENTS_MATCHED]
         rejected_stage2 = [p for p in peptides_stage1 if p not in stage2_passed]
         for p in rejected_stage2:
-            p.setdefault('_rejection_reason', f'Fewer than {MIN_FRAGMENTS_MATCHED} fragments matched')
+            p.setdefault('_rejection_reason', f'Fewer than {MIN_FRAGMENTS_MATCHED} significant fragments')
         n_drop_frag = len(peptides_stage1) - len(stage2_passed)
         if n_drop_frag:
-            print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} fragments matched): {len(peptides_stage1)} -> {len(stage2_passed)} peptides (dropped {n_drop_frag})")
+            print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} significant fragments): {len(peptides_stage1)} -> {len(stage2_passed)} peptides (dropped {n_drop_frag})")
         peptides_stage2 = _backfill_after_stage(stage2_passed, peptides_stage1, "Stage 2")
     else:
         rejected_stage2 = []
         peptides_stage2 = list(peptides_stage1)
-        print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} fragments matched): skipped (no ions_matched column in CSV)")
+        print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} significant fragments): skipped (no significant fragment columns in CSV)")
     # Stage 3: require EITHER q < Q_OR_PEP_THRESH OR PEP < Q_OR_PEP_THRESH (at least one PSM per peptide)
     print("[Stage 3/6] Running: require q<{} or PEP<{}. Next: Stage 4 (envelope).".format(Q_OR_PEP_THRESH, Q_OR_PEP_THRESH))
     def _passes_q_or_pep(p):
@@ -3253,10 +3258,11 @@ def run_rt_windows(args):
         print(f"[diagnostic] Before channel assignment: no valid window start in {len(kept)} kept peaks")
     # Distinct sets of 3 channels; within each set same peak cannot repeat; within each channel no overlap.
     # Goal: maximally fill each channel; repeating peptides across different sets of 3 is encouraged later.
-    # Prioritize valuable_sequence=1 and high relative area for first channels (workflow Step 9)
+    # Prioritize protect_peptide=True or valuable_sequence=1 and high relative area for first channels (workflow Step 9)
     def _valuable_sort_key(p):
+        is_prot = p.get('protect_peptide') in (True, 1, 'True', 'true', '1')
         v = p.get('valuable_sequence')
-        is_val = v == 1 or (isinstance(v, (int, float)) and v == 1) or (isinstance(v, str) and str(v).strip() == '1')
+        is_val = is_prot or (v == 1 or (isinstance(v, (int, float)) and v == 1) or (isinstance(v, str) and str(v).strip() == '1'))
         rel = p.get('relative_area_within_selection') or 0
         return (0 if is_val else 1, -rel)
     kept = sorted(kept, key=_valuable_sort_key)

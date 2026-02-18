@@ -492,10 +492,10 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     """
     Calculate a composite quality score combining Comet metrics (no Xcorr).
     
-    Combines: ΔCn (uniqueness), E-value (statistical significance), Sp rank, matched ion fraction.
+    Combines: ΔCn (uniqueness), E-value (statistical significance), Sp rank.
     
     Args:
-        peptide_dict: Dictionary containing Comet metrics (delta_cn, e_value, sp_rank, ions_matched, ions_total)
+        peptide_dict: Dictionary containing Comet metrics (delta_cn, e_value, sp_rank)
         charge: Charge state (optional, for future stratification)
         peptide_length: Peptide length (optional, for future stratification)
     
@@ -505,11 +505,6 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     delta_cn = peptide_dict.get('delta_cn', 0.0)
     e_value = peptide_dict.get('e_value', 1.0)  # Default to worst case if missing
     sp_rank = peptide_dict.get('sp_rank', float('inf'))  # Default to worst case if missing
-    ions_matched = peptide_dict.get('ions_matched', 0)
-    ions_total = peptide_dict.get('ions_total', 1)  # Avoid division by zero
-    
-    # Calculate matched ion fraction
-    ion_fraction = ions_matched / ions_total if ions_total > 0 else 0.0
     
     # ΔCn: 0-1 scale, higher is better (uniqueness)
     delta_cn_component = delta_cn * 50.0  # Weight: 50x (very important for uniqueness)
@@ -526,10 +521,7 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     else:
         sp_rank_component = 0.0
     
-    # Ion fraction: 0-1 scale, higher is better
-    ion_fraction_component = ion_fraction * 15.0  # Weight: 15x
-    
-    composite_score = (delta_cn_component + e_value_component + sp_rank_component + ion_fraction_component)
+    composite_score = (delta_cn_component + e_value_component + sp_rank_component)
     return composite_score
 
 

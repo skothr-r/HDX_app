@@ -18,3 +18,4 @@ dependencies:
   - plotly>=5.0.0
   - matplotlib>=3.5.0
   - scipy
+  - percolator  # Optional: for q-values in Comet pipeline (Streamlit Cloud skips if not installed)

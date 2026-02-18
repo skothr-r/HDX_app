@@ -31,7 +31,7 @@ def main():
     ap.add_argument('--chromatogram-traces', default=None,
                     help='Path to chromatogram_traces.npz (default: same dir as metrics CSV)')
     ap.add_argument('--filter-csv', default=None,
-                    help='Optional: extraction output CSV. Only plot peptides in this list (thins down plots).')
+                    help='Optional: current step input/output CSV used as peptide include-list for plotting.')
     ap.add_argument('--output-accepted-dir', default=None,
                     help='Override accepted plots directory (default: output-dir/extraction)')
     ap.add_argument('--output-rejected-dir', default=None,
@@ -83,7 +83,7 @@ def main():
     )
     print(f'[Plot Chromatograms] Metrics: {metrics_csv}')
     if args.filter_csv:
-        print(f'[Plot Chromatograms] Filter: {args.filter_csv} (only plot peptides in this list)')
+        print(f'[Plot Chromatograms] Filter CSV: {args.filter_csv} (current step peptide list used for plotting)')
     print(f'[Plot Chromatograms] Traces: {traces_path}')
     print(f'[Plot Chromatograms] Output: {accepted_dir} / {rejected_dir}')
     run_chromatograms(ns)
