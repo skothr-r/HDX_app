@@ -123,21 +123,18 @@ def main():
     else:
         out_csv = os.path.join(out_dir, f'{base}_significance.csv')
 
-    # Input: significant_frags (Step 5) or legacy significant_fragment_ions/comet_matched_frags
+    # Input: significant_frags (Step 5) or legacy significant_fragment_ions.
     # Output: refined_significant_frags (1% noise filter)
     cols_0 = pd.read_csv(args.input, nrows=0).columns
     has_sig = 'significant_frags' in cols_0
     has_sig_mz = 'significant_frags_mz' in cols_0
     has_legacy_sig = 'significant_fragment_ions' in cols_0
     has_legacy_mz = 'significant_fragment_mz' in cols_0
-    has_comet = 'comet_matched_frags' in cols_0 or 'matched fragment ions' in cols_0
-    col_ions_in = 'significant_frags' if has_sig else ('significant_fragment_ions' if has_legacy_sig else ('comet_matched_frags' if has_comet else 'comet_matched_frags'))
-    col_mz_in = 'significant_frags_mz' if has_sig_mz else ('significant_fragment_mz' if has_legacy_mz else ('comet_matched_frags_mz' if has_comet else 'comet_matched_frags_mz'))
+    col_ions_in = 'significant_frags' if has_sig else ('significant_fragment_ions' if has_legacy_sig else 'significant_frags')
+    col_mz_in = 'significant_frags_mz' if has_sig_mz else ('significant_fragment_mz' if has_legacy_mz else 'significant_frags_mz')
     col_ions = 'refined_significant_frags'
     col_mz = 'refined_significant_frags_mz'
-    col_matched_ions = 'comet_matched_frags'
-    col_matched_mz = 'comet_matched_frags_mz'
-    col_int = 'matched fragment ion intensities'
+    col_int = 'comet_matched_frags_intensities'
     col_pairs = 'refined_significant_fragment_pairs'
     col_overhangs = 'refined_significant_single_aa_overhangs'
     col_overhangs_prot = 'refined_significant_single_aa_overhangs_protein_positions'
@@ -157,21 +154,27 @@ def main():
         df = df.rename(columns={'matched fragment ions': 'comet_matched_frags'})
     if 'matched fragment ion mz' in df.columns and 'comet_matched_frags_mz' not in df.columns:
         df = df.rename(columns={'matched fragment ion mz': 'comet_matched_frags_mz'})
+    if 'matched fragment ion intensities' in df.columns and 'comet_matched_frags_intensities' not in df.columns:
+        df = df.rename(columns={'matched fragment ion intensities': 'comet_matched_frags_intensities'})
+    if 'comet_amtched_frags_intensities' in df.columns and 'comet_matched_frags_intensities' not in df.columns:
+        df = df.rename(columns={'comet_amtched_frags_intensities': 'comet_matched_frags_intensities'})
+    if 'matched fragment ion quality scores' in df.columns and 'comet_matched_frags_quality_scores' not in df.columns:
+        df = df.rename(columns={'matched fragment ion quality scores': 'comet_matched_frags_quality_scores'})
 
     # Resolve RT window columns
-    min_rt_col = 'detected_peak_min_rt' if 'detected_peak_min_rt' in df.columns else 'min_rt'
-    max_rt_col = 'detected_peak_max_rt' if 'detected_peak_max_rt' in df.columns else 'max_rt'
+    min_rt_col = 'MS1_RT_integration_start_sec' if 'MS1_RT_integration_start_sec' in df.columns else ('detected_peak_min_rt' if 'detected_peak_min_rt' in df.columns else 'min_rt')
+    max_rt_col = 'MS1_RT_integration_stop_sec' if 'MS1_RT_integration_stop_sec' in df.columns else ('detected_peak_max_rt' if 'detected_peak_max_rt' in df.columns else 'max_rt')
     if min_rt_col not in df.columns:
-        min_rt_col = 'collection_min_rt'
+        min_rt_col = 'MS1_RT_collection_start_sec' if 'MS1_RT_collection_start_sec' in df.columns else 'collection_min_rt'
     if max_rt_col not in df.columns:
-        max_rt_col = 'collection_max_rt'
+        max_rt_col = 'MS1_RT_collection_stop_sec' if 'MS1_RT_collection_stop_sec' in df.columns else 'collection_max_rt'
     if min_rt_col not in df.columns:
         min_rt_col = 'anchor_rt'
     if max_rt_col not in df.columns:
         max_rt_col = 'anchor_rt'
 
     if col_ions_in not in df.columns or col_mz_in not in df.columns:
-        print("Error: CSV must have fragment ion columns (significant_frags or comet_matched_frags).")
+        print("Error: CSV must have significant fragment columns (significant_frags and significant_frags_mz).")
         sys.exit(1)
     if col_ions not in df.columns:
         df[col_ions] = ''
@@ -217,13 +220,13 @@ def main():
             pct = 100 * (i + 1) / n_before
             _log(f"[Step 8]   Progress: {i + 1}/{n_before} ({pct:.1f}%) | {elapsed:.0f}s elapsed | ~{eta:.0f}s left")
         row = df.loc[idx]
-        peptide = row.get('plain_peptide') or row.get('sequence') or ''
+        peptide = row.get('peptide_sequence') or row.get('plain_peptide') or row.get('sequence') or ''
         if not peptide or not isinstance(peptide, str):
             continue
         min_rt = row.get(min_rt_col)
         max_rt = row.get(max_rt_col)
         if pd.isna(min_rt) or pd.isna(max_rt) or min_rt is None or max_rt is None:
-            min_rt = row.get('anchor_rt') or row.get('MS1_retention_time_sec')
+            min_rt = row.get('anchor_rt') or row.get('MS1_RT_sec') or row.get('MS1_retention_time_sec')
             max_rt = min_rt
         min_rt = float(min_rt) if min_rt is not None and not pd.isna(min_rt) else None
         max_rt = float(max_rt) if max_rt is not None and not pd.isna(max_rt) else None
@@ -245,14 +248,7 @@ def main():
         int_list = [p.strip() for p in str(int_val).strip().strip('"').split(',') if p.strip()] if pd.notna(int_val) and str(int_val).strip() else []
         loss_val = row.get('matched fragment ion loss types', '')
         loss_list = [p.strip() for p in str(loss_val).strip().strip('"').split(',') if p.strip()] if pd.notna(loss_val) and str(loss_val).strip() else []
-        # When significant_fragment_ions exists but significant_fragment_mz does not, ions (24) and mz (12) length mismatch causes drops.
-        # Fallback: use matched fragment ions + mz (always 1:1) so we can refine.
-        if len(ions_list) != len(mz_list) and col_matched_ions in df.columns and col_matched_mz in df.columns and (col_matched_ions != col_ions_in or col_matched_mz != col_mz_in):
-            matched_ions_val = row.get(col_matched_ions, '')
-            matched_mz_val = row.get(col_matched_mz, '')
-            if pd.notna(matched_ions_val) and pd.notna(matched_mz_val) and str(matched_ions_val).strip() and str(matched_mz_val).strip():
-                ions_list = [p.strip() for p in str(matched_ions_val).strip().strip('"').split(',') if p.strip()]
-                mz_list = [p.strip() for p in str(matched_mz_val).strip().strip('"').split(',') if p.strip()]
+        # Strict significant-only behavior: do not fallback to Comet fragment lists.
         if len(ions_list) != len(mz_list):
             skip_ions_mismatch += 1
             rows_to_drop.append(idx)
@@ -325,7 +321,7 @@ def main():
                         m = re.match(r'^(\d+)([A-Z])$', part.strip())
                         if m:
                             overhang_positions.add((int(m.group(1)), m.group(2)))
-                    seq_start = row.get('sequence_start_pos') or row.get('sequence_positions')
+                    seq_start = row.get('sequence_start_pos') or row.get('protein_position') or row.get('sequence_positions')
                     if pd.notna(seq_start) and str(seq_start).strip():
                         start = int(str(seq_start).split('-')[0].split(',')[0].strip())
                         prot_parts = [f'{start + p - 1}{aa}' for p, aa in sorted(overhang_positions) if 1 <= p <= len(clean)]
@@ -334,6 +330,22 @@ def main():
                     pass
 
     df = df.drop(index=rows_to_drop).reset_index(drop=True)
+    # Standardize legacy retention_time headers to RT headers.
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df.columns:
+            if new in df.columns:
+                df[new] = df[old].where(pd.notna(df[old]), df[new])
+                df = df.drop(columns=[old])
+            else:
+                df = df.rename(columns={old: new})
     n_after = len(df)
 
     n_passed = len([x for x in scatter_data if x[2]])
@@ -391,6 +403,42 @@ def main():
             _log(f"[Step 8] Diagnostic: MS2 scatter -> {os.path.basename(diag_path)}")
         except Exception as e:
             _log(f"[Step 8] Warning: Could not create scatter plot: {e}")
+
+    # Preserve shared workflow row organization across downstream tabs.
+    pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
+    rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df.columns else None)
+    if pos_col or seq_col:
+        def _start_len(row):
+            if pos_col:
+                s = str(row.get(pos_col, '')).strip()
+                if s and '-' in s:
+                    try:
+                        a, b = s.split('-', 1)
+                        start = int(str(a).strip())
+                        end = int(str(b).strip().split(',')[0])
+                        return start, max(0, end - start + 1)
+                    except Exception:
+                        pass
+            seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+            return 999999, (len(seq) if seq else 999999)
+        sl = df.apply(_start_len, axis=1, result_type='expand')
+        df['_sort_start'] = sl[0]
+        df['_sort_len'] = sl[1]
+        df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
+        df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
+        df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
+        df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
+
+    if 'MS1_mz_error' in df.columns and 'MS1_mz_error_ppm' not in df.columns:
+        df = df.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df.columns]
+    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df.columns]
+    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df.columns]
+    ms2_cols = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df.columns]
+    if front_cols or ms1_cols or frag_tail or ms2_cols:
+        lead_cols = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
+        df = df[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
 
     _log("[Step 8] Writing output CSV...")
     df.to_csv(out_csv, index=False)

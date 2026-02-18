@@ -28,6 +28,16 @@ except ImportError:
     HAS_PANDAS = False
     print("Warning: pandas not available, using manual CSV parsing")
 
+UNUSED_WORKFLOW_COLUMNS = {
+    'exp_neutral_mass',
+    'ions_total',
+    'modified_peptide',
+    'protein_count',
+    'sp_rank',
+    'single_aa_overhang_fragment_pairs',
+    'single_aa_overhangs_protein_positions',
+}
+
 def _find_percolator():
     """Return path to Percolator executable, or None if not found.
     Checks PATH first, then bundled percolator.linux (for Streamlit Cloud).
@@ -307,6 +317,54 @@ def _infer_specid_base_names(qvalues):
     return list(bases)
 
 
+def _sort_by_sequence_start_len_charge(df):
+    """Sort rows by sequence start, peptide length (short->long), then charge."""
+    pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
+    if pos_col is None and seq_col is None:
+        return df
+
+    def _start_and_len(row):
+        pos_val = row.get(pos_col, '') if pos_col else ''
+        s = str(pos_val).strip() if pos_val is not None else ''
+        if s and '-' in s:
+            try:
+                a, b = s.split('-', 1)
+                start = int(str(a).strip())
+                end = int(str(b).strip().split(',')[0])
+                ln = max(0, end - start + 1)
+                return start, ln
+            except Exception:
+                pass
+        seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+        return 999999, (len(seq) if seq else 999999)
+
+    start_len = df.apply(_start_and_len, axis=1, result_type='expand')
+    df['_sort_start'] = start_len[0]
+    df['_sort_len'] = start_len[1]
+    df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
+    df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge'], ascending=[True, True, True], kind='mergesort')
+    df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge'])
+    return df
+
+
+def _move_tail_columns_for_display_df(df):
+    """
+    Keep MS1_RT_minutes/intensity early; move MS1_RT_sec+MS2_RT* to very end.
+    """
+    # Backward compatibility for old column name
+    if 'MS1_mz_error' in df.columns and 'MS1_mz_error_ppm' not in df.columns:
+        df = df.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df.columns]
+    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df.columns]
+    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df.columns]
+    ms2_tail = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df.columns]
+    if not (front_cols or ms1_cols or frag_tail or ms2_tail):
+        return df
+    rest = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_tail]
+    return df[front_cols + ms1_cols + rest + frag_tail + ms2_tail]
+
+
 def merge_qvalues_into_csv(csv_file, qvalues, output_file, diagnose_unmatched=False, fill_unmatched=None, specid_bases=None):
     """Merge q-values into CSV file. If diagnose_unmatched=True, print why each unmatched row failed.
     If fill_unmatched=(qval, pep) is set, use those values for rows that have no Percolator match (so every row has a value)."""
@@ -377,15 +435,38 @@ def merge_qvalues_into_csv(csv_file, qvalues, output_file, diagnose_unmatched=Fa
             if b and b not in base_names:
                 base_names.append(b)
     
-    # Check if q-value columns already exist
-    has_qvalue = 'percolator_qvalue' in df.columns or 'q-value' in df.columns
-    has_pep = 'percolator_PEP' in df.columns or 'PEP' in df.columns
-    
-    # Initialize q-value columns
+    # Normalize q-value/PEP column names to canonical workflow names.
+    if 'percolator_qvalue' in df.columns and 'perc_qvalue' not in df.columns:
+        df = df.rename(columns={'percolator_qvalue': 'perc_qvalue'})
+    if 'q-value' in df.columns and 'perc_qvalue' not in df.columns:
+        df = df.rename(columns={'q-value': 'perc_qvalue'})
+    if 'percolator_PEP' in df.columns and 'perc_PEP' not in df.columns:
+        df = df.rename(columns={'percolator_PEP': 'perc_PEP'})
+    if 'PEP' in df.columns and 'perc_PEP' not in df.columns:
+        df = df.rename(columns={'PEP': 'perc_PEP'})
+    # Standardize legacy retention_time headers to RT headers.
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df.columns:
+            if new in df.columns:
+                df[new] = df[old].where(pd.notna(df[old]), df[new])
+                df = df.drop(columns=[old])
+            else:
+                df = df.rename(columns={old: new})
+
+    has_qvalue = 'perc_qvalue' in df.columns
+    has_pep = 'perc_PEP' in df.columns
     if not has_qvalue:
-        df['percolator_qvalue'] = None
+        df['perc_qvalue'] = None
     if not has_pep:
-        df['percolator_PEP'] = None
+        df['perc_PEP'] = None
     
     # Build lookup by (scan, charge) for fallback matching
     # Percolator outputs one PSM per (scan, charge), but Comet may have multiple num values
@@ -542,19 +623,29 @@ def merge_qvalues_into_csv(csv_file, qvalues, output_file, diagnose_unmatched=Fa
                 unmatched_details.append((scan, charge, num_str, in_lookup, peptide_key))
 
         # Update q-value columns
-        if has_qvalue:
-            qvalue_col = 'percolator_qvalue' if 'percolator_qvalue' in df.columns else 'q-value'
-            df.at[idx, qvalue_col] = qvalue
-        else:
-            df.at[idx, 'percolator_qvalue'] = qvalue
-        
-        if has_pep:
-            pep_col = 'percolator_PEP' if 'percolator_PEP' in df.columns else 'PEP'
-            df.at[idx, pep_col] = pep
-        else:
-            df.at[idx, 'percolator_PEP'] = pep
+        df.at[idx, 'perc_qvalue'] = qvalue
+        df.at[idx, 'perc_PEP'] = pep
     
     # Unmatched rows are left with missing/NaN percolator_qvalue and percolator_PEP (no E-value fallback).
+
+    # Drop columns unused in this workflow to reduce CSV noise.
+    drop_cols = [c for c in UNUSED_WORKFLOW_COLUMNS if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        print(f"Dropped unused columns: {', '.join(drop_cols)}")
+
+    # Reorder: place Percolator score columns directly after observed_mz.
+    if 'observed_mz' in df.columns:
+        preferred = ['perc_qvalue', 'perc_PEP']
+        present = [c for c in preferred if c in df.columns]
+        if present:
+            remainder = [c for c in df.columns if c not in present]
+            anchor_idx = remainder.index('observed_mz')
+            reordered = remainder[:anchor_idx + 1] + present + remainder[anchor_idx + 1:]
+            df = df[reordered]
+
+    df = _sort_by_sequence_start_len_charge(df)
+    df = _move_tail_columns_for_display_df(df)
 
     # Write output (same number of rows as input; we only add/update columns)
     output_row_count = len(df)
@@ -616,15 +707,26 @@ def merge_qvalues_into_csv(csv_file, qvalues, output_file, diagnose_unmatched=Fa
 def merge_qvalues_into_csv_manual(csv_file, qvalues, output_file, header, lines):
     """Fallback manual CSV merging (for non-standard formats)."""
     # This is the old implementation - kept for compatibility
+    # Normalize legacy names to canonical workflow names.
+    header = [('perc_qvalue' if c in ('percolator_qvalue', 'q-value') else c) for c in header]
+    header = [('perc_PEP' if c in ('percolator_PEP', 'PEP') else c) for c in header]
     # Check if q-value columns already exist
-    has_qvalue = 'percolator_qvalue' in header or 'q-value' in header
-    has_pep = 'percolator_PEP' in header or 'PEP' in header
+    has_qvalue = 'perc_qvalue' in header
+    has_pep = 'perc_PEP' in header
     
     # Add columns if they don't exist
     if not has_qvalue:
-        header.append('percolator_qvalue')
+        header.append('perc_qvalue')
     if not has_pep:
-        header.append('percolator_PEP')
+        header.append('perc_PEP')
+
+    # Move Percolator columns directly after observed_mz when present.
+    if 'observed_mz' in header:
+        percs = [c for c in ('perc_qvalue', 'perc_PEP') if c in header]
+        if percs:
+            rest = [c for c in header if c not in percs]
+            i = rest.index('observed_mz')
+            header = rest[:i + 1] + percs + rest[i + 1:]
     
     # Get base name from CSV filename
     base_name = os.path.splitext(os.path.basename(csv_file))[0]
@@ -752,14 +854,24 @@ def merge_qvalues_into_csv_manual(csv_file, qvalues, output_file, header, lines)
             if not has_qvalue:
                 row_data.append(qvalue_str)
             else:
-                qvalue_col_idx = header.index('percolator_qvalue') if 'percolator_qvalue' in header else header.index('q-value')
+                if 'perc_qvalue' in header:
+                    qvalue_col_idx = header.index('perc_qvalue')
+                elif 'percolator_qvalue' in header:
+                    qvalue_col_idx = header.index('percolator_qvalue')
+                else:
+                    qvalue_col_idx = header.index('q-value')
                 if qvalue_col_idx < len(row_data):
                     row_data[qvalue_col_idx] = qvalue_str
             
             if not has_pep:
                 row_data.append(pep_str)
             else:
-                pep_col_idx = header.index('percolator_PEP') if 'percolator_PEP' in header else header.index('PEP')
+                if 'perc_PEP' in header:
+                    pep_col_idx = header.index('perc_PEP')
+                elif 'percolator_PEP' in header:
+                    pep_col_idx = header.index('percolator_PEP')
+                else:
+                    pep_col_idx = header.index('PEP')
                 if pep_col_idx < len(row_data):
                     row_data[pep_col_idx] = pep_str
             

@@ -11,7 +11,8 @@ Requires envelope_ok or m0_gt_m1_gt_m2 column in the input CSV (written by Step 
 Output: comet_frags_perc_openMS_prefilter_extraction_envelope.csv
 
 When chromatogram_metrics_all.csv and chromatogram_traces.npz exist, generates
-MS1 chromatogram plots for envelope-passed peptides (same style as extraction).
+MS1 chromatogram plots for all peptides in the current Envelope step input
+(accepted + rejected split into separate output folders).
 
 Usage:
   python filter_envelope.py
@@ -87,24 +88,39 @@ def main():
         skip = 0
     df = pd.read_csv(args.input, sep=',', skiprows=skip, engine='python', quotechar='"', on_bad_lines='warn')
 
-    # Check for envelope columns (written by Step 6 extraction)
+    # Check for required envelope columns (written by Step 6 extraction)
     has_m0 = 'm0_gt_m1_gt_m2' in df.columns
     has_env_ok = 'envelope_ok' in df.columns
+    has_req_iso = 'has_required_isotopes' in df.columns
+    has_matched_isotopes = 'matched_isotopes' in df.columns
 
     if not has_m0 and not has_env_ok:
         print("Error: Input CSV has no envelope_ok or m0_gt_m1_gt_m2 columns.")
         print("Run chromatogram extraction (Step 6) first to produce the extraction CSV with envelope data.")
         sys.exit(1)
+    if not has_req_iso and not has_matched_isotopes:
+        print("Error: Input CSV has no has_required_isotopes or matched_isotopes column.")
+        print("Run chromatogram extraction (Step 6) first to produce summed-MS1 isotope presence metrics.")
+        sys.exit(1)
 
-    # Filter: keep rows where m0_gt_m1_gt_m2 (or envelope_ok) is True AND has_required_isotopes (M0, M+1, M+2) is True
-    has_req_iso = 'has_required_isotopes' in df.columns
+    # Filter criteria from summed MS1 (integration window):
+    #   (1) M0, M+1, M+2 present (has_required_isotopes == True)
+    #   (2) M+0 > M+1 OR M+1 > M+2 (m0_gt_m1_gt_m2 or envelope_ok == True)
 
-    def _passes_envelope(row):
-        # Require M0, M+1, M+2 present when column exists
+    def _has_required_isotopes(row):
         if has_req_iso:
             req = row.get('has_required_isotopes')
-            if pd.isna(req) or not _to_bool(req):
-                return False
+            return (not pd.isna(req)) and _to_bool(req)
+        # Backward compatibility: infer from matched_isotopes string in older extraction outputs.
+        mi = row.get('matched_isotopes')
+        if pd.isna(mi):
+            return False
+        s = str(mi).replace(' ', '')
+        return ('M+0' in s) and ('M+1' in s) and ('M+2' in s)
+
+    def _passes_envelope(row):
+        if not _has_required_isotopes(row):
+            return False
         m0 = row.get('m0_gt_m1_gt_m2')
         env = row.get('envelope_ok')
         if has_m0 and pd.notna(m0):
@@ -115,17 +131,70 @@ def main():
 
     mask = df.apply(_passes_envelope, axis=1)
     df_out = df[mask].reset_index(drop=True)
+    # Standardize legacy retention_time headers to RT headers.
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df_out.columns:
+            if new in df_out.columns:
+                df_out[new] = df_out[old].where(pd.notna(df_out[old]), df_out[new])
+                df_out = df_out.drop(columns=[old])
+            else:
+                df_out = df_out.rename(columns={old: new})
 
     n_before = len(df)
     n_after = len(df_out)
     n_dropped = n_before - n_after
 
+    # Preserve shared workflow row organization across downstream tabs.
+    pos_col = 'protein_position' if 'protein_position' in df_out.columns else ('sequence_positions' if 'sequence_positions' in df_out.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df_out.columns else ('plain_peptide' if 'plain_peptide' in df_out.columns else None)
+    rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df_out.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df_out.columns else None)
+    if pos_col or seq_col:
+        def _start_len(row):
+            if pos_col:
+                s = str(row.get(pos_col, '')).strip()
+                if s and '-' in s:
+                    try:
+                        a, b = s.split('-', 1)
+                        start = int(str(a).strip())
+                        end = int(str(b).strip().split(',')[0])
+                        return start, max(0, end - start + 1)
+                    except Exception:
+                        pass
+            seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+            return 999999, (len(seq) if seq else 999999)
+        sl = df_out.apply(_start_len, axis=1, result_type='expand')
+        df_out['_sort_start'] = sl[0]
+        df_out['_sort_len'] = sl[1]
+        df_out['_sort_charge'] = pd.to_numeric(df_out.get('charge'), errors='coerce').fillna(999999)
+        df_out['_sort_rt'] = pd.to_numeric(df_out.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
+        df_out = df_out.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
+        df_out = df_out.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
+
+    if 'MS1_mz_error' in df_out.columns and 'MS1_mz_error_ppm' not in df_out.columns:
+        df_out = df_out.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df_out.columns]
+    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df_out.columns]
+    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df_out.columns]
+    ms2_cols = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df_out.columns]
+    if front_cols or ms1_cols or frag_tail or ms2_cols:
+        lead_cols = [c for c in df_out.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
+        df_out = df_out[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
+
     df_out.to_csv(out_csv, index=False)
     print(f"[Step 7] Envelope filter: {n_before} -> {n_after} rows (dropped {n_dropped})")
     print(f"[Step 7] Output: {os.path.abspath(out_csv)}")
 
-    # Generate MS1 chromatogram plots for envelope-passed peptides (same style as extraction)
-    if not args.no_plots and n_after > 0:
+    # Generate MS1 chromatogram plots for all peptides in this step input
+    # (accepted and rejected are separated by envelope criteria downstream).
+    if not args.no_plots and n_before > 0:
         dataframes_dir = os.path.join(out_dir, 'dataframes')
         metrics_csv = os.path.join(dataframes_dir, 'chromatogram_metrics_all.csv')
         traces_path = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
@@ -139,7 +208,7 @@ def main():
                    '--chromatogram-metrics-csv', metrics_csv,
                    '--chromatogram-traces', traces_path,
                    '--output-dir', out_dir,
-                   '--filter-csv', out_csv,
+                   '--filter-csv', args.input,
                    '--output-accepted-dir', envelope_plots_dir,
                    '--output-rejected-dir', envelope_rejected_dir]
             try:

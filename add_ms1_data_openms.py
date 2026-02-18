@@ -8,11 +8,12 @@ This script:
 3. Appends MS1 data columns to the CSV
 
 By default all rows are preserved (only MS1 columns are added). Use --filter to drop rows
-that fail ions_matched > 1 or lack single AA overhangs.
+that fail significant fragment count (>1 when `significant_frags` is present) or lack
+single AA overhangs.
 
 Usage:
     python add_ms1_data_openms.py <comet_csv> <raw_file> [output_csv]
-    python add_ms1_data_openms.py --filter <comet_csv> <raw_file> [output_csv]   # also filter to ions_matched>1 and single AA overhangs
+    python add_ms1_data_openms.py --filter <comet_csv> <raw_file> [output_csv]   # also filter by significant_frags count and single AA overhangs
 
 Requirements:
     - pyopenms (pip install pyopenms)
@@ -25,6 +26,16 @@ import pandas as pd
 from pyopenms import MSExperiment, MzMLFile
 import numpy as np
 from collections import defaultdict
+
+UNUSED_WORKFLOW_COLUMNS = {
+    'exp_neutral_mass',
+    'ions_total',
+    'modified_peptide',
+    'protein_count',
+    'sp_rank',
+    'single_aa_overhang_fragment_pairs',
+    'single_aa_overhangs_protein_positions',
+}
 
 def extract_ms1_data(raw_file, comet_csv):
     """
@@ -176,7 +187,7 @@ def extract_ms1_data(raw_file, comet_csv):
             # Get precursor m/z from CSV
             precursor_mz = None
             mz_col_used = None
-            for col in ['spectrum precursor m/z', 'precursor_mz', 'mz', 'precursorMZ', 'precursor_m/z']:
+            for col in ['spectrum precursor m/z', 'precursor_mz', 'observed_mz', 'theoretical_mz', 'mz', 'precursorMZ', 'precursor_m/z']:
                 if col in row and not pd.isna(row[col]):
                     try:
                         precursor_mz = float(row[col])
@@ -236,7 +247,7 @@ def main():
     if len(argv) < 2:
         print("Usage: python add_ms1_data_openms.py [--filter] <comet_csv> <raw_file> [output_csv]")
         print("  Default: add MS1 columns only; preserve all rows.")
-        print("  --filter   Also filter rows (ions_matched>1 and single AA overhangs required)")
+        print("  --filter   Also filter rows (significant_frags>1 when present, and single AA overhangs required)")
         print("\nExample:")
         print("  python add_ms1_data_openms.py results.csv data.mzML results_with_ms1.csv")
         print("  python add_ms1_data_openms.py --filter results.csv data.mzML results_with_ms1_filtered.csv")
@@ -275,6 +286,11 @@ def main():
     
     input_row_count = len(df)
     print(f"[DEBUG] CSV loaded: {input_row_count} rows, {len(df.columns)} columns")
+    # Compatibility with renamed identifier columns.
+    if 'peptide_sequence' in df.columns and 'plain_peptide' not in df.columns:
+        df['plain_peptide'] = df['peptide_sequence']
+    if 'protein_position' in df.columns and 'sequence_positions' not in df.columns:
+        df['sequence_positions'] = df['protein_position']
     
     # Add or update MS1 columns
     print("[DEBUG] Adding/updating MS1 columns in CSV...")
@@ -290,11 +306,10 @@ def main():
     else:
         df['MS1_retention_time_min'] = ms1_rt_mins
     
-    # Add intensity column if it doesn't exist
-    if 'MS1_retention_time_intensity' not in df.columns:
-        df['MS1_retention_time_intensity'] = ms1_intensities
+    # Always refresh intensity values (important when re-running on existing *_openMS.csv).
+    df['MS1_retention_time_intensity'] = ms1_intensities
     
-    # Reorder columns to put MS1 columns after MS2 RT columns if they exist
+    # Reorder columns to put OpenMS-added MS1 columns immediately after observed_mz.
     cols = list(df.columns)
     
     # Remove MS1 columns temporarily
@@ -303,11 +318,11 @@ def main():
         if col in cols:
             cols.remove(col)
     
-    # Find position after MS2 RT columns
+    # Find insertion anchor (prefer observed_mz for workflow consistency).
     insert_pos = len(cols)
-    for i, col in enumerate(cols):
-        if ('MS2_retention_time' in col or 'retention_time_sec' in col) and 'MS1' not in col:
-            insert_pos = i + 1
+    for anchor in ['observed_mz', 'theoretical_mz', 'mz']:
+        if anchor in cols:
+            insert_pos = cols.index(anchor) + 1
             break
     
     # Insert MS1 columns
@@ -381,43 +396,25 @@ def main():
         print("[DEBUG] Skipping row filters (keeping all rows)")
         df_filtered = df.copy()
     else:
-        # Filter rows: exclude rows with <=1 matched fragment ion
-        print("[DEBUG] Filtering rows: excluding rows with <=1 matched fragment ion...")
-        # Check for ions_matched column (preferred) or matched fragment ions column
-        if 'ions_matched' in df.columns:
-            # Use ions_matched column (integer count)
-            df_filtered = df[df['ions_matched'] > 1].copy()
-            excluded_count = initial_row_count - len(df_filtered)
-            print(f"[DEBUG] Using 'ions_matched' column for filtering")
-            print(f"[DEBUG]   Initial rows: {initial_row_count}")
-            print(f"[DEBUG]   Rows with >1 matched ions: {len(df_filtered)}")
-            print(f"[DEBUG]   Rows excluded: {excluded_count} ({excluded_count/initial_row_count*100:.1f}%)")
-            if 'plain_peptide' in df.columns:
-                unique_before = df['plain_peptide'].nunique()
-                unique_after = df_filtered['plain_peptide'].nunique()
-                print(f"[DEBUG]   Unique peptides: {unique_before} -> {unique_after}")
-        elif 'matched fragment ions' in df.columns:
-            # Parse matched fragment ions column (comma-separated list)
-            def count_fragment_ions(frag_str):
-                """Count number of fragment ions in comma-separated string"""
+        # Filter rows: exclude rows with <=1 significant fragment ion
+        print("[DEBUG] Filtering rows: excluding rows with <=1 significant fragment ion...")
+        if 'significant_frags' in df.columns:
+            def count_sig_fragment_ions(frag_str):
                 if pd.isna(frag_str) or frag_str == '':
                     return 0
                 try:
-                    frag_str = str(frag_str).strip()
-                    if frag_str.startswith('"') and frag_str.endswith('"'):
-                        frag_str = frag_str[1:-1]  # Remove quotes
+                    frag_str = str(frag_str).strip().strip('"')
                     if frag_str == '':
                         return 0
-                    # Count comma-separated items
                     return len([x for x in frag_str.split(',') if x.strip() != ''])
-                except:
+                except Exception:
                     return 0
 
-            df['_fragment_ion_count'] = df['matched fragment ions'].apply(count_fragment_ions)
-            df_filtered = df[df['_fragment_ion_count'] > 1].copy()
+            df['_sig_fragment_ion_count'] = df['significant_frags'].apply(count_sig_fragment_ions)
+            df_filtered = df[df['_sig_fragment_ion_count'] > 1].copy()
             excluded_count = initial_row_count - len(df_filtered)
-            df_filtered = df_filtered.drop(columns=['_fragment_ion_count'])
-            print(f"[DEBUG] Using 'matched fragment ions' column for filtering")
+            df_filtered = df_filtered.drop(columns=['_sig_fragment_ion_count'])
+            print(f"[DEBUG] Using 'significant_frags' column for filtering")
             print(f"[DEBUG]   Initial rows: {initial_row_count}")
             print(f"[DEBUG]   Rows with >1 matched ions: {len(df_filtered)}")
             print(f"[DEBUG]   Rows excluded: {excluded_count} ({excluded_count/initial_row_count*100:.1f}%)")
@@ -426,9 +423,9 @@ def main():
                 unique_after = df_filtered['plain_peptide'].nunique()
                 print(f"[DEBUG]   Unique peptides: {unique_before} -> {unique_after}")
         else:
-            print(f"[DEBUG] WARNING: Neither 'ions_matched' nor 'matched fragment ions' column found!")
+            print(f"[DEBUG] WARNING: 'significant_frags' column not found!")
             print(f"[DEBUG]   Available columns: {list(df.columns)}")
-            print(f"[DEBUG]   Skipping filtering - keeping all {initial_row_count} rows")
+            print(f"[DEBUG]   Skipping significant-fragment filtering (keeping all {initial_row_count} rows)")
             df_filtered = df.copy()
             excluded_count = 0
 
@@ -476,67 +473,86 @@ def main():
 
         df = df_filtered
     
-    # Sort by: sequence start position -> peptide length -> charge -> MS1 retention time
-    print("[DEBUG] Sorting rows by: sequence start position, peptide length, charge, MS1 retention time...")
-    
-    def parse_sequence_start(seq_pos_str):
-        """Extract start position from sequence_positions (e.g., '2-20' -> 2)"""
-        if pd.isna(seq_pos_str) or seq_pos_str == '':
-            return 999999  # Put empty ones at end
-        try:
-            if '-' in str(seq_pos_str):
-                return int(str(seq_pos_str).split('-')[0])
-            return 999999
-        except:
-            return 999999
-    
-    def parse_sequence_length(seq_pos_str):
-        """Extract peptide length from sequence_positions (e.g., '2-20' -> 19)"""
-        if pd.isna(seq_pos_str) or seq_pos_str == '':
-            return 0
-        try:
-            if '-' in str(seq_pos_str):
-                parts = str(seq_pos_str).split('-')
-                start = int(parts[0])
-                end = int(parts[1])
-                return end - start + 1  # Length = end - start + 1
-            return 0
-        except:
-            return 0
-    
-    # Add helper columns for sorting
+    # Drop columns unused in this workflow to reduce CSV noise.
+    drop_cols = [c for c in UNUSED_WORKFLOW_COLUMNS if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        print(f"[DEBUG] Dropped unused columns: {', '.join(drop_cols)}")
+
+    # Canonical identifier names in written outputs.
+    if 'plain_peptide' in df.columns:
+        if 'peptide_sequence' not in df.columns:
+            df = df.rename(columns={'plain_peptide': 'peptide_sequence'})
+        else:
+            df = df.drop(columns=['plain_peptide'])
     if 'sequence_positions' in df.columns:
-        df['_sort_start'] = df['sequence_positions'].apply(parse_sequence_start)
-        df['_sort_length'] = df['sequence_positions'].apply(parse_sequence_length)
+        if 'protein_position' not in df.columns:
+            df = df.rename(columns={'sequence_positions': 'protein_position'})
+        else:
+            df = df.drop(columns=['sequence_positions'])
+    if 'MS1_retention_time_sec' in df.columns:
+        if 'MS1_RT_sec' not in df.columns:
+            df = df.rename(columns={'MS1_retention_time_sec': 'MS1_RT_sec'})
+        else:
+            df = df.drop(columns=['MS1_retention_time_sec'])
+    if 'MS1_retention_time_min' in df.columns:
+        if 'MS1_RT_minutes' not in df.columns:
+            df = df.rename(columns={'MS1_retention_time_min': 'MS1_RT_minutes'})
+        else:
+            df = df.drop(columns=['MS1_retention_time_min'])
+    if 'MS1_retention_time_intensity' in df.columns:
+        if 'MS1_RT_intensity' not in df.columns:
+            df = df.rename(columns={'MS1_retention_time_intensity': 'MS1_RT_intensity'})
+        else:
+            df = df.drop(columns=['MS1_retention_time_intensity'])
+
+    # OpenMS final ordering: same primary sort as Comet/Percolator, with RT as extra tie-breaker.
+    print("[DEBUG] Sorting rows by sequence start, peptide length, charge, then MS1 RT")
+    pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
+    rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df.columns else None)
+
+    def _start_len(row):
+        if pos_col:
+            s = str(row.get(pos_col, '')).strip()
+            if s and '-' in s:
+                try:
+                    a, b = s.split('-', 1)
+                    start = int(str(a).strip())
+                    end = int(str(b).strip().split(',')[0])
+                    ln = max(0, end - start + 1)
+                    return start, ln
+                except Exception:
+                    pass
+        seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+        return 999999, (len(seq) if seq else 999999)
+
+    start_len = df.apply(_start_len, axis=1, result_type='expand')
+    df['_sort_start'] = start_len[0]
+    df['_sort_len'] = start_len[1]
+    df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
+    if rt_col:
+        df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0)
     else:
-        print("[DEBUG] Warning: 'sequence_positions' column not found, using default sorting")
-        df['_sort_start'] = 999999
-        df['_sort_length'] = 0
-    
-    # Ensure charge and MS1_retention_time_sec exist for sorting
-    if 'charge' not in df.columns:
-        print("[DEBUG] Warning: 'charge' column not found, using default value")
-        df['charge'] = 0
-    
-    if 'MS1_retention_time_sec' not in df.columns:
-        print("[DEBUG] Warning: 'MS1_retention_time_sec' column not found, using default value")
-        df['MS1_retention_time_sec'] = 999999.0
-    
-    # Fill NaN values for sorting
-    df['charge'] = df['charge'].fillna(0)
-    df['MS1_retention_time_sec'] = df['MS1_retention_time_sec'].fillna(999999.0)
-    
-    # Sort by: start position -> length -> charge -> MS1 RT
-    df = df.sort_values(
-        by=['_sort_start', '_sort_length', 'charge', 'MS1_retention_time_sec'],
-        ascending=[True, True, True, True]
-    )
-    
-    # Remove helper columns
-    df = df.drop(columns=['_sort_start', '_sort_length'])
-    
-    print(f"[DEBUG] Sorting complete. First few start positions: {df['sequence_positions'].head(5).tolist() if 'sequence_positions' in df.columns else 'N/A'}")
-    
+        df['_sort_rt'] = 999999.0
+    df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
+    df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
+
+    # Column priority:
+    # 1) MS1_RT_minutes/intensity near front (after observed_mz when present)
+    # 2) comet_matched_frags* near end
+    # 3) MS2_RT* at very end (sanity-check only)
+    # Backward compatibility for old column name
+    if 'MS1_mz_error' in df.columns and 'MS1_mz_error_ppm' not in df.columns:
+        df = df.rename(columns={'MS1_mz_error': 'MS1_mz_error_ppm'})
+    front_cols = [c for c in ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes'] if c in df.columns]
+    ms1_cols = [c for c in ['MS1_RT_intensity'] if c in df.columns]
+    ms2_cols = [c for c in ['MS1_RT_sec', 'MS2_RT_sec', 'MS2_RT_minutes'] if c in df.columns]
+    frag_tail = [c for c in ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores'] if c in df.columns]
+    if front_cols or ms1_cols or ms2_cols or frag_tail:
+        rest = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
+        df = df[front_cols + ms1_cols + rest + frag_tail + ms2_cols]
+
     output_row_count = len(df)
     print(f"[DEBUG] Writing output to: {output_csv}")
     df.to_csv(output_csv, index=False, sep=',')
@@ -553,26 +569,26 @@ def main():
     
     # Count unique peptides
     unique_peptides = 0
-    if 'plain_peptide' in df.columns:
-        unique_peptides = df['plain_peptide'].nunique()
+    if 'peptide_sequence' in df.columns:
+        unique_peptides = df['peptide_sequence'].nunique()
         total_rows = len(df)
         avg_entries_per_peptide = total_rows / unique_peptides if unique_peptides > 0 else 0
         print(f"[DEBUG] Unique peptides: {unique_peptides}")
         print(f"[DEBUG] Total rows: {total_rows}")
         print(f"[DEBUG] Average entries per peptide: {avg_entries_per_peptide:.2f}")
     else:
-        print(f"[DEBUG] Warning: 'plain_peptide' column not found, cannot count unique peptides")
+        print(f"[DEBUG] Warning: 'peptide_sequence' column not found, cannot count unique peptides")
     
     print(f"[DEBUG] Done! Added MS1 data and sorted {len(df)} rows.")
     print(f"[DEBUG] Output written to: {output_csv}")
     print("[DEBUG] ========================================")
     
     # Print summary statistics
-    if 'MS1_retention_time_sec' in df.columns:
-        non_zero_rt = (df['MS1_retention_time_sec'] > 0).sum()
+    if 'MS1_RT_sec' in df.columns:
+        non_zero_rt = (df['MS1_RT_sec'] > 0).sum()
         print(f"[DEBUG] Summary: {non_zero_rt}/{len(df)} rows have MS1 RT > 0")
-    if 'MS1_retention_time_intensity' in df.columns:
-        non_zero_int = (df['MS1_retention_time_intensity'] > 0).sum()
+    if 'MS1_RT_intensity' in df.columns:
+        non_zero_int = (df['MS1_RT_intensity'] > 0).sum()
         print(f"[DEBUG] Summary: {non_zero_int}/{len(df)} rows have MS1 intensity > 0")
 
 

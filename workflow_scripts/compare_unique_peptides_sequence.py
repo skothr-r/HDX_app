@@ -179,6 +179,48 @@ def main():
     n_valuable = (df['valuable_sequence'] == 1).sum()
     print(f"[Step 8] Low-coverage positions (<{args.min_overhangs} overhangs): {len(low_coverage_positions)}", flush=True)
     print(f"[Step 8] Peptides with protect_peptide=True (valuable_sequence=1): {n_valuable} / {len(df)}", flush=True)
+    # Standardize legacy retention_time headers to RT headers.
+    for old, new in [
+        ('MS1_retention_time_sec', 'MS1_RT_sec'),
+        ('MS1_retention_time_min', 'MS1_RT_minutes'),
+        ('MS1_retention_time_intensity', 'MS1_RT_intensity'),
+        ('MS2_retention_time_sec', 'MS2_RT_sec'),
+        ('MS2_retention_time_min', 'MS2_RT_minutes'),
+        ('retention_time_sec', 'RT_sec'),
+        ('retention_time_min', 'RT_minutes'),
+    ]:
+        if old in df.columns:
+            if new in df.columns:
+                df[new] = df[old].where(pd.notna(df[old]), df[new])
+                df = df.drop(columns=[old])
+            else:
+                df = df.rename(columns={old: new})
+
+    # Preserve shared workflow row organization across downstream tabs.
+    pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
+    seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
+    rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df.columns else None)
+    if pos_col or seq_col:
+        def _start_len(row):
+            if pos_col:
+                s = str(row.get(pos_col, '')).strip()
+                if s and '-' in s:
+                    try:
+                        a, b = s.split('-', 1)
+                        start = int(str(a).strip())
+                        end = int(str(b).strip().split(',')[0])
+                        return start, max(0, end - start + 1)
+                    except Exception:
+                        pass
+            seq = str(row.get(seq_col, '')).strip() if seq_col else ''
+            return 999999, (len(seq) if seq else 999999)
+        sl = df.apply(_start_len, axis=1, result_type='expand')
+        df['_sort_start'] = sl[0]
+        df['_sort_len'] = sl[1]
+        df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
+        df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
+        df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
+        df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
 
     print("[Step 8] Writing output CSV...", flush=True)
     df.to_csv(out_csv, index=False)

@@ -200,7 +200,7 @@ def thin_peptides_by_collection_overlap(peptides, max_overlap=3):
 
 
 def _m0_envelope_ok(p):
-    """True if peptide has M+0 > M+1 or M+1 > M+2 (or no data so we don't exclude). Used for backfill pool."""
+    """True if peptide has M0 > M+1 > M+2 > 0 (or no data so we don't exclude). Used for backfill pool."""
     v = p.get('m0_gt_m1_gt_m2')
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return True  # no data: allow for backward compatibility
@@ -212,7 +212,7 @@ def _m0_envelope_ok(p):
 
 
 def _m0_envelope_ok_strict(p):
-    """True only when M+0 > M+1 or M+1 > M+2 is explicitly True. Every peptide gets True or False from the chromatogram step (missing is set to False when building the grid)."""
+    """True only when M0 > M+1 > M+2 is explicitly True. Every peptide gets True or False from the chromatogram step (missing is set to False when building the grid)."""
     v = p.get('m0_gt_m1_gt_m2')
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return False  # missing/unknown => exclude
@@ -336,24 +336,41 @@ def _get_collection_bounds(p):
 
 def _compute_drift_limits_per_channel(peptides_for_rt_grid, num_channels=3):
     """
-    For each peptide, compute drift_min and drift_max (full peak drift window).
-    Full window = collection ± buffer; no trimming. Channel assignment already ensures
-    these full windows do not overlap within a channel.
+    For each peptide, compute drift_min and drift_max (peak drift window).
+    Drift (black buffer) may overlap the neighbor's buffer by up to PEAK_DRIFT_OVERLAP_FRAC,
+    but must not overlap into the neighbor's collection window (gray).
     """
     rows = []
     for ch in range(num_channels):
         peptides_ch = [p for p in peptides_for_rt_grid if p.get('channel') == ch]
         peptides_ch_rt = sorted(peptides_ch, key=lambda p: (float(p.get('collection_min_rt') or p.get('detected_peak_min_rt') or 0)))
-        for p in peptides_ch_rt:
+        n_ch = len(peptides_ch_rt)
+        tuples_ch = []
+        for i, p in enumerate(peptides_ch_rt):
             cmin, cmax = _get_collection_bounds(p)
-            if cmin is None or cmax is None:
-                continue
             buf_sec = _peak_drift_buffer_sec(cmin, cmax)
-            drift_min = cmin - buf_sec
-            drift_max = cmax + buf_sec
+            drift_min_full = cmin - buf_sec
+            drift_max_full = cmax + buf_sec
+            if i == 0:
+                drift_min = drift_min_full
+            else:
+                prev_cmin, prev_cmax = _get_collection_bounds(peptides_ch_rt[i - 1])
+                prev_buf = _peak_drift_buffer_sec(prev_cmin, prev_cmax)
+                prev_drift_max = prev_cmax + prev_buf
+                # No overlap: leave PEAK_DRIFT_GAP_SEC between this drift and previous
+                drift_min = max(drift_min_full, prev_drift_max + PEAK_DRIFT_GAP_SEC, prev_cmax)
+            if i == n_ch - 1:
+                drift_max = drift_max_full
+            else:
+                next_cmin, next_cmax = _get_collection_bounds(peptides_ch_rt[i + 1])
+                next_buf = _peak_drift_buffer_sec(next_cmin, next_cmax)
+                next_drift_min = next_cmin - next_buf
+                # No overlap: leave PEAK_DRIFT_GAP_SEC between this drift and next
+                drift_max = min(drift_max_full, next_drift_min - PEAK_DRIFT_GAP_SEC, next_cmin)
             if drift_max <= drift_min:
                 drift_max = drift_min + max(1.0, (cmax - cmin) * 0.1)
-            rows.append((p, drift_min, drift_max))
+            tuples_ch.append((p, drift_min, drift_max))
+        rows.extend(tuples_ch)
     return rows
 
 
@@ -459,10 +476,9 @@ def _rt_center(p):
 def _n_significant_fragments(p):
     """
     Number of significant fragments for tie-breaking (higher = prefer when signal ties).
-    Uses significant_frag_count if available, else number of single-AA overhang
-    positions (fragment-supported).
+    Uses ions_matched if available, else number of single-AA overhang positions (fragment-supported).
     """
-    v = p.get('significant_frag_count')
+    v = p.get('ions_matched')
     if v is not None:
         try:
             n = int(float(v))
@@ -480,183 +496,104 @@ def _n_significant_fragments(p):
 
 def assign_peptides_to_channels_by_layers(peptides, channels_per_layer=3):
     """
-    Assign high-signal (≥1%) peptides into 3-channel sets. Full drift window per peptide; no overlap within channel.
+    Two-phase interval packing for distinct 3-channel layers.
 
-    - First 3-channel set: fill as many ≥1% as fit (each peptide at most once in that set).
-    - Next 3-channel set: (1) place any remaining ≥1% that didn't fit in the first set;
-      (2) then fill gaps with repeats from the first set (same peptide can appear in another set).
-    - Continue adding sets until all ≥1% are assigned in at least one channel.
-    - Uses full drift window (collection ± buffer) for fit; no overlap means drift_min >= last drift_max in channel.
+    Design:
+    - Distinct sets of 3 channels (layer 0 = Ch0–Ch2, layer 1 = Ch3–Ch5, ...).
+    - Within each set: the same peak (same peptide key) cannot appear more than once.
+    - Within each channel: no overlap (required gap between collection windows).
+    - Goal: maximally fill each channel. Repeating the same peptide across different
+      sets of 3 (in the repeat pass) is encouraged to fill gaps and maximize collection.
 
-    Mutates p['channel'] for each p in peptides. Returns (num_channels, repeat_copies) where repeat_copies
-    are dict copies placed as repeats (is_repeat_in_channel=True); caller should use kept + repeat_copies for downstream.
+    Phase 1 — Minimize layers: sort by RT, place with best-fit-by-slack; never place
+    a peptide in a layer that already contains the same key.
+    Phase 2 — Reorder within layers by priority; layer membership unchanged.
+    Mutates p['channel']. Returns num_channels.
     """
     if not peptides:
-        return (1, [])
+        return 1
     CH = channels_per_layer
-    # Drift bounds for each peptide; sort by drift_lo for placement
-    with_drift = []
+    with_meta = []
     for p in peptides:
-        d_lo, d_hi = _get_drift_bounds(p)
-        if d_lo is None or d_hi is None:
-            d_lo, d_hi = 0.0, 1.0
-        if d_lo >= d_hi:
-            d_hi = d_lo + 1.0
-        with_drift.append((p, d_lo, d_hi))
-    with_drift.sort(key=lambda x: (x[1], x[2]))
-
-    def _channel_end(ch_list):
-        """Max drift_max in channel (list of (p, d_lo, d_hi) or list of p with _drift_* stored)."""
-        if not ch_list:
-            return -float('inf')
-        ends = []
-        for it in ch_list:
-            if isinstance(it, tuple):
-                _, _, d_hi = it
-                ends.append(d_hi)
-            else:
-                ends.append(it.get('_drift_max', -float('inf')))
-        return max(ends) if ends else -float('inf')
-
-    def _slack_if_fits_drift(ch_tuples, d_lo, d_hi):
-        """If (d_lo, d_hi) fits in channel (no overlap: d_lo >= last drift_max), return slack; else inf."""
-        end = _channel_end(ch_tuples)
-        if d_lo >= end:
-            return d_lo - end
-        return float('inf')
-
-    def _gaps_in_channel(ch_tuples, max_rt_sec=None):
-        """Return list of (gap_start, gap_end) in channel. Uses drift bounds."""
-        if not ch_tuples:
-            return [(0.0, float(max_rt_sec or 7200))]
-        sorted_ch = sorted(ch_tuples, key=lambda t: t[1])
-        gaps = []
-        last_end = 0.0
-        for (p, d_lo, d_hi) in sorted_ch:
-            if d_lo > last_end + 1e-6:
-                gaps.append((last_end, d_lo))
-            last_end = max(last_end, d_hi)
-        if max_rt_sec is not None and last_end < max_rt_sec - 1e-6:
-            gaps.append((last_end, float(max_rt_sec)))
-        return gaps
-
-    # Layer 0: place as many as fit; track (p, d_lo, d_hi) per channel so we have drift for gap/repeat
-    layers = []  # each layer: list of CH lists of (p, d_lo, d_hi)
-    unplaced = []  # (p, d_lo, d_hi) not yet in any layer
-    max_rt_sec = None
-    for p, d_lo, d_hi in with_drift:
+        cmin, cmax = _get_collection_bounds(p)
+        if cmin is None or cmax is None:
+            cmin, cmax = 0.0, 1.0
+        else:
+            cmin, cmax = float(cmin), float(cmax)
+        if cmin >= cmax:
+            cmax = cmin + 1.0
+        sig = _priority_signal(p)
+        rt_c = (cmin + cmax) / 2.0
+        n_frag = _n_significant_fragments(p)
+        with_meta.append((p, cmin, cmax, sig, rt_c, n_frag))
+    # Phase 1: sort by RT only (minimize layers); tie-break by cmin then cmax
+    with_meta.sort(key=lambda x: (x[1], x[2]))
+    # Layers: each layer = list of CH channel lists (each channel = list of peptides).
+    # Place each peak in the channel with *minimal slack* (tightest fit) so channels stay compact.
+    GAP = CHANNEL_COLLECTION_GAP_SEC
+    def _slack_if_fits(peak_list, cmin, cmax):
+        """
+        If (cmin, cmax) fits in this channel with required gap (no overlap or touch), return the slack;
+        smaller slack = tighter fit. If it doesn't fit, return float('inf').
+        """
+        if not peak_list:
+            return 0.0  # empty channel: tightest possible
+        intervals = []
+        for q in peak_list:
+            a, b = _get_collection_bounds(q)
+            if a is not None and b is not None:
+                intervals.append((float(a), float(b)))
+        intervals.sort(key=lambda x: x[0])
+        # Fits before first? (gap between cmax and first_start)
+        first_start = intervals[0][0]
+        if cmax + GAP <= first_start:
+            return first_start - cmax - GAP
+        # Fits after last? (gap between last_end and cmin)
+        last_end = intervals[-1][1]
+        if cmin >= last_end + GAP:
+            return cmin - last_end - GAP
+        # Fits in a gap between consecutive intervals? (gaps on both sides)
+        for i in range(len(intervals) - 1):
+            _, prev_end = intervals[i]
+            next_start, _ = intervals[i + 1]
+            if cmin >= prev_end + GAP and cmax <= next_start - GAP:
+                gap_available = next_start - prev_end - 2 * GAP
+                peak_width = cmax - cmin
+                return gap_available - peak_width
+        return float('inf')  # overlaps or no room for gap: doesn't fit
+    layers = []
+    for p, cmin, cmax, sig, rt_c, n_frag in with_meta:
         pk = _peptide_key(p)
-        p['_drift_min'], p['_drift_max'] = d_lo, d_hi
         placed = False
-        if not layers:
-            layers.append([[] for _ in range(CH)])
         for li, layer in enumerate(layers):
-            layer_keys = {_peptide_key(t[0]) for ch in range(CH) for t in layer[ch]}
+            # Same peak cannot appear twice in one set of 3
+            layer_keys = {_peptide_key(q) for ch in range(CH) for q in layer[ch]}
             if pk in layer_keys:
                 continue
-            ch_slacks = [(_slack_if_fits_drift(layer[ch], d_lo, d_hi), ch) for ch in range(CH)]
+            # Slack for each channel that fits (inf if doesn't fit)
+            ch_slacks = [(_slack_if_fits(layer[ch], cmin, cmax), ch) for ch in range(CH)]
             valid = [(slack, ch) for slack, ch in ch_slacks if slack != float('inf')]
             if not valid:
                 continue
+            # Best channel: smallest slack (tightest fit); tie-break by channel index
             best_ch = min(valid, key=lambda x: (x[0], x[1]))[1]
-            layer[best_ch].append((p, d_lo, d_hi))
+            layer[best_ch].append(p)
             placed = True
             break
         if not placed:
-            unplaced.append((p, d_lo, d_hi))
-
-    # Add layers: place unplaced first, then fill gaps with repeats from previous layers
-    repeat_copies = []
-    max_rt_sec = max((t[2] for t in with_drift), default=7200)
-    MAX_LAYERS = 20  # cap to prevent infinite loop when many peptides overlap
-    while unplaced and len(layers) < MAX_LAYERS:
-        new_layer = [[] for _ in range(CH)]
-        # (1) Place as many unplaced as fit in this layer
-        still_unplaced = []
-        for (p, d_lo, d_hi) in unplaced:
-            pk = _peptide_key(p)
-            placed = False
-            layer_keys = {_peptide_key(t[0]) for ch in range(CH) for t in new_layer[ch]}
-            if pk in layer_keys:
-                still_unplaced.append((p, d_lo, d_hi))
-                continue
-            ch_slacks = [(_slack_if_fits_drift(new_layer[ch], d_lo, d_hi), ch) for ch in range(CH)]
-            valid = [(slack, ch) for slack, ch in ch_slacks if slack != float('inf')]
-            if not valid:
-                still_unplaced.append((p, d_lo, d_hi))
-                continue
-            best_ch = min(valid, key=lambda x: (x[0], x[1]))[1]
-            new_layer[best_ch].append((p, d_lo, d_hi))
-            placed = True
-        prev_unplaced_len = len(unplaced)
-        unplaced = still_unplaced
-        if len(unplaced) >= prev_unplaced_len and len(unplaced) > 0:
-            # No progress: remaining peptides overlap each other; stop adding layers
-            break
-        # (2) Fill gaps in new_layer with repeats from all previous layers
-        prev_peptides = []
-        for li, layer in enumerate(layers):
-            for ch in range(CH):
-                for t in layer[ch]:
-                    prev_peptides.append(t)
-        for ch in range(CH):
-            gaps = _gaps_in_channel(new_layer[ch], max_rt_sec)
-            layer_keys_ch = {_peptide_key(t[0]) for t in new_layer[ch]}
-            for (gap_start, gap_end) in gaps:
-                if gap_end - gap_start < 5.0:
-                    continue
-                best_repeat = None
-                best_width = -1.0
-                for (prev_p, pd_lo, pd_hi) in prev_peptides:
-                    if _peptide_key(prev_p) in layer_keys_ch:
-                        continue
-                    if pd_lo >= gap_start and pd_hi <= gap_end and (pd_hi - pd_lo) > best_width:
-                        best_width = pd_hi - pd_lo
-                        best_repeat = (prev_p, pd_lo, pd_hi)
-                if best_repeat is None:
-                    continue
-                prev_p, pd_lo, pd_hi = best_repeat
-                cp = dict(prev_p)
-                cp['is_repeat_in_channel'] = True
-                cp['_drift_min'], cp['_drift_max'] = pd_lo, pd_hi
-                repeat_copies.append(cp)
-                new_layer[ch].append((cp, pd_lo, pd_hi))
-                layer_keys_ch.add(_peptide_key(cp))
-        layers.append(new_layer)
-        if not unplaced:
-            break
-
-    # Flatten: assign global channel index; drop _drift_* from peptides
+            new_layer = [[] for _ in range(CH)]
+            new_layer[0].append(p)
+            layers.append(new_layer)
+    # Phase 2: reorder within each layer by priority (weighted score); do not change layer membership
+    for layer in layers:
+        _reshuffle_layer_channels(layer, CH)
+    # Assign global channel index: layer_i * CH + ch_j
     num_channels = CH * len(layers)
     for li, layer in enumerate(layers):
         for ch, peak_list in enumerate(layer):
-            for t in peak_list:
-                p = t[0]
-                p['channel'] = li * CH + ch
-                if '_drift_min' in p:
-                    del p['_drift_min']
-                if '_drift_max' in p:
-                    del p['_drift_max']
-    for cp in repeat_copies:
-        if '_drift_min' in cp:
-            del cp['_drift_min']
-        if '_drift_max' in cp:
-            del cp['_drift_max']
-
-    # Reorder within each layer by priority (optional)
-    layer_lists = [[[] for _ in range(CH)] for _ in range(len(layers))]
-    for p in peptides + repeat_copies:
-        ch = p.get('channel', 0)
-        if 0 <= ch < num_channels:
-            li, cj = ch // CH, ch % CH
-            layer_lists[li][cj].append(p)
-    for layer in layer_lists:
-        _reshuffle_layer_channels_drift(layer, CH)
-    for li, layer in enumerate(layer_lists):
-        for ch, peak_list in enumerate(layer):
             for p in peak_list:
                 p['channel'] = li * CH + ch
-    return (num_channels, repeat_copies)
+    return num_channels
 
 
 def _peak_score_for_reshuffle(p, alpha=0.3, tau_sec=600.0, coverage_weight=0.01):
@@ -671,48 +608,6 @@ def _peak_score_for_reshuffle(p, alpha=0.3, tau_sec=600.0, coverage_weight=0.01)
     duration = (float(cmax) - float(cmin)) if (cmin is not None and cmax is not None and cmax > cmin) else 0.0
     early_bonus = 1.0 + alpha * math.exp(-rt_center / tau_sec) if tau_sec > 0 else 1.0
     return sig * early_bonus + coverage_weight * duration
-
-
-def _drift_windows_overlap(p, q):
-    """True if full drift windows of p and q overlap (used for reshuffle within layer)."""
-    d_lo_p, d_hi_p = _get_drift_bounds(p)
-    d_lo_q, d_hi_q = _get_drift_bounds(q)
-    if d_lo_p is None or d_hi_p is None or d_lo_q is None or d_hi_q is None:
-        return _windows_overlap_or_touch(p, q)
-    return not (d_hi_p <= d_lo_q or d_hi_q <= d_lo_p)
-
-
-def _reshuffle_layer_channels_drift(layer, CH):
-    """Like _reshuffle_layer_channels but use drift bounds for overlap (no drift overlap within channel)."""
-    def _channel_score(ch_list):
-        return sum(_peak_score_for_reshuffle(p) for p in ch_list)
-    def _scores_vec():
-        return tuple(_channel_score(layer[ch]) for ch in range(CH))
-    def _fits_in(ch_list, peak):
-        return not any(_drift_windows_overlap(peak, q) for q in ch_list)
-    improved = True
-    while improved:
-        improved = False
-        old_vec = _scores_vec()
-        for ch_lo in range(CH):
-            for ch_hi in range(ch_lo + 1, CH):
-                for p in list(layer[ch_hi]):
-                    if not _fits_in(layer[ch_lo], p):
-                        continue
-                    layer[ch_hi].remove(p)
-                    layer[ch_lo].append(p)
-                    new_vec = _scores_vec()
-                    if new_vec > old_vec:
-                        old_vec = new_vec
-                        improved = True
-                        break
-                    else:
-                        layer[ch_lo].remove(p)
-                        layer[ch_hi].append(p)
-                if improved:
-                    break
-            if improved:
-                break
 
 
 def _reshuffle_layer_channels(layer, CH):
@@ -757,41 +652,37 @@ def _reshuffle_layer_channels(layer, CH):
     return
 
 
-def assign_peptides_to_channels(peptides, num_channels, gap_sec=None, preserve_order=False, use_collection_bounds=False):
+def assign_peptides_to_channels(peptides, num_channels, gap_sec=None):
     """
-    Assign peptides to channels. No overlap within a channel.
-    When use_collection_bounds=True: use collection window (cmin, cmax) for overlap - next peptide's
-    collection_min >= previous collection_max + gap_sec in channel. Collection windows never overlap.
-    When False: use drift window (collection ± 30s) - next drift_min >= previous drift_max. More spacing.
-    Among channels where the peptide fits, prefer the channel with the earliest end time.
-    When no channel fits without overlap, set channel=-1 (caller should filter these out).
-    When preserve_order=True, process in input order (e.g. total_area desc); otherwise sort by start (earliest first).
+    Assign in time order (earliest first). Among channels where the window fits (no overlap, gap_sec between),
+    prefer the channel with the earliest end time so early peaks are spread across channels
+    instead of stacking in one. Mutates p['channel']. Returns peptides.
     """
-    min_gap = max(0.0, float(gap_sec)) if gap_sec is not None else 0.0
+    if gap_sec is None:
+        gap_sec = CHANNEL_COLLECTION_GAP_SEC
     with_bounds = []
     for p in peptides:
-        if use_collection_bounds:
-            lo, hi = _get_collection_bounds(p)
-            with_bounds.append((p, lo, hi))
-        else:
-            drift_lo, drift_hi = _get_drift_bounds(p)
-            with_bounds.append((p, drift_lo, drift_hi))
-    if not preserve_order:
-        with_bounds.sort(key=lambda x: (x[1] if x[1] is not None else 0.0, x[2] if x[2] is not None else 0.0))
+        cmin, cmax = _get_collection_bounds(p)
+        with_bounds.append((p, cmin, cmax))
+    # Sort by collection start (earliest first)
+    with_bounds.sort(key=lambda x: (x[1] if x[1] is not None else 0.0, x[2] if x[2] is not None else 0.0))
+    # Per channel: next window must have cmin >= this (last cmax + gap so peaks do not overlap)
     channel_end_times = [-float('inf')] * num_channels
-    for p, lo, hi in with_bounds:
-        if lo is None or hi is None:
-            lo, hi = 0.0, 1.0
-        if lo >= hi:
-            hi = lo + 1.0
-        # No overlap: next peptide's start must be >= previous end + gap
-        candidates = [ch for ch in range(num_channels) if lo >= channel_end_times[ch] + min_gap]
+    for p, cmin, cmax in with_bounds:
+        cmin = cmin if cmin is not None else 0.0
+        cmax = cmax if cmax is not None else cmin + 1.0
+        if cmin >= cmax:
+            cmax = cmin + 1.0
+        # Among channels where this window fits with gap, choose the one with the smallest end time
+        candidates = [ch for ch in range(num_channels) if cmin >= channel_end_times[ch]]
         if candidates:
             ch = min(candidates, key=lambda k: channel_end_times[k])
             p['channel'] = ch
-            channel_end_times[ch] = hi
+            channel_end_times[ch] = cmax + gap_sec
         else:
-            p['channel'] = -1
+            ch = min(range(num_channels), key=lambda k: channel_end_times[k])
+            p['channel'] = ch
+            channel_end_times[ch] = cmax + gap_sec
     return peptides
 
 
@@ -1071,25 +962,28 @@ def _draw_filtration_funnel(funnel_counts, output_path, protein_id=''):
 def find_min_channels(peptides, gap_sec=None):
     """
     Return the minimum number of channels needed to fit all peptides so that after
-    assignment no two full windows (peak drift + collection + integration) overlap within any channel.
-    Tries k=1,2,3,... until assign_peptides_to_channels(peptides, k) yields no overlap of full drift windows.
+    assignment no two collection windows overlap or touch within any channel (gap_sec between).
+    Tries k=1,2,3,... until assign_peptides_to_channels(peptides, k, gap_sec) yields no overlap.
     Peptides must have collection_min_rt/collection_max_rt.
     """
     if not peptides:
         return 0
+    if gap_sec is None:
+        gap_sec = CHANNEL_COLLECTION_GAP_SEC
+    # Overlap when prev_max + gap > next_min (require gap between windows)
     for k in range(1, 501):  # cap at 500 channels
         copies = [dict(p) for p in peptides]
         assign_peptides_to_channels(copies, k, gap_sec=gap_sec)
         has_overlap = False
         for ch in range(k):
             ch_peps = [p for p in copies if p.get('channel') == ch]
-            ch_peps = sorted(ch_peps, key=lambda p: (_get_drift_bounds(p)[0] if _get_drift_bounds(p)[0] is not None else 0.0))
+            ch_peps = sorted(ch_peps, key=lambda p: (float(p.get('collection_min_rt') or 0)))
             for i in range(len(ch_peps) - 1):
-                _, prev_drift_max = _get_drift_bounds(ch_peps[i])
-                next_drift_min, _ = _get_drift_bounds(ch_peps[i + 1])
-                if prev_drift_max is not None and next_drift_min is not None:
+                prev_max = ch_peps[i].get('collection_max_rt')
+                next_min = ch_peps[i + 1].get('collection_min_rt')
+                if prev_max is not None and next_min is not None:
                     try:
-                        if float(prev_drift_max) > float(next_drift_min):
+                        if float(prev_max) + gap_sec > float(next_min):
                             has_overlap = True
                             break
                     except (TypeError, ValueError):
@@ -1242,7 +1136,7 @@ def backfill_peptides_from_gaps(kept_peptides, removed_peptides, min_overlap=3, 
 
     exclude_keys = exclude_keys or set()
     layer_keys = {_peptide_key(q) for q in (layer_peptides or [])}
-    # Pool: has collection window, MS1 within 5 ppm, M+0>M+1 or M+1>M+2, optional PSM requirement, not in exclude_keys, not already in layer (no repeat within 3-channel set)
+    # Pool: has collection window, MS1 within 5 ppm, M0>M+1>M+2, optional PSM requirement, not in exclude_keys, not already in layer (no repeat within 3-channel set)
     removed_pool = [
         p for p in removed_peptides
         if _has_collection(p) and _ms1_trace_ok(p) and _m0_envelope_ok(p)
@@ -1839,7 +1733,7 @@ def _write_filter_csv_from_three_channel_csv(three_channel_csv_path, out_filter_
     Write a filter CSV with columns plain_peptide, charge, modifications, and optionally
     drift_min_rt, drift_max_rt, m0_gt_m1_gt_m2 from the 3-channel CSV (for chromatogram x-axis,
     flank shading, and skipping envelope re-check on re-extraction).
-    All peptides in the channel list already satisfy M+0 > M+1 or M+1 > M+2, so we set
+    All peptides in the channel list already satisfy M0 > M+1 > M+2, so we set
     m0_gt_m1_gt_m2=True so the chromatogram re-extraction does not re-reject them.
     Exclude peptides with fewer than min_single_aa_overhangs significant single-AA overhangs
     (so we do not generate individual chromatogram PNGs for them; 0-overhang peptides are
@@ -2162,25 +2056,17 @@ PEAK_DRIFT_OVERLAP_FRAC = 0.0  # no overlap: drift windows are separated by at l
 def _peak_drift_buffer_sec(cmin, cmax):
     """
     Compute peak drift buffer (seconds) on each side of the collection window.
-    Fixed +30 seconds on either side.
+    Relative to collection width (like log-noise scaling): wider peaks get more buffer, narrower get less, with min/max bounds.
     Returns buffer in seconds to add on left and right (same value).
     """
-    return PEAK_DRIFT_BUFFER_SEC
-
-
-def _get_drift_bounds(p):
-    """Return (drift_min, drift_max) = full reserved window (collection ± peak drift buffer). Used for channel assignment so no two peptides in a channel have overlapping full windows."""
-    cmin, cmax = _get_collection_bounds(p)
-    if cmin is None or cmax is None:
-        return (None, None)
     try:
-        cmin, cmax = float(cmin), float(cmax)
-        if cmin >= cmax or cmin != cmin or cmax != cmax:
-            return (None, None)
+        w = float(cmax) - float(cmin)
     except (TypeError, ValueError):
-        return (None, None)
-    buf = _peak_drift_buffer_sec(cmin, cmax)
-    return (cmin - buf, cmax + buf)
+        return PEAK_DRIFT_BUFFER_SEC
+    if w <= 0 or not (w == w):
+        return PEAK_DRIFT_BUFFER_SEC
+    buf = max(PEAK_DRIFT_BUFFER_MIN_SEC, min(PEAK_DRIFT_BUFFER_MAX_SEC, PEAK_DRIFT_BUFFER_FRAC * w))
+    return buf
 
 
 def _get_collection_bounds_for_drift(p):
@@ -2410,7 +2296,7 @@ def run_rt_windows(args):
                                 entry[col] = conv(r[col])
                             except (TypeError, ValueError):
                                 pass
-                    # Every peptide must have M+0 > M+1 or M+1 > M+2 designation (True/False) from chromatogram step
+                    # Every peptide must have M0 > M+1 > M+2 designation (True/False) from chromatogram step
                     if 'm0_gt_m1_gt_m2' in df_pw.columns:
                         v = r.get('m0_gt_m1_gt_m2')
                         if isinstance(v, bool):
@@ -2647,23 +2533,23 @@ def run_rt_windows(args):
                 except (TypeError, ValueError):
                     pass
 
-        # Significant fragment count for MS2 (significant-only workflow).
-        significant_frag_count = None
-        for col in ['significant_frag_count']:
+        # Matched fragment count for MS2 (ions_matched, num_matched_ions, or count from "matched fragment ions")
+        ions_matched = None
+        for col in ['ions_matched', 'num_matched_ions', 'matched_peaks']:
             if col in df.columns and pd.notna(row.get(col)):
                 try:
-                    significant_frag_count = int(float(row[col]))
+                    ions_matched = int(float(row[col]))
                     break
                 except (TypeError, ValueError):
                     pass
-        if significant_frag_count is None:
-            for col in ['significant_frags', 'refined_significant_frags', 'significant_fragment_ions']:
+        if ions_matched is None:
+            for col in ['matched fragment ions', 'matched_fragment_ions']:
                 if col in df.columns:
                     val = row.get(col)
                     if pd.notna(val) and str(val).strip():
                         parts = [x.strip() for x in str(val).split(',') if x.strip()]
                         if parts:
-                            significant_frag_count = len(parts)
+                            ions_matched = len(parts)
                             break
 
         # Prefer significant_single_aa_overhangs_protein_positions (5 ppm + >0.5% intensity) when present,
@@ -2755,12 +2641,9 @@ def run_rt_windows(args):
             'percolator_PEP': percolator_PEP,
             'evalue': evalue,
             'n_candidates': n_candidates,
-            'significant_frag_count': significant_frag_count,
+            'ions_matched': ions_matched,
             'matched fragment ions': row.get('matched fragment ions') if 'matched fragment ions' in df.columns else None,
             'matched fragment ion intensities': row.get('matched fragment ion intensities') if 'matched fragment ion intensities' in df.columns else None,
-            'significant_single_aa_overhangs_protein_positions': significant_single_aa_overhangs_protein_positions,
-            'significant_fragment_pairs': significant_fragment_pairs_raw,
-            'single_aa_fragment_pairs': single_aa_fragment_pairs_dict,
         })
 
     def _parse_ion_intensities(ions_str, intensities_str):
@@ -2860,57 +2743,18 @@ def run_rt_windows(args):
         mz_observed_min = min(mz_vals) if mz_vals else None
         mz_observed_max = max(mz_vals) if mz_vals else None
         mz_observed_std = float(np.std(mz_vals)) if len(mz_vals) > 1 else None
-        # Significant fragment count: max across PSMs (peptide passes ">= N fragments"
-        # if any PSM had >= N)
-        sig_frag_count_vals = []
+        # Ions matched: max across PSMs (peptide passes ">= N fragments" if any PSM had >= N)
+        ions_matched_vals = []
         for p in group:
-            v = p.get('significant_frag_count')
+            v = p.get('ions_matched')
             if v is not None and not (isinstance(v, float) and pd.isna(v)):
                 try:
-                    sig_frag_count_vals.append(int(float(v)))
+                    ions_matched_vals.append(int(float(v)))
                 except (TypeError, ValueError):
                     pass
-        sig_frag_count_max = max(sig_frag_count_vals) if sig_frag_count_vals else None
+        ions_matched_max = max(ions_matched_vals) if ions_matched_vals else None
         has_significant_fragment_pairs_merged = any(p.get('_has_significant_fragment_pairs') for p in group)
         fragment_intensity_c, fragment_intensity_z = _aggregate_fragment_intensities(group)
-        # Merge overhang/fragment keys for unique-peptides grid (per-channel and combined)
-        merged_sig_overhangs = []
-        for p in group:
-            v = p.get('significant_single_aa_overhangs_protein_positions')
-            if v and str(v).strip() and not (isinstance(v, float) and pd.isna(v)):
-                for part in str(v).strip().split(','):
-                    if part.strip():
-                        merged_sig_overhangs.append(part.strip())
-        def _overhang_pos_key(s):
-            if not s or not str(s).strip() or len(str(s)) < 2:
-                return 0
-            s = str(s).strip()
-            if s[-1].isalpha() and s[:-1].replace('.', '').replace('-', '').isdigit():
-                try:
-                    return int(float(s[:-1]))
-                except (TypeError, ValueError):
-                    pass
-            return 0
-        significant_single_aa_overhangs_protein_positions_merged = ','.join(sorted(set(merged_sig_overhangs), key=_overhang_pos_key)) if merged_sig_overhangs else None
-        sig_pairs_set = set()
-        for p in group:
-            v = p.get('significant_fragment_pairs')
-            if v and str(v).strip() and not (isinstance(v, float) and pd.isna(v)):
-                for part in str(v).strip().replace('|', '-').split(','):
-                    if '-' in part.strip():
-                        sig_pairs_set.add(part.strip())
-        significant_fragment_pairs_merged = ','.join(sorted(sig_pairs_set)) if sig_pairs_set else None
-        single_aa_fragment_pairs_merged = {}
-        for p in group:
-            d = p.get('single_aa_fragment_pairs') or {}
-            if isinstance(d, dict):
-                for pos, pairs in d.items():
-                    pos_int = int(pos) if isinstance(pos, (int, float)) else pos
-                    if pos_int not in single_aa_fragment_pairs_merged:
-                        single_aa_fragment_pairs_merged[pos_int] = set()
-                    for x in (pairs if isinstance(pairs, (set, list)) else [pairs]):
-                        if x is not None and str(x).strip():
-                            single_aa_fragment_pairs_merged[pos_int].add(str(x).strip())
         # Min q and min PEP across PSMs (for filter: pass if q<0.05 OR PEP<0.05)
         q_vals = [p.get('percolator_qvalue') for p in group if p.get('percolator_qvalue') is not None and not (isinstance(p.get('percolator_qvalue'), float) and pd.isna(p.get('percolator_qvalue')))]
         pep_vals = [p.get('percolator_PEP') for p in group if p.get('percolator_PEP') is not None and not (isinstance(p.get('percolator_PEP'), float) and pd.isna(p.get('percolator_PEP')))]
@@ -2951,15 +2795,12 @@ def run_rt_windows(args):
             '_scan_count_total': scan_count_total_merged,
             '_scan_count_passed': passed_psms,
             'n_candidates': max([p.get('n_candidates') for p in group if p.get('n_candidates') is not None]) if any(p.get('n_candidates') is not None for p in group) else first.get('n_candidates'),
-            'significant_frag_count': sig_frag_count_max,
+            'ions_matched': ions_matched_max,
             '_has_significant_fragment_pairs': has_significant_fragment_pairs_merged,
             'fragment_intensity_c': fragment_intensity_c,
             'fragment_intensity_z': fragment_intensity_z,
             'percolator_qvalue_min': percolator_qvalue_min,
             'percolator_PEP_min': percolator_PEP_min,
-            'significant_single_aa_overhangs_protein_positions': significant_single_aa_overhangs_protein_positions_merged,
-            'significant_fragment_pairs': significant_fragment_pairs_merged,
-            'single_aa_fragment_pairs': single_aa_fragment_pairs_merged,
         })
     print(f"Collapsed to {len(peptides_for_rt_grid)} unique peptides (sequence + charge + mods) for RT windows")
 
@@ -3045,8 +2886,7 @@ def run_rt_windows(args):
     MIN_FRAGMENTS_MATCHED = 5
     Q_OR_PEP_THRESH = 0.05
     RELATIVE_AREA_MIN = 0.0001  # 0.01%: remove peptides with relative total area below this (Stage 5)
-    BACKFILL_RELATIVE_AREA_MIN = 0.0005  # 0.05%: backfill candidates must have relative area >= this (weaker signal fills gaps)
-    CHANNEL_ASSIGNMENT_RELATIVE_AREA_MIN = 0.01  # 1%: only peptides with relative area >= this get initial channel assignment and determine channel count; 0.05–1% are backfill only
+    BACKFILL_RELATIVE_AREA_MIN = 0.0001  # 0.01%: backfill candidates must have relative area >= this
     RELATIVE_AREA_PROTECTED = 0.07  # 7%: peptides with relative total area >= this bypass stages 2–6 (still need ≥2 single-AA overhangs)
 
     def _set_relative_area_for_plot(peptides):
@@ -3077,39 +2917,6 @@ def run_rt_windows(args):
     print("  (Backfill runs once after channel assignment, filling gaps in all channels.)")
     print("----------------------------------------\n")
 
-    # Envelope at pipeline entry: only envelope-OK or protected (≥7% rel area) peptides enter stages 1–6.
-    # So Stage 4 no longer rejects anyone — envelope is applied here instead.
-    def _envelope_ok(p):
-        v = p.get('m0_gt_m1_gt_m2')
-        if v is True or (isinstance(v, str) and str(v).strip().lower() in ('true', '1', 'yes')):
-            return True
-        if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v or v == 0)):
-            return bool(v)
-        return False
-    _sum_initial = sum((p.get('total_area') or 0) for p in all_accepted_for_rt_windows if p.get('total_area') is not None and not (isinstance(p.get('total_area'), float) and (pd.isna(p.get('total_area')) or p.get('total_area') <= 0)))
-    try:
-        _sum_initial = float(_sum_initial)
-    except (TypeError, ValueError):
-        _sum_initial = 0.0
-    def _is_valuable(p):
-        # protect_peptide (True/False) or valuable_sequence (1) — prioritize for channel assignment, avoid dropping
-        if p.get('protect_peptide') in (True, 1, 'True', 'true', '1'):
-            return True
-        v = p.get('valuable_sequence')
-        if v == 1 or (isinstance(v, (int, float)) and v == 1):
-            return True
-        if isinstance(v, str) and str(v).strip() == '1':
-            return True
-        return False
-    for p in all_accepted_for_rt_windows:
-        rel = (float(p.get('total_area') or 0) / _sum_initial) if _sum_initial > 0 else 0.0
-        p['_protected_high_relative_area'] = rel >= RELATIVE_AREA_PROTECTED or _is_valuable(p)
-    n_before_env = len(all_accepted_for_rt_windows)
-    all_accepted_for_rt_windows = [p for p in all_accepted_for_rt_windows if p.get('_protected_high_relative_area') or _envelope_ok(p)]
-    n_env_excluded = n_before_env - len(all_accepted_for_rt_windows)
-    if n_env_excluded:
-        print(f"Envelope at pipeline entry: excluded {n_env_excluded} peptides (envelope not OK and relative area < {RELATIVE_AREA_PROTECTED*100:.0f}%); {len(all_accepted_for_rt_windows)} peptides enter stages 1–6.")
-
     # Stage 1: require at least MIN_SINGLE_AA_OVERHANGS single-amino-acid overhangs
     print("[Stage 1/6] Running: require ≥{} single-AA overhangs. Next: Stage 2 (fragments matched).".format(MIN_SINGLE_AA_OVERHANGS))
     peptides_stage1 = [p for p in all_accepted_for_rt_windows if len(p.get('single_aa_positions') or {}) >= MIN_SINGLE_AA_OVERHANGS]
@@ -3138,22 +2945,22 @@ def run_rt_windows(args):
     n_protected = sum(1 for p in peptides_stage1 if p.get('_protected_high_relative_area'))
     if n_protected:
         print(f"  Protected (≥{RELATIVE_AREA_PROTECTED*100:.0f}% relative total area, exempt from stages 2–6): {n_protected} peptides")
-    # Stage 2: require at least MIN_FRAGMENTS_MATCHED significant fragments (skip if no significant fragment counts in data)
+    # Stage 2: require at least MIN_FRAGMENTS_MATCHED fragments matched in MS2 spectrum (skip if no ions_matched in data)
     print("[Stage 2/6] Running: require ≥{} fragments matched. Next: Stage 3 (q-value/PEP).".format(MIN_FRAGMENTS_MATCHED))
-    has_sig_frag_count = any(p.get('significant_frag_count') is not None for p in peptides_stage1)
-    if has_sig_frag_count:
-        stage2_passed = [p for p in peptides_stage1 if p.get('_protected_high_relative_area') or (p.get('significant_frag_count') or 0) >= MIN_FRAGMENTS_MATCHED]
+    has_ions_matched = any(p.get('ions_matched') is not None for p in peptides_stage1)
+    if has_ions_matched:
+        stage2_passed = [p for p in peptides_stage1 if p.get('_protected_high_relative_area') or (p.get('ions_matched') or 0) >= MIN_FRAGMENTS_MATCHED]
         rejected_stage2 = [p for p in peptides_stage1 if p not in stage2_passed]
         for p in rejected_stage2:
-            p.setdefault('_rejection_reason', f'Fewer than {MIN_FRAGMENTS_MATCHED} significant fragments')
+            p.setdefault('_rejection_reason', f'Fewer than {MIN_FRAGMENTS_MATCHED} fragments matched')
         n_drop_frag = len(peptides_stage1) - len(stage2_passed)
         if n_drop_frag:
-            print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} significant fragments): {len(peptides_stage1)} -> {len(stage2_passed)} peptides (dropped {n_drop_frag})")
+            print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} fragments matched): {len(peptides_stage1)} -> {len(stage2_passed)} peptides (dropped {n_drop_frag})")
         peptides_stage2 = _backfill_after_stage(stage2_passed, peptides_stage1, "Stage 2")
     else:
         rejected_stage2 = []
         peptides_stage2 = list(peptides_stage1)
-        print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} significant fragments): skipped (no significant fragment columns in CSV)")
+        print(f"Stage 2 (>={MIN_FRAGMENTS_MATCHED} fragments matched): skipped (no ions_matched column in CSV)")
     # Stage 3: require EITHER q < Q_OR_PEP_THRESH OR PEP < Q_OR_PEP_THRESH (at least one PSM per peptide)
     print("[Stage 3/6] Running: require q<{} or PEP<{}. Next: Stage 4 (envelope).".format(Q_OR_PEP_THRESH, Q_OR_PEP_THRESH))
     def _passes_q_or_pep(p):
@@ -3242,12 +3049,8 @@ def run_rt_windows(args):
         print("No peptides for RT windows after filtering stages. Exiting.")
         sys.exit(0)
 
-    # Initial channel assignment: only consider peaks with > 0.1% relative area; 0.01–0.1% go to backfill only
-    kept = [p for p in peptides_main if (p.get('relative_area_within_selection') or 0) >= CHANNEL_ASSIGNMENT_RELATIVE_AREA_MIN]
-    not_in_kept = [p for p in peptides_main if p not in kept]  # 0.01% <= rel < 1%; eligible for backfill if >= 0.05%
-    if not_in_kept:
-        print(f"Channel assignment: {len(kept)} peptides with ≥{CHANNEL_ASSIGNMENT_RELATIVE_AREA_MIN*100:.0f}% relative area get initial slots (channel count from these); {len(not_in_kept)} peptides (<1% rel area) available for backfill if ≥{BACKFILL_RELATIVE_AREA_MIN*100:.2f}%")
-    removed = []  # no thinning
+    kept = list(peptides_main)
+    removed = []  # no thinning: all passed peptides are kept
     # Diagnostic: min window start across kept peaks before channel assignment (if plot starts later → plotting bug)
     _starts_kept = [(_get_collection_bounds(p)[0]) for p in kept]
     _starts_kept = [float(x) for x in _starts_kept if x is not None]
@@ -3258,14 +3061,6 @@ def run_rt_windows(args):
         print(f"[diagnostic] Before channel assignment: no valid window start in {len(kept)} kept peaks")
     # Distinct sets of 3 channels; within each set same peak cannot repeat; within each channel no overlap.
     # Goal: maximally fill each channel; repeating peptides across different sets of 3 is encouraged later.
-    # Prioritize protect_peptide=True or valuable_sequence=1 and high relative area for first channels (workflow Step 9)
-    def _valuable_sort_key(p):
-        is_prot = p.get('protect_peptide') in (True, 1, 'True', 'true', '1')
-        v = p.get('valuable_sequence')
-        is_val = is_prot or (v == 1 or (isinstance(v, (int, float)) and v == 1) or (isinstance(v, str) and str(v).strip() == '1'))
-        rel = p.get('relative_area_within_selection') or 0
-        return (0 if is_val else 1, -rel)
-    kept = sorted(kept, key=_valuable_sort_key)
     num_channels = assign_peptides_to_channels_by_layers(kept, channels_per_layer=3)
     num_channels = max(1, num_channels)
     n_layers = (num_channels + 2) // 3
@@ -3277,21 +3072,10 @@ def run_rt_windows(args):
     print(f"Channels (all passed): " + ", ".join(f"Ch{ch}={n_ch_kept[ch]}" for ch in range(num_channels)))
 
     # Backfill after channel assignment: fill gaps in all channels that have RT windows assigned.
-    # Backfill only with peptides that (1) pass envelope, (2) have relative area >= backfill min, (3) are "repeated peaks" (same key in >= 2 layers in kept).
-    print(f"Backfill (after channel assignment): filling gaps in all {num_channels} channel(s) (candidates: envelope OK, rel area ≥{BACKFILL_RELATIVE_AREA_MIN*100:.2f}%, repeated in another layer)...")
+    # Backfill candidates must have relative area >= 0.01%. Prefer >=2 overhangs, then 1, then 0; then fragmentation-only; then <0.01% rel only where <4 overlap.
+    print(f"Backfill (after channel assignment): filling gaps in all {num_channels} channel(s) (candidates: relative area ≥{BACKFILL_RELATIVE_AREA_MIN*100:.2f}%)...")
     all_excluded = list(all_excluded_by_key.values())
-    # Repeated peaks = (seq, charge, mods) appears in at least 2 different 3-channel layers in kept
-    CH_PER_LAYER = 3
-    layers_by_key = defaultdict(set)
-    for p in kept:
-        layers_by_key[_peptide_key(p)].add((p.get('channel') or 0) // CH_PER_LAYER)
-    repeated_peptide_keys = {k for k, layers in layers_by_key.items() if len(layers) >= 2}
-    all_excluded_backfill = [
-        p for p in all_excluded
-        if (p.get('relative_area_within_selection') or 0) >= BACKFILL_RELATIVE_AREA_MIN
-        and _envelope_ok(p)
-        and _peptide_key(p) in repeated_peptide_keys
-    ]
+    all_excluded_backfill = [p for p in all_excluded if (p.get('relative_area_within_selection') or 0) >= BACKFILL_RELATIVE_AREA_MIN]
     primary_list = [p for p in all_excluded_backfill if p.get('_exclusion_count') == 1]
     backup_list = [p for p in all_excluded_backfill if p.get('_exclusion_count') > 1]
     primary_2plus = [p for p in primary_list if _n_single_aa_overhangs(p) >= 2]
@@ -3305,16 +3089,10 @@ def run_rt_windows(args):
         p for p in all_excluded_backfill
         if _n_single_aa_overhangs(p) == 0 and p.get('_has_significant_fragment_pairs')
     ]
-    # Peptides that passed all stages but have 0.01–0.1% rel area: no initial channel slot, but eligible for backfill
-    not_in_kept_backfill = [
-        p for p in not_in_kept
-        if _envelope_ok(p) and (p.get('relative_area_within_selection') or 0) >= BACKFILL_RELATIVE_AREA_MIN
-    ]
-    if not_in_kept_backfill:
-        print(f"Backfill: {len(not_in_kept_backfill)} peptides (0.05–1% rel area, no initial slot) added to backfill pool")
     backfill_pool_low_rel = [p for p in all_excluded_backfill if (p.get('relative_area_within_selection') or 0) < RELATIVE_AREA_MIN]
     used_keys = set()
     all_backfill = []
+    CH_PER_LAYER = 3
     for ch in range(num_channels):
         ch0 = (ch // CH_PER_LAYER) * CH_PER_LAYER
         layer_peptides = [p for p in kept if ch0 <= p.get('channel') < ch0 + CH_PER_LAYER] + [p for p in all_backfill if ch0 <= p.get('channel') < ch0 + CH_PER_LAYER]
@@ -3325,7 +3103,6 @@ def run_rt_windows(args):
             primary_0 + [p for p in modified_pool if _n_single_aa_overhangs(p) == 0],
             backup_2plus, backup_1, backup_0,
             fragmentation_only_pool,  # after overhang-based: backfill with significant fragmentation even if 0 overhang pairs
-            not_in_kept_backfill,  # 0.01–0.1% rel area: passed all stages but no initial slot
         ]
         ch_backfill = []
         n_frag_only = 0
@@ -3419,7 +3196,8 @@ def run_rt_windows(args):
     # Reorder within each layer only (Ch1 = highest signal in layer, etc.) so layer packing is preserved
     reorder_channels_by_relative_area_within_layers(peptides_for_rt_grid, num_channels, channels_per_layer=3)
 
-    # No shuffle between channels: assignment (≥1% in 3-channel sets, then backfill) is final
+    # Shuffle: move higher-signal into earlier channels when they fit in a gap (same layer only)
+    shuffle_higher_signal_into_earlier_channels(peptides_for_rt_grid, num_channels, max_rt=max_rt_global, channels_per_layer=3)
 
     # Repeated peptide: earliest channel = shaded (filled); later channels = outline only
     set_repeat_outline_by_earliest_channel(peptides_for_rt_grid, num_channels)
@@ -3434,8 +3212,8 @@ def run_rt_windows(args):
 
     n_ch = [sum(1 for p in peptides_for_rt_grid if p.get('channel') == ch) for ch in range(num_channels)]
     sum_rel_ch = [sum((p.get('relative_area_within_selection') or 0) for p in peptides_for_rt_grid if p.get('channel') == ch) for ch in range(num_channels)]
-    print(f"Channels (after backfill + repeat, reordered by collected signal descending): " + ", ".join(f"Ch{ch+1}={n_ch[ch]} (relΣ={sum_rel_ch[ch]:.3f})" for ch in range(num_channels)) + " (no overlap within channel)")
-    # Diagnostic: min_rt_start per channel after backfill
+    print(f"Channels (after backfill + repeat, reordered by collected signal descending, shuffle applied): " + ", ".join(f"Ch{ch+1}={n_ch[ch]} (relΣ={sum_rel_ch[ch]:.3f})" for ch in range(num_channels)) + " (no overlap within channel)")
+    # Diagnostic: min_rt_start per channel after backfill/shuffle (if mins move later → shuffling undid early RT)
     for ch in range(num_channels):
         peptides_ch = [p for p in peptides_for_rt_grid if p.get('channel') == ch]
         starts_ch = [(_get_collection_bounds(p)[0]) for p in peptides_ch]
@@ -3531,7 +3309,11 @@ def run_rt_windows(args):
     df_channel = pd.DataFrame(df_rows)
     channel_dataframe_csv = os.path.join(rt_windows_dir, f'{output_base}_rt_windows_by_channel_dataframe.csv')
     df_channel.to_csv(channel_dataframe_csv, index=False)
-    print(f"  Wrote N-channel selected peptides (by channel, drift_min) to {channel_dataframe_csv}")
+    print(f"  Wrote N-channel dataframe (by channel, drift_min) to {channel_dataframe_csv}")
+    # Same content, canonical name for channel selected peptides (channel order, within channel by min peak drift)
+    three_channel_csv = os.path.join(rt_windows_dir, 'three_channel_selected_peptide_rt_windows.csv')
+    df_channel.to_csv(three_channel_csv, index=False)
+    print(f"  Wrote {num_channels}-channel selected peptides to {three_channel_csv}")
 
     # Copy individual chromatograms for the thinned peptide set into one directory for inspection
     copy_filtered_chromatograms(peptides_for_rt_grid, output_dir, csv_dir, output_base)
@@ -3952,7 +3734,7 @@ def run_rt_windows(args):
     primary_chrom_dir = os.path.join(output_dir, 'peptide_chromatograms_primary')
     os.makedirs(primary_chrom_dir, exist_ok=True)
     rt_windows_by_channel_log_file = (rt_windows_by_channel_file[:-4] + '_log.png') if rt_windows_by_channel_file.endswith('.png') else (rt_windows_by_channel_file + '_log.png')
-    for src in [rt_windows_by_channel_file, rt_windows_by_channel_log_file, channel_dataframe_csv, channels_csv]:
+    for src in [rt_windows_by_channel_file, rt_windows_by_channel_log_file, three_channel_csv, channel_dataframe_csv, channels_csv]:
         if src and os.path.isfile(src):
             shutil.copy2(src, os.path.join(primary_chrom_dir, os.path.basename(src)))
     raw_file = getattr(args, 'mzml', None) or getattr(args, 'raw_file', None)
@@ -4017,9 +3799,7 @@ def run_rt_windows(args):
     # Combined/unique_peptides (saved in primary dir)
     fasta_path = getattr(args, 'fasta', None)
     protein_id = getattr(args, 'protein', None) or ''
-    if not fasta_path or not os.path.isfile(fasta_path):
-        print("  Skipping combined and unique_peptides grid plots (no FASTA file). Pass --fasta <path> to generate these.")
-    elif fasta_path and os.path.isfile(fasta_path):
+    if fasta_path and os.path.isfile(fasta_path):
         if _write_combined_visualization_for_peptide_set(df, peptides_after_backfill, _norm_mods, primary_chrom_dir, 'combined', fasta_path, protein_id):
             print(f"  Combined/unique_peptides plots saved in {os.path.abspath(primary_chrom_dir)}")
     # Explicit unique peptides grid + segmented/family plots (one row per sequence+charge+mods; when fasta and peptides exist)
@@ -4059,9 +3839,9 @@ def run_rt_windows(args):
                         try:
                             create_accepted_peptides_protein_grid(
                                 peptides_ch, protein_sequence, pid or 'protein', protein_length,
-                                ch_unique_output, rt_windows_dir, channel_only=True
+                                ch_unique_output, rt_windows_dir
                             )
-                            print(f"  Channel {ch + 1} unique peptides (single plot, no families) saved to {os.path.basename(ch_unique_output)}")
+                            print(f"  Channel {ch + 1} unique peptides saved to {os.path.basename(ch_unique_output)}")
                         except Exception as ec:
                             print(f"  Warning: could not create unique_peptides for channel {ch + 1}: {ec}", file=sys.stderr)
         except Exception as e:

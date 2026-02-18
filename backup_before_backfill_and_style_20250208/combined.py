@@ -53,8 +53,14 @@ def peak_drift_buffer_sec(cmin, cmax, frac=PEAK_DRIFT_BUFFER_FRAC_DEFAULT,
                           min_sec=PEAK_DRIFT_BUFFER_MIN_SEC_DEFAULT,
                           max_sec=PEAK_DRIFT_BUFFER_MAX_SEC_DEFAULT,
                           default=PEAK_DRIFT_BUFFER_DEFAULT_SEC):
-    """Buffer (seconds) to add on each side of collection window. Fixed +30 seconds on either side."""
-    return default
+    """Buffer (seconds) to add on each side of collection window; scales with collection width. Used for peak drift window."""
+    try:
+        w = float(cmax) - float(cmin)
+    except (TypeError, ValueError):
+        return default
+    if w <= 0 or not (w == w):
+        return default
+    return max(min_sec, min(max_sec, frac * w))
 
 
 def _set_total_area_colorbar_ticks(cbar):
@@ -492,10 +498,10 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     """
     Calculate a composite quality score combining Comet metrics (no Xcorr).
     
-    Combines: ΔCn (uniqueness), E-value (statistical significance), Sp rank.
+    Combines: ΔCn (uniqueness), E-value (statistical significance), Sp rank, matched ion fraction.
     
     Args:
-        peptide_dict: Dictionary containing Comet metrics (delta_cn, e_value, sp_rank)
+        peptide_dict: Dictionary containing Comet metrics (delta_cn, e_value, sp_rank, ions_matched, ions_total)
         charge: Charge state (optional, for future stratification)
         peptide_length: Peptide length (optional, for future stratification)
     
@@ -505,6 +511,11 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     delta_cn = peptide_dict.get('delta_cn', 0.0)
     e_value = peptide_dict.get('e_value', 1.0)  # Default to worst case if missing
     sp_rank = peptide_dict.get('sp_rank', float('inf'))  # Default to worst case if missing
+    ions_matched = peptide_dict.get('ions_matched', 0)
+    ions_total = peptide_dict.get('ions_total', 1)  # Avoid division by zero
+    
+    # Calculate matched ion fraction
+    ion_fraction = ions_matched / ions_total if ions_total > 0 else 0.0
     
     # ΔCn: 0-1 scale, higher is better (uniqueness)
     delta_cn_component = delta_cn * 50.0  # Weight: 50x (very important for uniqueness)
@@ -521,7 +532,10 @@ def calculate_composite_quality_score(peptide_dict, charge=None, peptide_length=
     else:
         sp_rank_component = 0.0
     
-    composite_score = (delta_cn_component + e_value_component + sp_rank_component)
+    # Ion fraction: 0-1 scale, higher is better
+    ion_fraction_component = ion_fraction * 15.0  # Weight: 15x
+    
+    composite_score = (delta_cn_component + e_value_component + sp_rank_component + ion_fraction_component)
     return composite_score
 
 
@@ -911,7 +925,7 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
         mzml_file: Optional mzML file for reading fill times
         peak_windows_csv: Optional path to peak_windows CSV file (peak_windows_all.csv, peak_windows.csv, or peak_windows_rejected.csv)
         filter_by_peak_window_status: Optional filter by peak window status ('accepted' or 'rejected'). If None, no filtering by peak window status.
-        test: If True, use only 30 randomly sampled peptides (same as --test in chromatograms) for all plots and comet_frags_filtered_by_qvalue_pepscore_mods_minaa.csv.
+        test: If True, use only 30 randomly sampled peptides (same as --test in chromatograms) for all plots and filtered_peptides.csv.
         filter_criteria: Optional dict from run_visualization.py (top_n_limit, min_single_aa_overhangs, min_scans_combined, ppm_tolerance,
             high_overhang_threshold, two_pass_Kc, two_pass_Kz, two_pass_max_per_residue, test_sample_size). If None, defaults are used.
     """
@@ -1004,7 +1018,7 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
                     'rejection_reason': row.get('rejection_reason', ''),
                     'detected_peak_min_rt': row.get('detected_peak_min_rt'),
                     'detected_peak_max_rt': row.get('detected_peak_max_rt'),
-                    'detected_peak_window_size': row.get('detected_peak_window_size'),
+                    'detected_peak_window_size': row.get('detected_peak_window_window_size'),
                     'spectrum_window_min_rt': row.get('spectrum_window_min_rt'),
                     'spectrum_window_max_rt': row.get('spectrum_window_max_rt'),
                     'spectrum_window_size': row.get('spectrum_window_size'),
@@ -2412,7 +2426,7 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
     peptides_for_rt_grid_sorted.sort(key=lambda x: (x[0] if x[0] > 0 else 999999, -x[1], x[2]))
     peptides_for_rt_grid = [p for _, _, _, p in peptides_for_rt_grid_sorted]
     
-    # Test mode: use only N randomly sampled peptides (same N for all combined plots and filter CSV)
+    # Test mode: use only N randomly sampled peptides (same N for all combined plots and filtered_peptides.csv)
     if test and len(peptides_for_rt_grid) > _test_sample_size:
         n_orig = len(peptides_for_rt_grid)
         size = min(_test_sample_size, n_orig)
@@ -2420,7 +2434,7 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
         sampled_tuples = [peptides_for_rt_grid_sorted[i] for i in indices]
         sampled_tuples.sort(key=lambda x: (x[0] if x[0] > 0 else 999999, -x[1], x[2]))
         peptides_for_rt_grid = [p for _, _, _, p in sampled_tuples]
-        print(f"[TEST MODE] Using {size} randomly sampled peptides (of {n_orig}) for combined plots and filter CSV")
+        print(f"[TEST MODE] Using {size} randomly sampled peptides (of {n_orig}) for combined plots and filtered_peptides.csv")
     
     num_peptides = len(peptides_for_rt_grid)  # Use filtered list for RT grid
     
@@ -3642,10 +3656,14 @@ def create_combined_visualization(csv_file, protein_id, fasta_file, output_file,
         output_basename_no_ext = os.path.splitext(os.path.basename(output_file))[0]
         is_already_filtered = (output_basename_no_ext == 'filtered' or output_basename_no_ext.endswith('_filtered'))
         if is_already_filtered and peptides_for_rt_grid:
-            filtered_csv_path = os.path.join(results_dir, 'comet_frags_filtered_by_qvalue_pepscore_mods_minaa.csv')
+            filtered_csv_path = os.path.join(results_dir, 'filtered_peptides.csv')
             if write_filtered_peptides_csv(csv_file, peptides_for_rt_grid, filtered_csv_path):
+                comet_frags_path = os.path.join(results_dir, 'comet_frags_filtered_peptides.csv')
+                import shutil
+                shutil.copy2(filtered_csv_path, comet_frags_path)
                 print(f"\nWrote filtered peptides CSV ({len(peptides_for_rt_grid)} peptides): {os.path.abspath(filtered_csv_path)}")
-                print("  To run chromatogram extraction on these peptides: python extract_ms1_chromatograms.py <comet_frags_filtered_by_qvalue_pepscore_mods_minaa.csv> <mzML> <output.png>")
+                print(f"  Also: {os.path.abspath(comet_frags_path)} (Comet fragments filtered peptide list)")
+                print("  To run chromatogram extraction on these peptides: python extract_ms1_chromatograms.py <filtered_peptides.csv> <mzML> <output.png>")
     
     if ion_type_filter is None:
         # Automatically generate filtered version with default thresholds
@@ -4627,17 +4645,16 @@ def create_fragment_pair_grid_from_peptides(peptides, single_aa_overhangs, prote
     print(f"  - Fragment length range (global): 1 to {max_fragment_length_global}")
 
 
-def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id, protein_length, output_file, results_dir, channel_only=False, families_only=False, interactive_zoom=False):
+def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id, protein_length, output_file, results_dir):
     """
-    Full protein on x-axis, one block per unique peptide sequence on y-axis.
-    Multiple PSMs (same or different charge/modifications) merge into one block.
+    Full protein on x-axis, one block per unique (sequence, charge, mods) on y-axis.
+    Multiple scans of the same peptide merge into one block; different charges or modifications
+    of the same sequence each get their own block (a family can have multiple blocks).
     Overhangs and fragment pairs use significant data when available (5 ppm + >0.5% intensity).
     Each block: c-fragment rows, main sequence row (deep red = single-AA overhang; elsewhere shaded by summed fragment intensity across scans so darkest where many overlapping fragments have high signal), z-fragment rows.
     When fragment_intensity_c/z are present (from CSV matched fragment ion intensities), main-row darkness = normalized summed intensity; otherwise fallback to coverage count. Fragment rows use transparent blue-black and less saturated yellow at single-AA overhang; letters are Times New Roman, bold, large.
     Writes two files: ..._unique_peptides.png (ordered by position), ..._unique_peptides_by_total_area.png (ordered by total_area).
-    Each row = one unique peptide sequence (PSMs with different charge/modifications merged).
-    When channel_only=True (per-channel view): only the main grid and by_total_area/lowres are written; no family or segment breakdown plots.
-    When families_only=True: only the higher-def family segment plots are written (groups of overlapping sequences); skips main grid, by_total_area, lowres.
+    Each row = one unique peptide (sequence + charge + modifications).
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -4728,20 +4745,34 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
         except (TypeError, ValueError):
             return -1.0
 
-    # One block per unique peptide sequence; multiple PSMs (same or different charge/modifications) merge into one block.
-    print(f"  [Grid] Grouping {len(peptides)} peptides by sequence...", flush=True)
+    def _canon_charge(c):
+        try:
+            return int(c) if c not in (None, '') else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _canon_mods(m):
+        if m in (None, ''):
+            return '-'
+        s = str(m).strip()
+        return s if s and s.lower() not in ('nan', '-') else '-'
+
+    # One block per unique peptide (sequence, charge, mods); multiple scans of same peptide merge into one block. Different charge or modifications = separate row.
+    # A family (same sequence) can have multiple blocks — each (sequence, charge, mods) gets its own block.
     from collections import defaultdict
     groups_by_peptide = defaultdict(list)
     for p in peptides:
         plain = _plain_sequence(p)
         if not plain:
             continue
-        groups_by_peptide[plain].append(p)
+        charge = _canon_charge(p.get('charge'))
+        mods = _canon_mods(p.get('modifications'))
+        key = (plain, charge, mods)
+        groups_by_peptide[key].append(p)
 
     blocks = []
     for _key, group_psms in groups_by_peptide.items():
-        # Representative: PSM with highest total_area (merge across charge/mod variants)
-        rep = max(group_psms, key=lambda p: _total_area(p))
+        rep = group_psms[0]
         start, end, clean = _bounds(rep)
         if start is None or end is None or clean is None:
             continue
@@ -4781,7 +4812,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
         blocks.append((rep, start, end, L, clean, overhang, c_list, z_list, total_area, c_intensities, z_intensities))
 
     if blocks:
-        print(f"  [Grid] Unique peptide grid: {len(peptides)} PSMs -> {len(blocks)} unique sequences (significant fragment pairs when available)", flush=True)
+        print(f"  Unique peptide grid: {len(peptides)} PSMs -> {len(blocks)} blocks (sequence+charge+mods; significant fragment pairs when available)")
     if not blocks:
         print("  No accepted peptides with valid protein boundaries; skipping accepted-peptides protein grid")
         return
@@ -4856,7 +4887,6 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             if n_match > min_len // 2:  # majority: more than half of shorter peptide's residues match
                 family_edges.append((i, j))
     family_components = _union_find_components(num_peptides, family_edges)
-    print(f"  [Grid] Computed {len(family_components)} peptide families", flush=True)
     # Sort families by min(start) so leftmost protein region first; within family sort by (start, -length)
     families = []
     for comp in family_components:
@@ -4867,7 +4897,6 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
     families.sort(key=lambda f: f[1])  # by x_lo
 
     # Order by position (start, then -length)
-    print(f"  [Grid] Drawing position-ordered full grid...", flush=True)
     order_position = sorted(range(num_peptides), key=lambda i: (blocks[i][1], -blocks[i][3]))
     # Order by total_area (descending so large area at top)
     order_area = sorted(range(num_peptides), key=lambda i: (-blocks[i][8], blocks[i][1], -blocks[i][3]))  # total_area at index 8
@@ -5125,9 +5154,9 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             rect_outline = Rectangle((-1, bstart), protein_length + 1, block_heights[idx], linewidth=1.5, edgecolor='black', facecolor='none', zorder=3)
             ax.add_patch(rect_outline)
 
-        ax.set_ylabel('Unique peptides (one row per sequence; fragments below)', fontsize=10, fontweight='bold', fontfamily='serif')
+        ax.set_ylabel('Unique peptides (one row per sequence+charge+mods; fragments below)', fontsize=10, fontweight='bold', fontfamily='serif')
         ax.set_xlabel('Protein position', fontsize=10, fontweight='bold', fontfamily='serif')
-        ax.set_title(f'{protein_id} – Unique peptides and fragments\n(one row per sequence; deep red = overhang; yellow = single-AA overhang in fragment rows)\n{title_suffix}', fontsize=11, fontweight='bold', fontfamily='serif')
+        ax.set_title(f'{protein_id} – Unique peptides and fragments\n(one row per sequence+charge+modifications; deep red = overhang; yellow = single-AA overhang in fragment rows)\n{title_suffix}', fontsize=11, fontweight='bold', fontfamily='serif')
         from matplotlib.patches import Patch
         ax.legend(handles=[
             Patch(facecolor=OVERHANG_RED, edgecolor='gray', label='Single-AA overhang (main row)'),
@@ -5145,7 +5174,7 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             _set_total_area_colorbar_ticks(cbar)
         plt.savefig(out_path, dpi=use_dpi, bbox_inches='tight', pad_inches=0.25)
         plt.close()
-        print(f"  [Grid] Saved: {os.path.basename(out_path)} (DPI {use_dpi}, {w:.0f}x{h:.0f} in)", flush=True)
+        print(f"  Saved: {out_path} (DPI {use_dpi}, {w:.0f}x{h:.0f} in)")
 
     def draw_one_figure_segment(block_order, out_path, title_suffix, x_lo, x_hi):
         """Draw the grid restricted to protein positions [x_lo, x_hi] (1-based), only blocks overlapping that range."""
@@ -5316,34 +5345,27 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
             _set_total_area_colorbar_ticks(cbar)
         plt.savefig(out_path, dpi=seg_dpi, bbox_inches='tight', pad_inches=0.25)
         plt.close()
-        print(f"  [Grid] Saved segment {x_lo}–{x_hi}: {os.path.basename(out_path)}", flush=True)
+        print(f"  Saved segment {x_lo}–{x_hi}: {out_path}")
 
-    # Position-ordered (full resolution) — skip when families_only
-    if not families_only:
-        draw_one_figure(order_position, output_file, 'rows ordered by protein position')
-        print(f"  [Grid] Drawing total-area-ordered grid...", flush=True)
-        # Total-area-ordered
-        out_by_area = output_file.replace('_unique_peptides.png', '_unique_peptides_by_total_area.png')
-        if out_by_area == output_file:
-            out_by_area = output_file.replace('.png', '_by_total_area.png')
-        draw_one_figure(order_area, out_by_area, 'rows ordered by total area')
-        print(f"  [Grid] Drawing low-res overview...", flush=True)
-        # Low-resolution full overview (position-ordered)
-        out_lowres = output_file.replace('_unique_peptides.png', '_unique_peptides_lowres.png')
-        if out_lowres == output_file:
-            out_lowres = output_file.replace('.png', '_lowres.png')
-        draw_one_figure(order_position, out_lowres, 'rows ordered by protein position (overview)', dpi=LOWRES_DPI)
+    # Position-ordered (full resolution)
+    draw_one_figure(order_position, output_file, 'rows ordered by protein position')
+    # Total-area-ordered
+    out_by_area = output_file.replace('_unique_peptides.png', '_unique_peptides_by_total_area.png')
+    if out_by_area == output_file:
+        out_by_area = output_file.replace('.png', '_by_total_area.png')
+    draw_one_figure(order_area, out_by_area, 'rows ordered by total area')
+    # Low-resolution full overview (position-ordered)
+    out_lowres = output_file.replace('_unique_peptides.png', '_unique_peptides_lowres.png')
+    if out_lowres == output_file:
+        out_lowres = output_file.replace('.png', '_lowres.png')
+    draw_one_figure(order_position, out_lowres, 'rows ordered by protein position (overview)', dpi=LOWRES_DPI)
 
-    # Family plots only for combined/total view (not for per-channel); always run when families_only
-    if (not channel_only or families_only) and families:
-        print(f"  [Grid] Drawing {len(families)} family segment plots...", flush=True)
-        base_seg = output_file.rsplit('.', 1)[0]  # strip .png
-        for fam_idx, (family_block_indices, x_lo, x_hi) in enumerate(families, start=1):
-            n_pep = len(family_block_indices)
-            fam_path = f"{base_seg}_family{fam_idx}_pos{x_lo}-{x_hi}.png"
-            print(f"  [Grid]   Family {fam_idx}/{len(families)}: pos {x_lo}–{x_hi} ({n_pep} peptides)", flush=True)
-            draw_one_figure_segment(family_block_indices, fam_path, f'family {fam_idx} (pos {x_lo}–{x_hi}, {n_pep} peptides)', x_lo, x_hi)
-    print(f"  [Grid] Unique peptide grid complete.", flush=True)
+    # Family plots only (no segment plots; families give the same breakdown without redundancy)
+    base_seg = output_file.rsplit('.', 1)[0]  # strip .png
+    for fam_idx, (family_block_indices, x_lo, x_hi) in enumerate(families, start=1):
+        n_pep = len(family_block_indices)
+        fam_path = f"{base_seg}_family{fam_idx}_pos{x_lo}-{x_hi}.png"
+        draw_one_figure_segment(family_block_indices, fam_path, f'family {fam_idx} (pos {x_lo}–{x_hi}, {n_pep} peptides)', x_lo, x_hi)
 
 
 def create_rt_overlay_only_plot(peptides, output_file, protein_id, total_area_range=None, stage_label=None, peptide_traces=None, rt_max_sec=None):
@@ -5453,7 +5475,7 @@ def create_rt_overlay_only_plot(peptides, output_file, protein_id, total_area_ra
     rt_max_global = -float('inf')
 
     width = max(40, 36)
-    height = 32.0
+    height = 16.0
     fig, ax_overlay = plt.subplots(1, 1, figsize=(width, height))
     # Black background for overlay
     fig.patch.set_facecolor('black')
@@ -5701,8 +5723,14 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     WHITESPACE_BAR_COLOR = (1.0, 1.0, 1.0, 1.0)  # explicit white bar in gap between windows
 
     def _peak_drift_buffer_sec(coll_min, coll_max):
-        """Buffer (seconds) each side. Fixed +30 seconds on either side."""
-        return PEAK_DRIFT_BUFFER_SEC
+        """Buffer (seconds) each side; relative to collection width, with min/max (match regenerate_rt_windows_from_csv)."""
+        try:
+            w = float(coll_max) - float(coll_min)
+        except (TypeError, ValueError):
+            return PEAK_DRIFT_BUFFER_SEC
+        if w <= 0 or not (w == w):
+            return PEAK_DRIFT_BUFFER_SEC
+        return max(PEAK_DRIFT_BUFFER_MIN_SEC, min(PEAK_DRIFT_BUFFER_MAX_SEC, PEAK_DRIFT_BUFFER_FRAC * w))
 
     def _identifier_lines(p, drift_min=None, drift_max=None):
         """Return list of identifier lines for a peptide (sequence, charge, mods, m/z, integration, collection, peak drift, positions). drift_min/drift_max optional (computed per-channel with max spacing)."""
@@ -5756,8 +5784,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     y_center = 0.5
     bar_height = 0.6
     width = max(40, 36)  # wider so overlay time axis is readable
-    height_overlay = 32.0  # much larger overlay panel for legibility
-    height_per_channel = 8.0
+    height_overlay = 16.0  # much larger overlay panel (was 6.0)
+    height_per_channel = 4.0
     fig, axes_all = plt.subplots(1 + num_channels, 1, figsize=(width, height_overlay + height_per_channel * num_channels), sharex=True)
     ax_overlay = axes_all[0]
     axes = axes_all[1:1 + num_channels]
@@ -5955,18 +5983,15 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     ax_overlay.set_ylabel('All peptides (chromatogram traces)' + (' [log scale]' if use_log_scale else '') if use_traces else 'All peptides (synthetic peaks; run with --mzml for real traces)', fontsize=12, fontweight='bold')
     ax_overlay.set_yticks([])
     ax_overlay.grid(axis='x', alpha=0.3, linestyle='--')
-    # Global x range: always 0 to at least 20 min (full run view); overlay and RT windows share one x-axis
-    RT_PLOT_XMIN_SEC = 0.0
-    RT_PLOT_XMAX_SEC = 20.0 * 60.0   # 20 min so x-axis is complete
+    # Global x range (same as extract chromatograms: overlay and RT windows share one x-axis)
     if rt_max_global <= rt_min_global:
         rt_min_global = 0
         rt_max_global = 100
     rt_range = rt_max_global - rt_min_global
-    x_min = RT_PLOT_XMIN_SEC
+    x_min = 0.0
     x_max = rt_max_global + max(rt_range * 0.2, 40.0)
     if rt_max_sec is not None and rt_max_sec > 0:
         x_max = max(x_max, rt_max_sec + 60.0)
-    x_max = max(x_max, RT_PLOT_XMAX_SEC)
     ax_overlay.set_xlim(x_min, x_max)
     # Horizontal colorbar below the overlay for total_area (same scale as channel bars)
     if norm is not None and cmap is not None:
@@ -5993,7 +6018,7 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
         ax.set_yticklabels([f'Channel {ch + 1} ({len(peptides_ch)} peptides)'], fontsize=10)
         ax.grid(axis='x', alpha=0.3, linestyle='--')
         n_ch = len(peptides_ch)
-        # Use collection windows only (no drift - drift is instrument, not for channel assignment/display)
+        # First pass: compute drift limits; no overlap within channel (gap = PEAK_DRIFT_GAP_SEC between drift windows)
         channel_data = []
         for i, p in enumerate(peptides_ch):
             min_rt, max_rt = _get_window(p)
@@ -6004,16 +6029,58 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
                 pad = max(10.0, (max_rt - min_rt) * 0.15)
                 coll_min = min_rt - pad
                 coll_max = max_rt + pad
-            rt_min_global = min(rt_min_global, coll_min)
-            rt_max_global = max(rt_max_global, coll_max)
-            channel_data.append({'p': p, 'min_rt': min_rt, 'max_rt': max_rt, 'coll_min': coll_min, 'coll_max': coll_max})
-        # Draw collection (grey), integration (colored) — no drift bars (drift is instrument, not channel)
+            buf_sec = _peak_drift_buffer_sec(coll_min, coll_max)
+            drift_min_full = coll_min - buf_sec
+            drift_max_full = coll_max + buf_sec
+            if i == 0:
+                drift_min = drift_min_full
+            else:
+                prev_coll_min, prev_coll_max = _get_collection_window(peptides_ch[i - 1])
+                if prev_coll_min is not None and prev_coll_max is not None:
+                    prev_buf = _peak_drift_buffer_sec(prev_coll_min, prev_coll_max)
+                    prev_drift_max = prev_coll_max + prev_buf
+                    # No overlap: leave PEAK_DRIFT_GAP_SEC between this drift and previous
+                    drift_min = max(drift_min_full, prev_drift_max + PEAK_DRIFT_GAP_SEC, prev_coll_max)
+                else:
+                    drift_min = drift_min_full
+            if i == n_ch - 1:
+                drift_max = drift_max_full
+            else:
+                next_coll_min, next_coll_max = _get_collection_window(peptides_ch[i + 1])
+                if next_coll_min is not None and next_coll_max is not None:
+                    next_buf = _peak_drift_buffer_sec(next_coll_min, next_coll_max)
+                    next_drift_min = next_coll_min - next_buf
+                    # No overlap: leave PEAK_DRIFT_GAP_SEC between this drift and next
+                    drift_max = min(drift_max_full, next_drift_min - PEAK_DRIFT_GAP_SEC, next_coll_min)
+                else:
+                    drift_max = drift_max_full
+            if drift_max <= drift_min:
+                drift_max = drift_min + max(1.0, (coll_max - coll_min) * 0.1)
+            rt_min_global = min(rt_min_global, drift_min)
+            rt_max_global = max(rt_max_global, drift_max)
+            channel_data.append({'p': p, 'min_rt': min_rt, 'max_rt': max_rt, 'coll_min': coll_min, 'coll_max': coll_max, 'drift_min': drift_min, 'drift_max': drift_max})
+        # Draw white bars in each gap between consecutive windows (slice of white space); crop to x >= 0
+        for i in range(len(channel_data) - 1):
+            gap_left = channel_data[i]['drift_max']
+            gap_right = channel_data[i + 1]['drift_min']
+            left = max(0.0, gap_left)
+            gap_w = gap_right - left
+            if gap_w > 1e-6:
+                ax.barh(y_center, gap_w, height=bar_height, left=left, color=WHITESPACE_BAR_COLOR, alpha=1.0, edgecolor='none', align='center', zorder=-0.5)
+        # Second pass: draw drift (black), collection (grey), integration (colored), labels; crop any left edge below 0
         for i, d in enumerate(channel_data):
-            p, min_rt, max_rt, coll_min, coll_max = d['p'], d['min_rt'], d['max_rt'], d['coll_min'], d['coll_max']
+            p, min_rt, max_rt, coll_min, coll_max, drift_min, drift_max = d['p'], d['min_rt'], d['max_rt'], d['coll_min'], d['coll_max'], d['drift_min'], d['drift_max']
             is_repeat = p.get('is_repeat_in_channel')
+            # Draw full collection and integration windows (no trim) so coeluting/overlapping peaks show true extent
             draw_coll_min = coll_min
             draw_coll_max = coll_max
             coll_w = max(0.0, draw_coll_max - draw_coll_min)
+            # Left drift bar: crop to 0 so peptides with buffer below 0 are still shown
+            drift_left_draw = max(0.0, drift_min)
+            if drift_left_draw < coll_min and (coll_min - drift_left_draw) > 1e-6:
+                ax.barh(y_center, coll_min - drift_left_draw, height=bar_height, left=drift_left_draw, color=PEAK_DRIFT_BLACK, alpha=0.85, edgecolor='none', align='center', zorder=0)
+            if drift_max > coll_max and (drift_max - coll_max) > 1e-6:
+                ax.barh(y_center, drift_max - coll_max, height=bar_height, left=coll_max, color=PEAK_DRIFT_BLACK, alpha=0.85, edgecolor='none', align='center', zorder=0)
             coll_left_draw = max(0.0, draw_coll_min)
             if coll_w > 1e-6 and draw_coll_max > coll_left_draw:
                 ax.barh(y_center, draw_coll_max - coll_left_draw, height=bar_height, left=coll_left_draw, color=COLLECTION_GRAY, alpha=0.6, edgecolor='none', align='center', zorder=0.5)
@@ -6031,8 +6098,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
             if is_repeat:
                 label_str = label_str + " (repeat)" if label_str else "repeat"
             ax.text(int_left_draw + w / 2.0, y_center, label_str, fontsize=8, ha='center', va='center', color='k' if is_repeat else 'white', clip_on=True, path_effects=path_effects if not is_repeat else None)
-            x_anchor = max(0.0, coll_min) + 2.0
-            lines = _identifier_lines(p, drift_min=coll_min, drift_max=coll_max)
+            x_anchor = max(0.0, drift_min) + 2.0
+            lines = _identifier_lines(p, drift_min=drift_min, drift_max=drift_max)
             if i % 2 == 0:
                 y_ref = y_label_below
                 va = 'top'
@@ -6051,7 +6118,7 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
     for ax in list(axes) + [ax_overlay]:
         ax.set_xlim(x_min, x_max)
     log_suffix = ' [log scale]' if use_log_scale else ''
-    axes[0].set_title(f'{protein_id} - RT integration windows by channel (no overlap within channel){log_suffix}\nGray = collection window; colored = integration (by total_area)', fontsize=12, fontweight='bold', pad=10)
+    axes[0].set_title(f'{protein_id} - RT integration windows by channel (no overlap within channel){log_suffix}\nBlack = peak drift (extends toward midpoint between peptides, gap left); gray = collection; colored = integration (by total_area)', fontsize=12, fontweight='bold', pad=10)
     # Big stage label: Passed / Excluded (figure coordinates, top-left of axes area)
     if stage_label is not None or n_passed is not None or n_excluded is not None:
         label_parts = []
@@ -6268,9 +6335,8 @@ def create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein
         for i, d in enumerate(channel_data):
             p, min_rt, max_rt, coll_min, coll_max, drift_min, drift_max = d['p'], d['min_rt'], d['max_rt'], d['coll_min'], d['coll_max'], d['drift_min'], d['drift_max']
             is_repeat = p.get('is_repeat_in_channel')
-            # Clip to drift slot so no overlap within channel (same as main channel strip)
-            draw_coll_min = max(coll_min, drift_min)
-            draw_coll_max = min(coll_max, drift_max)
+            # Draw full collection/integration windows so coeluting peaks show true extent (no trim)
+            draw_coll_min, draw_coll_max = coll_min, coll_max
             coll_w = max(0.0, draw_coll_max - draw_coll_min)
             drift_left_draw = max(0.0, drift_min)
             if drift_left_draw < coll_min and (coll_min - drift_left_draw) > 1e-6:
@@ -6334,19 +6400,7 @@ def create_rt_integration_windows_plot(peptides_for_rt_grid, output_file, protei
     if num_input == 0:
         print("  No peptides for RT integration windows plot, skipping")
         return
-    # When sort_by_channel, use num_channels horizontal strips; do NOT filter by total_area so channel plot is always created when we have peptides (by-channel plot handles missing/0 total_area for color).
-    if sort_by_channel:
-        try:
-            create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein_id, rt_max_sec=rt_max_sec, peptide_traces=peptide_traces, total_area_range=total_area_range, num_channels=num_channels, stage_label=stage_label, n_passed=n_passed, n_excluded=n_excluded)
-            # Log-scale by-channel plots (_log.png and _log_ch1.png ...) are not generated (skip to avoid clutter).
-        except Exception as e:
-            import traceback
-            print(f"  Error creating by-channel RT windows plot: {e}")
-            traceback.print_exc()
-            print("  Skipping by-channel plot; other plots may still be generated.")
-        return
-
-    # For non-channel plot: drop peptides with no/zero total_area (gray bars with total area 0)
+    # Drop peptides with no/zero total_area (gray bars with total area 0)
     def _has_positive_total_area(p):
         v = p.get('total_area')
         if v is None or (isinstance(v, float) and (np.isnan(v) or v <= 0)):
@@ -6357,14 +6411,27 @@ def create_rt_integration_windows_plot(peptides_for_rt_grid, output_file, protei
             return False
     indices_kept = [i for i, p in enumerate(peptides_for_rt_grid) if _has_positive_total_area(p)]
     peptides_for_rt_grid = [peptides_for_rt_grid[i] for i in indices_kept]
+    # Keep peptide_traces in sync so overlay has same length as peptides_for_rt_grid
     if peptide_traces is not None and len(peptide_traces) == num_input:
         peptide_traces = [peptide_traces[i] for i in indices_kept]
     elif peptide_traces is not None:
-        peptide_traces = None
+        peptide_traces = None  # length mismatch with input; overlay would be wrong
     if len(peptides_for_rt_grid) < num_input:
         print(f"  Excluded {num_input - len(peptides_for_rt_grid)} peptides with total_area 0 or missing")
     if not peptides_for_rt_grid:
         print("  No peptides left for RT integration windows plot, skipping")
+        return
+
+    # When sort_by_channel, use num_channels horizontal strips (one per channel) instead of one row per peptide
+    if sort_by_channel:
+        try:
+            create_rt_windows_by_channel_plot(peptides_for_rt_grid, output_file, protein_id, rt_max_sec=rt_max_sec, peptide_traces=peptide_traces, total_area_range=total_area_range, num_channels=num_channels, stage_label=stage_label, n_passed=n_passed, n_excluded=n_excluded)
+            # Log-scale by-channel plots (_log.png and _log_ch1.png ...) are not generated (skip to avoid clutter).
+        except Exception as e:
+            import traceback
+            print(f"  Error creating by-channel RT windows plot: {e}")
+            traceback.print_exc()
+            print("  Skipping by-channel plot; other plots may still be generated.")
         return
 
     def _canon_charge(c):
