@@ -240,6 +240,47 @@ def _find_chromatogram_plots(out_dir: str) -> tuple[str | None, str | None]:
     return (first_chrom, ms1_overlay_preferred or ms1_overlay)
 
 
+def _list_chromatogram_overview_plots(out_dir: str) -> list[str]:
+    """List overview/zoom chromatogram plots emitted by visualization.chromatograms."""
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+
+    exts = ('.png', '.jpg', '.jpeg')
+    paths = []
+    for f in sorted(os.listdir(out_dir)):
+        fl = f.lower()
+        if not fl.endswith(exts):
+            continue
+        if (
+            'all_peptides_overlay' in fl
+            or 'zoom_peptides' in fl
+            or fl.endswith('_chromatograms.png')
+        ):
+            paths.append(os.path.join(out_dir, f))
+
+    rank_tokens = [
+        'all_peptides_overlay.png',
+        'all_peptides_overlay_tracks_only.png',
+        'all_peptides_overlay_tracks_only_1pct.png',
+        'all_peptides_overlay_skyline_style.png',
+        'zoom_peptides_all_linear_log_tracks',
+        'zoom_peptides_all_tracks_1pct',
+        'zoom_peptides_all_tracks',
+        'zoom_peptides_all_linear',
+        'zoom_peptides_all_log',
+        'zoom_peptides_segment_',
+    ]
+
+    def _rank(path: str) -> tuple[int, str]:
+        name = os.path.basename(path).lower()
+        for i, token in enumerate(rank_tokens):
+            if token in name:
+                return (i, name)
+        return (len(rank_tokens), name)
+
+    return sorted(set(paths), key=_rank)
+
+
 QVALUE_COLS = ['perc_qvalue', 'percolator_qvalue', 'q-value', 'qvalue', 'percolator_q-value', 'FDR', 'fdr']
 PEP_COLS = ['perc_PEP', 'percolator_PEP', 'PEP', 'pep']
 XCORR_COLS = ['xcorr', 'XCorr', 'xCorr']
@@ -1988,6 +2029,11 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                         ext_output_path = os.path.join(out_dir, out_base + '_extraction_test.csv')
                     _queue_run(cmd, 'Extraction', out_suffix, needs_visualization=True, input_path=extraction_input, output_path=ext_output_path)
                     _execute_pending_run(stream_container=extraction_run_live)
+
+                    # After a successful extraction run, default to showing chromatogram panels.
+                    if st.session_state.get('script_step') == 'Extraction':
+                        st.session_state.show_extraction_accepted = True
+                        st.session_state.show_extraction_rejected = True
         st.subheader('Extraction')
         st.caption('Envelope, apex ≥10⁵, coelution, shape correlation, S/N fragments 1% max.')
         st.caption('Pass/Fail = passed all filters')
@@ -1998,12 +2044,13 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
         dataframes_dir = os.path.join(out_dir, 'dataframes')
         metrics_csv = os.path.join(dataframes_dir, 'chromatogram_metrics_all.csv')
         traces_path = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
-        has_metrics_traces = has_extraction and os.path.exists(metrics_csv) and os.path.exists(traces_path)
-        chrom_paths, _ = _list_chromatogram_plots(out_dir) if has_extraction else ([], None)
+        has_metrics_traces = os.path.exists(metrics_csv) and os.path.exists(traces_path)
+        chrom_paths, _ = _list_chromatogram_plots(out_dir)
+        ext_accepted, ext_rejected = _list_chromatogram_plots_by_status(out_dir, 'extraction')
+        has_extraction_artifacts = has_metrics_traces or bool(ext_accepted) or bool(ext_rejected)
 
         # Chromatogram plots — run plot script to generate PNGs, display accepted/rejected separately
-        if has_extraction:
-            ext_accepted, ext_rejected = _list_chromatogram_plots_by_status(out_dir, 'extraction') if has_extraction else ([], [])
+        if has_extraction_artifacts:
             # Auto-show plots when they exist (user wants them displayed)
             for key in ['show_extraction_accepted', 'show_extraction_rejected']:
                 if key not in st.session_state:
@@ -2032,7 +2079,7 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
             if st.button('Hide chromatogram plots', key='hide_extraction_chromatograms', help='Stop showing chromatogram plots.'):
                 st.session_state.show_extraction_accepted = False
                 st.session_state.show_extraction_rejected = False
-            ext_accepted, ext_rejected = _list_chromatogram_plots_by_status(out_dir, 'extraction') if has_extraction else ([], [])
+            ext_accepted, ext_rejected = _list_chromatogram_plots_by_status(out_dir, 'extraction')
             plots_per_row, img_width = 2, 550
             if st.session_state.show_extraction_accepted:
                 st.markdown('**Accepted** (extraction/)')
@@ -2062,6 +2109,20 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                                     st.image(p, width=img_width, caption=os.path.basename(p))
                 elif has_metrics_traces:
                     st.info('Click **Generate plots (rejected)** to run the plot script. PNGs will appear after it completes.')
+
+            overview_plots = _list_chromatogram_overview_plots(out_dir)
+            if overview_plots:
+                st.markdown('**Chromatogram overview/zoom plots**')
+                ov_cols_per_row, ov_width = 2, 640
+                for i in range(0, len(overview_plots), ov_cols_per_row):
+                    chunk = overview_plots[i:i + ov_cols_per_row]
+                    cols = st.columns(ov_cols_per_row)
+                    for j, p in enumerate(chunk):
+                        if os.path.exists(p):
+                            with cols[j]:
+                                st.image(p, width=ov_width, caption=os.path.basename(p))
+        elif has_extraction:
+            st.info('Run Extraction to generate chromatogram_metrics_all.csv and chromatogram_traces.npz.')
 
         # Diagnostic plots (coelution, apex, shape)
         if has_coelution or has_extraction:
