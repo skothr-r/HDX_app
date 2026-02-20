@@ -11,12 +11,15 @@ Run: streamlit run hdx_filter_app.py
 """
 
 import gc
+import io
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from datetime import datetime
 from html import escape
 
@@ -30,9 +33,20 @@ if _SCRIPT_DIR not in sys.path:
 import pandas as pd
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+# Local app files can include very large generated PNGs. We downscale for display,
+# but disable Pillow's decompression-bomb guard for trusted local content.
+try:
+    from PIL import Image as _PILImage
+
+    _PILImage.MAX_IMAGE_PIXELS = None
+    warnings.filterwarnings('ignore', category=getattr(__import__('PIL.Image', fromlist=['DecompressionBombWarning']), 'DecompressionBombWarning'))
+except Exception:
+    pass
 
 # Default paths — data/data_hdx holds mzML + FASTA; pipeline CSVs saved there
 DEFAULT_DATA_DIR = os.path.join(_SCRIPT_DIR, 'data', 'data_hdx')
@@ -96,6 +110,57 @@ def _build_results_tree(root_dir: str) -> list[tuple[str, str]]:
             if f.lower().endswith(img_ext):
                 out.append((prefix + f, os.path.join(dirpath, f)))
     return sorted(out, key=lambda x: x[0])
+
+
+@st.cache_data(show_spinner=False)
+def _read_image_bytes_cached(path: str, mtime: float) -> bytes:
+    """Read image bytes with mtime-keyed cache (refreshes when file changes)."""
+    with open(path, 'rb') as f:
+        return f.read()
+
+
+@st.cache_data(show_spinner=False)
+def _read_thumbnail_bytes_cached(path: str, mtime: float, max_width: int = 320) -> bytes:
+    """
+    Build and cache a lightweight thumbnail for faster gallery rendering.
+    Falls back to original bytes if Pillow is unavailable.
+    """
+    try:
+        from PIL import Image  # type: ignore
+
+        with Image.open(path) as img:
+            img = img.convert('RGB')
+            w, h = img.size
+            if w > max_width:
+                new_h = max(1, int(h * (max_width / float(w))))
+                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=82, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return _read_image_bytes_cached(path, mtime)
+
+
+@st.cache_data(show_spinner=False)
+def _read_display_image_bytes_cached(path: str, mtime: float, max_width: int = 3600) -> bytes:
+    """
+    Read an image and downscale for display reliability.
+    Keeps quality high but avoids enormous in-memory images in Streamlit/Pillow.
+    """
+    try:
+        from PIL import Image  # type: ignore
+
+        with Image.open(path) as img:
+            img = img.convert('RGB')
+            w, h = img.size
+            if w > max_width:
+                new_h = max(1, int(h * (max_width / float(w))))
+                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=90, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return _read_image_bytes_cached(path, mtime)
 
 
 def _list_chromatogram_plots(out_dir: str) -> tuple[list[str], str | None]:
@@ -819,6 +884,10 @@ def main():
         st.session_state.last_step_name = None  # e.g. 'Extraction', 'Prefilter'
     if 'last_step_run_started_ts' not in st.session_state:
         st.session_state.last_step_run_started_ts = None
+    if 'tab_focus_request' not in st.session_state:
+        st.session_state.tab_focus_request = None
+    if 'tab_focus_ttl' not in st.session_state:
+        st.session_state.tab_focus_ttl = 0
     try:
         import pyopenms  # noqa: F401
         pyopenms_ok = True
@@ -926,16 +995,29 @@ def main():
         csv_files = sorted(csv_files)
     mzml_path = mzml_files[0] if mzml_files else None
     fasta_path = fasta_files[0] if fasta_files else None
-    # Override: when session has both uploads, use their paths directly (Streamlit Cloud)
-    if st.session_state.get('uploaded_fasta') and st.session_state.get('uploaded_mzml'):
-        ud = st.session_state.get('uploaded_data_dir', '') or upload_dir_default
-        fname, fval = st.session_state.uploaded_fasta
-        mname, mval = st.session_state.uploaded_mzml
-        fp = fval if isinstance(fval, str) else os.path.join(ud, fname)
-        mp = mval if isinstance(mval, str) else os.path.join(ud, mname)
-        if ud and os.path.isdir(ud) and os.path.exists(fp) and os.path.exists(mp):
-            fasta_path = fp
-            mzml_path = mp
+    # Override uploaded paths independently so mixed sources work:
+    # e.g. FASTA from data dir + mzML uploaded in this session.
+    ud = st.session_state.get('uploaded_data_dir', '') or upload_dir_default
+    up_fasta = st.session_state.get('uploaded_fasta')
+    up_mzml = st.session_state.get('uploaded_mzml')
+    if ud and os.path.isdir(ud):
+        if up_fasta:
+            fname, fval = up_fasta
+            fp = fval if isinstance(fval, str) else os.path.join(ud, fname)
+            if os.path.exists(fp):
+                fasta_path = fp
+        if up_mzml:
+            mname, mval = up_mzml
+            mp = mval if isinstance(mval, str) else os.path.join(ud, mname)
+            if os.path.exists(mp):
+                mzml_path = mp
+    # Robust fallback: if session paths are stale after rerun/restart, rediscover uploads on disk.
+    upload_fasta_files = _find_files(upload_dir_default, FASTA_EXT) if os.path.isdir(upload_dir_default) else []
+    upload_mzml_files = _find_files(upload_dir_default, MZML_EXT) if os.path.isdir(upload_dir_default) else []
+    if (not fasta_path or not os.path.exists(fasta_path)) and upload_fasta_files:
+        fasta_path = max(upload_fasta_files, key=lambda p: os.path.getmtime(p))
+    if (not mzml_path or not os.path.exists(mzml_path)) and upload_mzml_files:
+        mzml_path = max(upload_mzml_files, key=lambda p: os.path.getmtime(p))
     csv_default_idx = 0
     last_out_preview = st.session_state.get('last_step_output')
     if csv_files:
@@ -951,6 +1033,13 @@ def main():
                     csv_default_idx = i
                     break
     csv_path = csv_files[csv_default_idx] if csv_files else None
+    pipeline_inputs_ready = bool(
+        mzml_path and os.path.exists(mzml_path) and fasta_path and os.path.exists(fasta_path)
+    )
+    # Pipeline-first mode: when FASTA+mzML are available, ignore discovered CSVs.
+    # This prevents stale on-disk CSVs from hijacking a fresh run.
+    if pipeline_inputs_ready:
+        csv_path = None
 
     params_files = _find_files(data_dir, ('.params',))
     default_params = os.path.join(_SCRIPT_DIR, 'comet.params.new')
@@ -1002,6 +1091,33 @@ def main():
                    comet_rename: tuple = None) -> None:
         """Queue a script run for execution at end of page (enables live streaming)."""
         _clear_chromatograms_cache()
+        step_l = str(step_name or '').strip().lower()
+        tab_name = None
+        if step_l.startswith('comet'):
+            tab_name = 'Comet'
+        elif step_l.startswith('percolator'):
+            tab_name = 'Percolator'
+        elif step_l.startswith('openms'):
+            tab_name = 'OpenMS'
+        elif step_l.startswith('prefilter'):
+            tab_name = 'Prefilter'
+        elif step_l.startswith('extraction') or step_l.startswith('chromatogram plots'):
+            tab_name = 'Extraction'
+        elif step_l.startswith('envelope'):
+            tab_name = 'Envelope'
+        elif step_l.startswith('significance'):
+            tab_name = 'Significance'
+        elif step_l.startswith('sequence'):
+            tab_name = 'Sequence'
+        elif step_l.startswith('d_mz'):
+            tab_name = 'D_MZ'
+        elif step_l == 'sf':
+            tab_name = 'SF'
+        elif step_l.startswith('channels'):
+            tab_name = 'Channels'
+        if tab_name:
+            st.session_state.tab_focus_request = tab_name
+            st.session_state.tab_focus_ttl = 3
         out_path = output_path or (input_path and _step_output_path(input_path, out_dir, out_suffix))
         st.session_state.pending_run = (cmd, step_name, out_suffix, needs_visualization, out_path, run_cwd, comet_rename)
 
@@ -1112,12 +1228,31 @@ def main():
                 st.session_state.last_step_name = step_name
                 st.session_state.last_step_run_started_ts = run_started_ts
             else:
-                st.session_state.last_step_output = None
-                st.session_state.last_step_name = step_name
-                st.session_state.last_step_run_started_ts = run_started_ts
-                st.sidebar.warning(
-                    f'{step_name} completed, but no fresh output file timestamp was detected for {out_suffix}.'
-                )
+                # Don't "forget" prior successful step outputs when timestamp detection is noisy.
+                fallback_output = ''
+                if output_path and os.path.exists(output_path):
+                    fallback_output = output_path
+                elif out_suffix:
+                    try:
+                        for fn in os.listdir(work_dir):
+                            if fn.endswith(out_suffix):
+                                fp = os.path.join(work_dir, fn)
+                                if os.path.isfile(fp):
+                                    fallback_output = fp
+                                    break
+                    except Exception:
+                        fallback_output = ''
+                if fallback_output and os.path.exists(fallback_output):
+                    st.session_state.last_step_output = fallback_output
+                    st.session_state.last_step_name = step_name
+                    st.session_state.last_step_run_started_ts = run_started_ts
+                else:
+                    # Keep prior last_step_output untouched to avoid forcing users to rerun steps.
+                    st.session_state.last_step_name = step_name
+                    st.session_state.last_step_run_started_ts = run_started_ts
+                    st.sidebar.warning(
+                        f'{step_name} completed, but no output file was auto-detected for {out_suffix}.'
+                    )
             load_csv.clear()
             _clear_chromatograms_cache()
             gc.collect()
@@ -1136,7 +1271,10 @@ def main():
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
     # Resolve chained inputs. conf_base = root name (e.g. comet_frags_perc_openMS).
-    base_for_resolve = os.path.splitext(os.path.basename(csv_path))[0] if csv_path else ''
+    # Prefer last successful step output as chain source when available.
+    last_out_for_chain = st.session_state.get('last_step_output')
+    chain_csv_path = last_out_for_chain if (last_out_for_chain and os.path.exists(last_out_for_chain)) else csv_path
+    base_for_resolve = os.path.splitext(os.path.basename(chain_csv_path))[0] if chain_csv_path else ''
     for strip in ['_prefilter_extraction_envelope_significance_sequence', '_prefilter_extraction_envelope_significance',
                   '_prefilter_extraction_envelope', '_prefilter_extraction', '_prefilter',
                   '_prefilter_extraction_test_envelope_significance_sequence', '_prefilter_extraction_test_envelope_significance',
@@ -1149,17 +1287,17 @@ def main():
     else:
         conf_base = base_for_resolve
     extraction_test = st.session_state.get('extraction_test', True)
-    step5_input = _resolve_step_input_from_conf_base(conf_base, out_dir, ['_prefilter', '_confidence'], csv_path) if csv_path else None
+    step5_input = _resolve_step_input_from_conf_base(conf_base, out_dir, ['_prefilter', '_confidence'], chain_csv_path) if chain_csv_path else None
     step6_suffixes = (['_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test'] +
                       ['_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction']) if extraction_test else (['_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction'] +
                       ['_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test'])
-    step6_input = _resolve_step_input_from_conf_base(conf_base, out_dir, step6_suffixes, csv_path) if csv_path else None
+    step6_input = _resolve_step_input_from_conf_base(conf_base, out_dir, step6_suffixes, chain_csv_path) if chain_csv_path else None
     step7_suffixes = (['_prefilter_extraction_test_envelope', '_confidence_accuracy_extraction_test_envelope', '_confidence_extraction_test_envelope'] +
                       ['_prefilter_extraction_envelope', '_confidence_accuracy_extraction_envelope', '_confidence_extraction_envelope']) if extraction_test else (['_prefilter_extraction_envelope', '_confidence_accuracy_extraction_envelope', '_confidence_extraction_envelope'] +
                       ['_prefilter_extraction_test_envelope', '_confidence_accuracy_extraction_test_envelope', '_confidence_extraction_test_envelope'])
-    step7_input = _resolve_step_input_from_conf_base(conf_base, out_dir, step7_suffixes, csv_path) if csv_path else None
+    step7_input = _resolve_step_input_from_conf_base(conf_base, out_dir, step7_suffixes, chain_csv_path) if chain_csv_path else None
     # Significance runs on envelope or extraction (needs RT windows)
-    sig_frag_input = (step7_input if step7_input and os.path.exists(step7_input) else step6_input) if csv_path else None
+    sig_frag_input = (step7_input if step7_input and os.path.exists(step7_input) else step6_input) if chain_csv_path else None
 
     st.sidebar.divider()
 
@@ -1170,7 +1308,7 @@ def main():
 
     # Intentionally do not show sidebar "Loaded/Auto-loaded CSV" status;
     # inputs are FASTA + mzML and each step writes its own output CSV.
-    pipeline_mode = (csv_path is None or not os.path.exists(csv_path)) and mzml_path and fasta_path
+    pipeline_mode = (csv_path is None or not os.path.exists(csv_path)) and pipeline_inputs_ready
     if csv_path is None or not os.path.exists(csv_path):
         if not pipeline_mode:
             st.session_state.pending_run = None
@@ -1231,7 +1369,12 @@ def main():
         base = os.path.splitext(os.path.basename(csv_path))[0]
         # Detect available data
         has_extraction = 'apex_intensity' in df.columns or 'total_area' in df.columns
-        has_envelope = 'm0_gt_m1_gt_m2' in df.columns or 'envelope_ok' in df.columns
+        has_envelope = (
+            ('m0_m1_gt_m2_m3' in df.columns)
+            or all(c in df.columns for c in ('m0_intensity', 'm1_intensity', 'm2_intensity', 'm3_intensity'))
+            or ('m0_gt_m1_gt_m2' in df.columns)
+            or ('envelope_ok' in df.columns)
+        )
         has_sig_frags = (SIGNIFICANT_FRAGS_COL in df.columns)
         has_coelution = 'coelution_score' in df.columns
         qcol = _resolve_qcol(df)
@@ -1313,10 +1456,42 @@ def main():
         'percolator': os.path.join(out_dir, pipeline_base + '_comet_perc.csv') if pipeline_base else '',
         'openms': os.path.join(out_dir, pipeline_base + '_comet_perc_openMS.csv') if pipeline_base else '',
     }
+    tab_done_suffixes = {
+        'comet': ['_comet'],
+        'percolator': ['_comet_perc'],
+        'openms': ['_comet_perc_openMS'],
+        'prefilter': ['_prefilter', '_confidence'],
+        'extraction': ['_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test', '_extraction_test',
+                       '_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction', '_extraction'],
+        'envelope': ['_prefilter_extraction_test_envelope', '_confidence_accuracy_extraction_test_envelope', '_confidence_extraction_test_envelope',
+                     '_prefilter_extraction_envelope', '_confidence_accuracy_extraction_envelope', '_confidence_extraction_envelope', '_envelope'],
+        'significance': ['_prefilter_extraction_test_envelope_significance', '_confidence_accuracy_extraction_test_envelope_significance',
+                         '_confidence_extraction_test_envelope_significance', '_confidence_extraction_test_significance', '_confidence_accuracy_extraction_test_significance',
+                         '_prefilter_extraction_envelope_significance', '_confidence_accuracy_extraction_envelope_significance',
+                         '_confidence_extraction_envelope_significance', '_confidence_extraction_significance', '_confidence_accuracy_extraction_significance', '_significance'],
+        'sequence': ['_prefilter_extraction_test_envelope_significance_sequence', '_confidence_extraction_test_envelope_significance_sequence',
+                     '_prefilter_extraction_envelope_significance_sequence', '_confidence_extraction_envelope_significance_sequence', '_sequence', '_significance_sequence'],
+        'd_mz': ['_D_MZ'],
+        'sf': ['_SF'],
+        'channels': ['_channels'],
+    }
+
+    def _tab_is_done(step_name: str) -> bool:
+        # Prefer explicit expected outputs first.
+        out = pipeline_outputs.get(step_name) or step_outputs.get(step_name, '')
+        if out and os.path.exists(out):
+            return True
+        # In pipeline-first mode, csv_path can be intentionally None; fallback to suffix scan in out_dir.
+        suffixes = tab_done_suffixes.get(step_name, [])
+        if suffixes:
+            latest = _latest_csv_with_suffix(out_dir, suffixes)
+            if latest and os.path.exists(latest):
+                return True
+        return False
+
     green_tabs_css = []
     for name, path in [('comet', 2), ('percolator', 3), ('openms', 4), ('prefilter', 7), ('extraction', 8), ('envelope', 9), ('significance', 10), ('sequence', 11), ('d_mz', 12), ('sf', 13), ('channels', 14)]:
-        out = pipeline_outputs.get(name) or step_outputs.get(name, '')
-        if out and os.path.exists(out):
+        if _tab_is_done(name):
             green_tabs_css.append(f'[data-testid="stTabs"] [role="tab"]:nth-child({path}) {{ color: #84cc16 !important; }}')
     # Checkmarks in Metrics tab — blue to match app theme (same as buttons)
     # accent-color + span/svg: target both native checkbox and Streamlit's custom visual
@@ -1345,6 +1520,26 @@ def main():
 
     filter_steps = ['Summary', 'Comet', 'Percolator', 'OpenMS', 'Metrics', 'Compare', 'Prefilter', 'Extraction', 'Envelope', 'Significance', 'Sequence', 'D_MZ', 'SF', 'Channels', 'Method']
     filter_tabs = st.tabs(filter_steps)
+    req_tab = st.session_state.get('tab_focus_request')
+    req_ttl = int(st.session_state.get('tab_focus_ttl', 0) or 0)
+    if req_tab in filter_steps and req_ttl > 0:
+        components.html(
+            f"""
+            <script>
+            const target = {json.dumps(req_tab)};
+            setTimeout(() => {{
+              const doc = window.parent.document;
+              const tabs = Array.from(doc.querySelectorAll('[data-testid="stTabs"] button[role="tab"]'));
+              const tab = tabs.find(t => (t.textContent || '').trim() === target);
+              if (tab && tab.getAttribute('aria-selected') !== 'true') tab.click();
+            }}, 60);
+            </script>
+            """,
+            height=0,
+        )
+        st.session_state.tab_focus_ttl = req_ttl - 1
+    elif req_ttl <= 0:
+        st.session_state.tab_focus_request = None
 
     # Show banner when a pipeline step is queued (fallback runner executes at end of script)
     if st.session_state.pending_run:
@@ -1390,7 +1585,7 @@ def main():
             st.caption('Extraction')
             ex1, ex2, ex3, ex4 = st.columns(4)
             with ex1:
-                enable_envelope = st.checkbox('Envelope (M0, M+1, M+2 present; M0>M+1 OR M+1>M+2)', True, key='enable_env')
+                enable_envelope = st.checkbox('Envelope (M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3)', True, key='enable_env')
             with ex2:
                 enable_apex = st.checkbox('Apex', True, key='enable_apex')
                 apex_min = st.number_input('Min apex', 1e4, 1e8, 1e5, 1e4, format='%.0e', key='apex_min')
@@ -1408,7 +1603,7 @@ def main():
             with sf2:
                 ppm_thresh = st.slider('5ppm', 1.0, 20.0, 5.0, 0.5, key='ppm_thresh', help='PPM tolerance for fragment matching')
             with sf3:
-                min_sig_frag_count = st.number_input('Min sig frags', 0, 50, 3, 1, key='min_sig')
+                min_sig_frag_count = st.number_input('Min sig frags', 0, 50, 5, 1, key='min_sig')
             with sf4:
                 sig_frac_pct = st.slider('1% max peak', 0.1, 5.0, 1.0, 0.1, key='sig_frac', help='Min % of max MS2 for fragment (noise filter)')
             # Extraction run options
@@ -1469,8 +1664,17 @@ def main():
     # Step 6: Extraction (envelope, apex >=10^5, coelution, shape, S/N 1% max)
     if enable_envelope and has_envelope:
         def _pass_env(row):
+            m_new = row.get('m0_m1_gt_m2_m3')
             m0 = row.get('m0_gt_m1_gt_m2')
             env = row.get('envelope_ok')
+            i0 = pd.to_numeric(pd.Series([row.get('m0_intensity')]), errors='coerce').iloc[0]
+            i1 = pd.to_numeric(pd.Series([row.get('m1_intensity')]), errors='coerce').iloc[0]
+            i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
+            i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
+            if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
+                return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+            if pd.notna(m_new):
+                return _to_bool(m_new)
             if pd.notna(m0):
                 return _to_bool(m0)
             if pd.notna(env):
@@ -1502,9 +1706,15 @@ def main():
                 return 0
             parts = [p.strip() for p in str(val).replace(',', ' ').split() if p.strip()]
             return len(parts)
+        def _count_overhangs(row):
+            val = row.get('single_aa_overhangs_protein_positions')
+            if pd.isna(val) or val is None or str(val).strip() == '':
+                return 0
+            return len([p.strip() for p in str(val).split(',') if p.strip()])
         counts = df_filtered.apply(_count_sig, axis=1)
+        overhang_counts = df_filtered.apply(_count_overhangs, axis=1)
         effective_min = max(1, min_sig_frag_count)  # require at least 1 when enabled
-        mask_sig = counts >= effective_min
+        mask_sig = (counts >= effective_min) & (overhang_counts >= 2)
         df_filtered = df_filtered[mask_sig].copy()
     step_counts.append(('Significance', len(df_filtered), n_prev))
     n_prev = len(df_filtered)
@@ -1519,7 +1729,15 @@ def main():
     def _pass_conf(r):
         return _pass_confidence(r, df_orig, qcol, pepcol, q_thresh, pep_thresh, enabled=use_qpep)
     def _pass_env(r):
-        m0, env = r.get('m0_gt_m1_gt_m2'), r.get('envelope_ok')
+        m_new, m0, env = r.get('m0_m1_gt_m2_m3'), r.get('m0_gt_m1_gt_m2'), r.get('envelope_ok')
+        i0 = pd.to_numeric(pd.Series([r.get('m0_intensity')]), errors='coerce').iloc[0]
+        i1 = pd.to_numeric(pd.Series([r.get('m1_intensity')]), errors='coerce').iloc[0]
+        i2 = pd.to_numeric(pd.Series([r.get('m2_intensity')]), errors='coerce').iloc[0]
+        i3 = pd.to_numeric(pd.Series([r.get('m3_intensity')]), errors='coerce').iloc[0]
+        if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
+            return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+        if pd.notna(m_new):
+            return _to_bool(m_new)
         if pd.notna(m0): return _to_bool(m0)
         if pd.notna(env): return _to_bool(env)
         return False
@@ -1578,7 +1796,7 @@ def main():
     # ─── Rest of tabs (Summary, Prefilter, Extraction, etc.) ─────────────────
     with filter_tabs[0]:  # Summary
         if pipeline_mode:
-            st.info('Run the **Comet** → **Percolator** → **OpenMS** pipeline (tabs 2–4) to create a CSV, then select it in the sidebar.')
+            st.info('Run the **Comet** → **Percolator** → **OpenMS** pipeline (tabs 2–4). The latest output CSV will auto-load for downstream steps.')
         st.subheader('Filter summary')
         with st.expander('All tabs: pipeline steps and outputs', expanded=True, icon='▶'):
             # Build table of all tabs with status and description
@@ -1591,7 +1809,7 @@ def main():
                 ('Compare', None, 'Byonic vs Comet: overlap plots + byonic_only/comet_only CSVs'),
                 ('Prefilter', step_outputs.get('prefilter', ''), 'PEP, Q, prolines, mods, ppm → _prefilter.csv'),
                 ('Extraction', step_outputs.get('extraction', ''), 'Envelope, apex ≥10⁵, coelution, shape, S/N 1% max → _extraction.csv'),
-                ('Envelope', step_outputs.get('envelope', ''), 'M0>M+1 OR M+1>M+2 → _envelope.csv'),
+                ('Envelope', step_outputs.get('envelope', ''), 'M0 and M+1 > M+2 and M+3 (requires M+3 present) → _envelope.csv'),
                 ('Significance', step_outputs.get('significance', ''), '5ppm, min sig frags, 1% max peak → _significance.csv'),
                 ('Sequence', step_outputs.get('sequence', ''), 'Unique peptides grid + protect_peptide → _sequence.csv'),
                 ('D_MZ', step_outputs.get('d_mz', ''), 'Deuterated m/z target range (undeut + max deut) / 2 ± range → _D_MZ.csv'),
@@ -1599,11 +1817,33 @@ def main():
                 ('Channels', step_outputs.get('channels', ''), 'Channel assignment → _channels.csv'),
                 ('Method', None, 'Pipeline documentation'),
             ]
+            summary_suffixes = {
+                'Comet': ['_comet'],
+                'Percolator': ['_comet_perc'],
+                'OpenMS': ['_comet_perc_openMS'],
+                'Prefilter': ['_prefilter', '_confidence'],
+                'Extraction': ['_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test', '_extraction_test',
+                               '_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction', '_extraction'],
+                'Envelope': ['_prefilter_extraction_test_envelope', '_confidence_accuracy_extraction_test_envelope', '_confidence_extraction_test_envelope',
+                             '_prefilter_extraction_envelope', '_confidence_accuracy_extraction_envelope', '_confidence_extraction_envelope', '_envelope'],
+                'Significance': ['_prefilter_extraction_test_envelope_significance', '_confidence_accuracy_extraction_test_envelope_significance',
+                                 '_confidence_extraction_test_envelope_significance', '_confidence_extraction_test_significance', '_confidence_accuracy_extraction_test_significance',
+                                 '_prefilter_extraction_envelope_significance', '_confidence_accuracy_extraction_envelope_significance',
+                                 '_confidence_extraction_envelope_significance', '_confidence_extraction_significance', '_confidence_accuracy_extraction_significance', '_significance'],
+                'Sequence': ['_prefilter_extraction_test_envelope_significance_sequence', '_confidence_extraction_test_envelope_significance_sequence',
+                             '_prefilter_extraction_envelope_significance_sequence', '_confidence_extraction_envelope_significance_sequence', '_sequence', '_significance_sequence'],
+                'D_MZ': ['_D_MZ'],
+                'SF': ['_SF'],
+                'Channels': ['_channels'],
+            }
             step_rows = '| Tab | Status | Rows | Description |\n|-----|--------|------|-------------|\n'
             for tab_name, out_path, desc in tab_info:
-                if out_path and os.path.exists(out_path):
+                resolved_out = out_path
+                if (not resolved_out or not os.path.exists(resolved_out)) and tab_name in summary_suffixes:
+                    resolved_out = _latest_csv_with_suffix(out_dir, summary_suffixes[tab_name])
+                if resolved_out and os.path.exists(resolved_out):
                     try:
-                        n = len(load_csv(out_path))
+                        n = len(load_csv(resolved_out))
                         rows_str = str(n)
                     except Exception:
                         rows_str = '—'
@@ -1836,21 +2076,38 @@ def main():
     with filter_tabs[6]:  # Prefilter (Proline, Mods, Q/PEP, PPM — all from CSV)
         prefilter_run_live = st.container()
         run_step4 = st.button('Run Prefilter', key='run_step4', help='Prefilter (Q, PEP, prolines, mods)')
-        if run_step4 and csv_path and os.path.exists(csv_path):
+        prefilter_input = ''
+        _last_out = st.session_state.get('last_step_output', '') or ''
+        _last_out_is_openms = bool(_last_out and os.path.exists(_last_out) and _last_out.endswith('_comet_perc_openMS.csv'))
+        for candidate in [
+            step_outputs.get('openms', ''),
+            (_last_out if _last_out_is_openms else ''),
+            _latest_csv_with_suffix(out_dir, ['_comet_perc_openMS']),
+            csv_path,
+        ]:
+            if candidate and os.path.exists(candidate):
+                prefilter_input = candidate
+                break
+        if run_step4 and prefilter_input:
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_comet_frags_confidence.py'),
-                   '--input', csv_path, '--output-dir', out_dir]
+                   '--input', prefilter_input, '--output-dir', out_dir]
             if use_qpep:
                 cmd.extend(['--use-qpep', '--q-threshold', str(q_thresh), '--pep-threshold', str(pep_thresh)])
             if enable_xcorr_filter:
                 cmd.extend(['--use-xcorr', '--xcorr-min', str(xcorr_min)])
             if enable_sp_filter:
                 cmd.extend(['--use-sp', '--sp-min', str(sp_min)])
-            _queue_run(cmd, 'Prefilter', '_prefilter.csv', input_path=csv_path)
+            _queue_run(cmd, 'Prefilter', '_prefilter.csv', input_path=prefilter_input)
             _execute_pending_run(stream_container=prefilter_run_live)
+        elif run_step4:
+            st.error('Run OpenMS first (or load an OpenMS CSV output) before Prefilter.')
         st.subheader('Prefilter')
         st.caption('PEP, Q-value, prolines, mods, ppm (MS1 peptide) — run Significant fragmentation for PPM of matched fragments (5ppm)')
         st.caption('Pass/Fail = passed all filters (see how failing rows distribute across metrics)')
         prefilter_preview = _resolve_preview_output('Prefilter', step_outputs['prefilter'])
+        prefilter_detected = prefilter_preview or _latest_csv_with_suffix(out_dir, ['_prefilter', '_confidence'])
+        if prefilter_detected and os.path.exists(prefilter_detected):
+            st.caption(f"Active Prefilter output: `{prefilter_detected}`")
         if prefilter_preview:
             _render_step_output_csv(prefilter_preview, 'step4_prefilter', expanded=(csv_path == prefilter_preview))
             prefilter_rejected = (
@@ -1986,7 +2243,12 @@ def main():
         extraction_run_live = st.container()
         run_step6 = st.button('Run Extraction', key='run_step6', help='Extraction (envelope, apex, coelution, shape)')
         if run_step6:
-            extraction_input = (step5_input if step5_input and os.path.exists(step5_input) else step6_input) or csv_path
+            extraction_input = (
+                (step5_input if step5_input and os.path.exists(step5_input) else None)
+                or _latest_csv_with_suffix(out_dir, ['_prefilter', '_confidence'])
+                or (step6_input if step6_input and os.path.exists(step6_input) else None)
+                or csv_path
+            )
             if not mzml_path:
                 st.error('Select mzML.')
             elif not extraction_input or not os.path.exists(extraction_input):
@@ -2051,6 +2313,30 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
 
         # Chromatogram plots — run plot script to generate PNGs, display accepted/rejected separately
         if has_extraction_artifacts:
+            if 'extraction_hires_plot' not in st.session_state:
+                st.session_state.extraction_hires_plot = None
+            if 'extraction_hires_label' not in st.session_state:
+                st.session_state.extraction_hires_label = ''
+
+            def _render_extraction_thumb_gallery(paths: list[str], gallery_key: str, thumbs_per_row: int = 3, thumb_width: int = 240) -> None:
+                """Render small thumbnails with click-to-expand high-resolution viewer."""
+                for i in range(0, len(paths), thumbs_per_row):
+                    chunk = paths[i:i + thumbs_per_row]
+                    cols = st.columns(thumbs_per_row)
+                    for j, p in enumerate(chunk):
+                        if not os.path.exists(p):
+                            continue
+                        try:
+                            mt = os.path.getmtime(p)
+                            thumb_bytes = _read_thumbnail_bytes_cached(p, mt, max_width=360)
+                        except Exception:
+                            thumb_bytes = p
+                        with cols[j]:
+                            st.image(thumb_bytes, width=thumb_width, caption=os.path.basename(p))
+                            if st.button('Expand', key=f'{gallery_key}_expand_{i}_{j}_{os.path.basename(p)}'):
+                                st.session_state.extraction_hires_plot = p
+                                st.session_state.extraction_hires_label = os.path.basename(p)
+
             # Auto-show plots when they exist (user wants them displayed)
             for key in ['show_extraction_accepted', 'show_extraction_rejected']:
                 if key not in st.session_state:
@@ -2060,9 +2346,11 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 if st.button('Generate plots (accepted)', key='gen_extraction_accepted',
                              help='Run plot script and show accepted peptide chromatograms'):
                     st.session_state.show_extraction_accepted = True
-                    if not ext_accepted and has_metrics_traces:
+                    st.session_state.extraction_hires_plot = None
+                    st.session_state.extraction_hires_label = ''
+                    if has_metrics_traces:
                         plot_cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'plot_chromatograms_from_extraction.py'),
-                                    '--output-dir', os.path.abspath(out_dir)]
+                                    '--output-dir', os.path.abspath(out_dir), '--clear-output']
                         if step_outputs.get('extraction') and os.path.exists(step_outputs['extraction']):
                             plot_cmd.extend(['--filter-csv', step_outputs['extraction']])
                         _queue_run(plot_cmd, 'Chromatogram plots', '_chromatograms', needs_visualization=True)
@@ -2070,9 +2358,11 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 if st.button('Generate plots (rejected)', key='gen_extraction_rejected',
                              help='Run plot script and show rejected peptide chromatograms'):
                     st.session_state.show_extraction_rejected = True
-                    if not ext_rejected and has_metrics_traces:
+                    st.session_state.extraction_hires_plot = None
+                    st.session_state.extraction_hires_label = ''
+                    if has_metrics_traces:
                         plot_cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'plot_chromatograms_from_extraction.py'),
-                                    '--output-dir', os.path.abspath(out_dir)]
+                                    '--output-dir', os.path.abspath(out_dir), '--clear-output']
                         if step_outputs.get('extraction') and os.path.exists(step_outputs['extraction']):
                             plot_cmd.extend(['--filter-csv', step_outputs['extraction']])
                         _queue_run(plot_cmd, 'Chromatogram plots', '_chromatograms', needs_visualization=True)
@@ -2080,18 +2370,11 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 st.session_state.show_extraction_accepted = False
                 st.session_state.show_extraction_rejected = False
             ext_accepted, ext_rejected = _list_chromatogram_plots_by_status(out_dir, 'extraction')
-            plots_per_row, img_width = 2, 550
             if st.session_state.show_extraction_accepted:
                 st.markdown('**Accepted** (extraction/)')
                 if ext_accepted:
                     st.caption('Integrated isotopes, integration window green, collection window gray.')
-                    for i in range(0, len(ext_accepted), plots_per_row):
-                        chunk = ext_accepted[i:i + plots_per_row]
-                        cols = st.columns(plots_per_row)
-                        for j, p in enumerate(chunk):
-                            if os.path.exists(p):
-                                with cols[j]:
-                                    st.image(p, width=img_width, caption=os.path.basename(p))
+                    _render_extraction_thumb_gallery(ext_accepted, 'ext_accepted')
                 elif has_metrics_traces:
                     st.info('Click **Generate plots (accepted)** to run the plot script. PNGs will appear after it completes.')
                 else:
@@ -2100,27 +2383,64 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 st.markdown('**Rejected** (rejected_extraction/)')
                 if ext_rejected:
                     st.caption('Integrated isotopes, integration window green, collection window gray.')
-                    for i in range(0, len(ext_rejected), plots_per_row):
-                        chunk = ext_rejected[i:i + plots_per_row]
-                        cols = st.columns(plots_per_row)
-                        for j, p in enumerate(chunk):
-                            if os.path.exists(p):
-                                with cols[j]:
-                                    st.image(p, width=img_width, caption=os.path.basename(p))
+                    _render_extraction_thumb_gallery(ext_rejected, 'ext_rejected')
                 elif has_metrics_traces:
                     st.info('Click **Generate plots (rejected)** to run the plot script. PNGs will appear after it completes.')
 
             overview_plots = _list_chromatogram_overview_plots(out_dir)
             if overview_plots:
                 st.markdown('**Chromatogram overview/zoom plots**')
-                ov_cols_per_row, ov_width = 2, 640
-                for i in range(0, len(overview_plots), ov_cols_per_row):
-                    chunk = overview_plots[i:i + ov_cols_per_row]
-                    cols = st.columns(ov_cols_per_row)
-                    for j, p in enumerate(chunk):
-                        if os.path.exists(p):
-                            with cols[j]:
-                                st.image(p, width=ov_width, caption=os.path.basename(p))
+                _render_extraction_thumb_gallery(overview_plots, 'ext_overview')
+
+            selected_plot = st.session_state.get('extraction_hires_plot')
+            if selected_plot and os.path.exists(selected_plot):
+                plot_label = st.session_state.get('extraction_hires_label') or os.path.basename(selected_plot)
+                if hasattr(st, 'dialog'):
+                    @st.dialog('High-resolution chromatogram plot')
+                    def _show_extraction_plot_dialog():
+                        st.caption(plot_label)
+                        try:
+                            full_bytes = _read_display_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot), max_width=3600)
+                        except Exception:
+                            full_bytes = selected_plot
+                        st.image(full_bytes, width='stretch')
+                        try:
+                            original_bytes = _read_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot))
+                        except Exception:
+                            original_bytes = b''
+                        act_col1, act_col2 = st.columns(2)
+                        with act_col1:
+                            if original_bytes:
+                                st.download_button(
+                                    'Download original PNG',
+                                    data=original_bytes,
+                                    file_name=os.path.basename(selected_plot),
+                                    mime='image/png',
+                                    key=f'dl_extraction_hires_{os.path.basename(selected_plot)}'
+                                )
+                        with act_col2:
+                            if st.button('Close', key='close_extraction_hires_dialog'):
+                                st.session_state.extraction_hires_plot = None
+                                st.session_state.extraction_hires_label = ''
+                                st.rerun()
+
+                    _show_extraction_plot_dialog()
+                else:
+                    # Fallback for older Streamlit versions without modal dialogs.
+                    st.markdown('**High-resolution plot viewer**')
+                    viewer_col1, viewer_col2 = st.columns([1, 5])
+                    with viewer_col1:
+                        if st.button('Close', key='close_extraction_hires'):
+                            st.session_state.extraction_hires_plot = None
+                            st.session_state.extraction_hires_label = ''
+                            st.rerun()
+                    with viewer_col2:
+                        st.caption(plot_label)
+                    try:
+                        full_bytes = _read_display_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot), max_width=3600)
+                    except Exception:
+                        full_bytes = selected_plot
+                    st.image(full_bytes, width='stretch')
         elif has_extraction:
             st.info('Run Extraction to generate chromatogram_metrics_all.csv and chromatogram_traces.npz.')
 
@@ -2186,12 +2506,13 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
             st.info('Load extraction CSV (Step 6 output) for chromatogram extraction diagnostics.')
 
     with filter_tabs[8]:  # Envelope (Step 7)
+        envelope_run_live = st.container()
         run_step7 = st.button('Run Envelope', key='run_step7', help='Envelope filter')
         if run_step7:
             # Envelope runs on the most recent extraction CSV in output dir.
             env_input = _latest_csv_with_suffix(out_dir, ['_extraction', '_extraction_test']) or step6_input
             if not env_input or not os.path.exists(env_input):
-                st.error('Run Extraction (Step 6) first. Envelope needs the extraction CSV with envelope_ok / m0_gt_m1_gt_m2 columns.')
+                st.error('Run Extraction (Step 6) first. Envelope needs extraction summed-MS1 intensity columns.')
             else:
                 # Verify input has envelope columns (avoid passing OpenMS/prefilter CSV by mistake)
                 try:
@@ -2199,17 +2520,19 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                         hdr = f.readline()
                         if 'CometVersion' in hdr:
                             hdr = f.readline()
-                    if 'envelope_ok' not in hdr and 'm0_gt_m1_gt_m2' not in hdr:
-                        st.error('Input CSV has no envelope_ok or m0_gt_m1_gt_m2 columns. Run Extraction (Step 6) first.')
+                    has_intensity_triplet = ('m0_intensity' in hdr and 'm1_intensity' in hdr and 'm2_intensity' in hdr and 'm3_intensity' in hdr)
+                    has_any_env_metric = ('m0_m1_gt_m2_m3' in hdr or 'envelope_ok' in hdr or 'm0_gt_m1_gt_m2' in hdr)
+                    if not has_intensity_triplet and not has_any_env_metric:
+                        st.error('Input CSV has no envelope intensity columns (m0/m1/m2/m3). Run Extraction (Step 6) first.')
                     else:
                         cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_envelope.py'),
                                '--input', env_input, '--output-dir', out_dir, '--no-plots']
                         _queue_run(cmd, 'Envelope', '_envelope.csv', needs_visualization=True, input_path=env_input)
+                        _execute_pending_run(stream_container=envelope_run_live)
                 except Exception as e:
                     st.error(f'Could not verify input: {e}')
-        _render_terminal()
         st.subheader('Envelope')
-        st.caption('Require M0, M+1, M+2 present and M0>M+1 OR M+1>M+2. Output: ..._envelope.csv. Plot buttons below generate per-peptide summed MS1 spectra for accepted/rejected sets.')
+        st.caption('Require M0, M+1, M+2, M+3 present and both M0/M+1 > M+2/M+3. Output: ..._envelope.csv. Plot buttons below generate per-peptide summed MS1 spectra for accepted/rejected sets.')
         envelope_preview = _resolve_preview_output('Envelope', step_outputs['envelope'])
         if envelope_preview:
             _render_step_output_csv(envelope_preview, 'step7_envelope', expanded=(csv_path == envelope_preview))
@@ -2222,18 +2545,18 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
             import plotly.express as px
             envelope_plots = []
             if has_envelope:
-                env_col = 'm0_gt_m1_gt_m2' if 'm0_gt_m1_gt_m2' in df_orig.columns else ('envelope_ok' if 'envelope_ok' in df_orig.columns else None)
+                env_col = 'm0_m1_gt_m2_m3' if 'm0_m1_gt_m2_m3' in df_orig.columns else ('m0_gt_m1_gt_m2' if 'm0_gt_m1_gt_m2' in df_orig.columns else ('envelope_ok' if 'envelope_ok' in df_orig.columns else None))
                 if env_col:
                     def _env_status(row):
                         v = row.get(env_col)
                         if pd.isna(v): return 'Missing'
-                        if _to_bool(v): return 'Pass (M0>M+1 or M+1>M+2)'
+                        if _to_bool(v): return 'Pass (M0 and M+1 > M+2 and M+3)'
                         return 'Fail'
                     env_status = df_orig.apply(_env_status, axis=1)
                     all_status = [_status_all(idx) for idx in df_orig.index]
                     plot_df = pd.DataFrame({'Envelope': env_status, 'All filters': all_status})
                     fig = px.histogram(plot_df, x='Envelope', color='All filters', barmode='stack',
-                                       title='Envelope (M0>M+1 OR M+1>M+2) — Pass all filters by category',
+                                       title='Envelope (M0 and M+1 > M+2 and M+3) — Pass all filters by category',
                                        color_discrete_map={'Fail': 'red', 'Pass': 'dodgerblue'})
                     _reorder_traces_smaller_on_top(fig, plot_df, 'All filters')
                     fig.update_layout(template='plotly_dark', height=PLOT_HEIGHT, margin=dict(l=40, r=20, t=40, b=40))
@@ -2241,7 +2564,7 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 if envelope_plots:
                     _plot_grid(envelope_plots)
             else:
-                st.caption('Load extraction CSV (with envelope_ok / m0_gt_m1_gt_m2) for envelope diagnostics.')
+                st.caption('Load extraction CSV with m0/m1/m2(/m3) intensity columns for envelope diagnostics.')
         else:
             st.caption("Click **Generate plots** to load envelope diagnostic plots.")
 
@@ -2282,7 +2605,7 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
         can_generate_env_summed = bool(env_plot_filter_input and os.path.exists(env_plot_filter_input) and mzml_path and os.path.exists(mzml_path))
 
         def _run_envelope_summed_ms1_plots(mode: str, target_dir: str) -> bool:
-            """Run summed MS1 plot generation inline and stream newly saved PNGs live."""
+            """Run summed MS1 plot generation using the shared single-terminal runner."""
             if mode not in ('accepted', 'rejected'):
                 st.error(f'Unknown mode: {mode}')
                 return False
@@ -2295,66 +2618,14 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                         '--mode', mode,
                         '--output-dir', target_dir,
                         '--clear-output']
-            env, run_cmd = _build_env_and_cmd(plot_cmd, needs_visualization=True)
-            work_dir = os.path.abspath(_SCRIPT_DIR)
-            terminal_lines = []
-            returncode = -1
-            status_label = f"Envelope summed MS1 {mode} plots"
-            with st.status(f'Running {status_label}…', expanded=True) as status:
-                st.caption(f"Command: {' '.join(run_cmd)}")
-                stream_box = st.empty()
-                progress_box = st.empty()
-                gallery_box = st.empty()
-                try:
-                    proc = subprocess.Popen(
-                        run_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding='utf-8',
-                        errors='replace',
-                        bufsize=1,
-                        cwd=work_dir,
-                        env=env,
-                    )
-                    while True:
-                        line = proc.stdout.readline()
-                        if line:
-                            ln = line.rstrip()
-                            if ln:
-                                terminal_lines.append(ln)
-                                if len(terminal_lines) > 250:
-                                    terminal_lines = terminal_lines[-250:]
-                                stream_box.code('\n'.join(terminal_lines), language=None)
-                        pngs = []
-                        if os.path.isdir(target_dir):
-                            try:
-                                pngs = [os.path.join(target_dir, f) for f in os.listdir(target_dir) if f.lower().endswith('.png')]
-                            except OSError:
-                                pngs = []
-                        progress_box.caption(f"Saved {len(pngs)} {mode} summed MS1 plots so far…")
-                        if pngs:
-                            recent = sorted(pngs, key=lambda p: os.path.getmtime(p))[-4:]
-                            with gallery_box.container():
-                                st.markdown('**Latest saved plots**')
-                                cols = st.columns(2)
-                                for i, img in enumerate(recent):
-                                    with cols[i % 2]:
-                                        st.image(img, width=450, caption=os.path.basename(img))
-                        if not line and proc.poll() is not None:
-                            break
-                    returncode = proc.wait()
-                except Exception as e:
-                    terminal_lines.append(f"[Error running {status_label}: {e}]")
-                    returncode = 1
-                out_text = '\n'.join(terminal_lines).strip() or '(No output)'
-                st.session_state.script_output = out_text
-                st.session_state.script_step = status_label
-                if returncode == 0:
-                    status.update(label=f'{status_label} complete', state='complete')
-                    return True
-                status.update(label=f'{status_label} failed', state='error')
-                return False
+            _queue_run(
+                plot_cmd,
+                f'Envelope summed MS1 {mode} plots',
+                '_envelope_summed_ms1',
+                needs_visualization=True,
+                input_path=env_plot_filter_input,
+            )
+            return _execute_pending_run(stream_container=envelope_run_live)
 
         for key in ['show_envelope_accepted', 'show_envelope_rejected']:
             if key not in st.session_state:
@@ -2400,6 +2671,7 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 st.info('Click **Generate Plots Rejected Envelopes** to generate summed MS1 envelope plots.')
 
     with filter_tabs[9]:  # Significance (combined: 5ppm + min sig frags + 1% max, all from summed MS2)
+        sig_frag_run_live = st.container()
         run_sig_frag = st.button('Run Significant fragmentation', key='run_sig_frag',
                                  help='5 ppm + min sig frags + 1% max (all from summed extracted MS2)')
         if run_sig_frag:
@@ -2430,11 +2702,18 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                     min_frac = sig_frac_pct / 100.0
                     cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_significant_frags_summed_ms2.py'),
                            '--mzml', mzml_path, '--input', sig_frag_input, '--output-dir', out_dir,
-                           '--ppm', str(ppm_thresh), '--min-frac', str(min_frac), '--min-sig-frags', str(min_sig_frag_count)]
+                           '--ppm', str(ppm_thresh), '--min-frac', str(min_frac), '--min-sig-frags', str(min_sig_frag_count),
+                           '--min-overhangs', '2']
                     _queue_run(cmd, 'Significant fragmentation', '_significance.csv', needs_visualization=True, input_path=sig_frag_input)
-        _render_terminal()
+                    _execute_pending_run(stream_container=sig_frag_run_live)
         st.subheader('Significant fragmentation')
-        st.caption('5 ppm + min sig frags + 1% max peak (all from summed extracted MS2). Run Extraction first.')
+        st.caption('5 ppm + min sig frags + min 2 significant single-AA overhangs + 1% max peak (all from summed extracted MS2). Run Extraction first.')
+        st.info(
+            f"Current significance metrics: PPM tolerance = `{ppm_thresh:.1f}` | "
+            f"Min significant fragments = `{int(min_sig_frag_count)}` | "
+            f"Min single-AA overhangs = `2` | "
+            f"Min fragment intensity = `{sig_frac_pct:.1f}%` of max summed MS2"
+        )
         sig_preview = _resolve_preview_output('Significant fragmentation', step_outputs['significance'])
         if sig_preview:
             _render_step_output_csv(sig_preview, 'sig_frag_output', expanded=(csv_path == sig_preview))
@@ -2600,8 +2879,9 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
             st.info('No significant_frags column. Run Significant fragmentation.')
 
     with filter_tabs[10]:  # Sequence
+        seq_cov_run_live = st.container()
         st.subheader('Sequence')
-        st.caption('Unique peptides grid plots + protect_peptide column. Output: ..._prefilter_extraction_envelope_significance_sequence.csv')
+        st.caption('Unique peptides grid plots + valuable_sequence/protect_peptide columns. Output: ..._prefilter_extraction_envelope_significance_sequence.csv')
         try:
             seq_cov_input = None
             for candidate in [step_outputs.get('significance'), step_outputs.get('envelope'), step_outputs.get('extraction')]:
@@ -2622,7 +2902,7 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                            '--input', seq_cov_input, '--output-dir', out_dir,
                            '--sequence-coverage-dir', seq_cov_dir, '--fasta', fasta_path]
                     _queue_run(cmd, 'Sequence coverage', '_sequence.csv', needs_visualization=True, input_path=seq_cov_input)
-            _render_terminal()
+                    _execute_pending_run(stream_container=seq_cov_run_live)
             seq_output_path = _resolve_preview_output('Sequence coverage', step_outputs.get('sequence'))
             if seq_output_path and os.path.exists(seq_output_path):
                 _render_step_output_csv(seq_output_path, 'seq_cov_sequence', expanded=False)
@@ -2650,8 +2930,6 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
             st.error(f'Sequence tab error: {e}')
             import traceback
             st.code(traceback.format_exc())
-
-        _render_terminal()
 
     with filter_tabs[11]:  # D_MZ (Estimated Deuterated MZ target range)
         st.subheader('Estimated Deuterated MZ target range calculation')

@@ -2599,7 +2599,7 @@ def find_peak_boundaries(chromatogram, ms1_rts, group_data=None, rt_anchor=None,
 FILTERING_CRITERIA_PLOT = (
     "XIC ppm=20 | anchor mz/rt=20ppm/60s | pre-filter: (no E-value threshold) | "
     "score=0.28 coel + 0.28 shape + 0.14 ratio + 0.12 RT_cov + 0.05 rt_prior + 0.05 quality + 0.20 strength | "
-    "accept: M0, M+1, M+2 present; M+0>M+1 or M+1>M+2 (envelope) | PSM: q≤0.05, PEP≤0.05"
+    "accept: M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3 | PSM: q≤0.05, PEP≤0.05"
 )
 
 
@@ -2934,13 +2934,17 @@ def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, 
         m0 = observed_iso.get(0, {}).get('max_intensity', 0.0)
         m1 = observed_iso.get(1, {}).get('max_intensity', 0.0)
         m2 = observed_iso.get(2, {}).get('max_intensity', 0.0)
-        has_required_isotopes = all(i in observed_iso for i in (0, 1, 2))
-        envelope_ok = bool(has_required_isotopes and ((m0 > m1) or (m1 > m2)))
+        m3 = observed_iso.get(3, {}).get('max_intensity', 0.0)
+        has_required_isotopes = all(i in observed_iso for i in (0, 1, 2, 3))
+        m0_m1_gt_m2_m3 = bool(has_required_isotopes and (m0 > m2) and (m0 > m3) and (m1 > m2) and (m1 > m3))
+        envelope_ok = bool(m0_m1_gt_m2_m3)
         metrics = {
             'matched_iso_indices': sorted(matched_iso_indices),
             'observed_iso': observed_iso,
             'has_required_isotopes': has_required_isotopes,
+            'm0_m1_gt_m2_m3': m0_m1_gt_m2_m3 if has_required_isotopes else False,
             'm0_gt_m1_gt_m2': bool((m0 > m1) or (m1 > m2)) if has_required_isotopes else False,
+            'm2_le_m0': bool(m2 <= m0) if has_required_isotopes else False,
             'passes_envelope': envelope_ok,
         }
         return fig, metrics
@@ -3226,12 +3230,23 @@ def run_plots_from_dataframe(args):
         return s in ('true', '1', 'yes')
 
     # Apply filtering criteria from the dataframe columns (no mzML needed).
-    # Require: (1) M0, M+1, M+2 present (has_required_isotopes); (2) envelope M+0 > M+1 OR M+1 > M+2 (envelope_ok).
+    # Require: (1) M0, M+1, M+2, M+3 present (has_required_isotopes);
+    #          (2) M0 and M+1 > M+2 and M+3.
     status_list = []
     rejection_reasons = []
     for _, row in df.iterrows():
         has_required = _to_bool(row.get('has_required_isotopes', False))
-        envelope_ok = _to_bool(row.get('envelope_ok', False))
+        if 'm0_m1_gt_m2_m3' in df.columns and not pd.isna(row.get('m0_m1_gt_m2_m3')):
+            envelope_ok = _to_bool(row.get('m0_m1_gt_m2_m3', False))
+        else:
+            i0 = pd.to_numeric(pd.Series([row.get('m0_intensity')]), errors='coerce').iloc[0]
+            i1 = pd.to_numeric(pd.Series([row.get('m1_intensity')]), errors='coerce').iloc[0]
+            i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
+            i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
+            if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
+                envelope_ok = bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+            else:
+                envelope_ok = _to_bool(row.get('envelope_ok', False))
         mods = row.get('modifications', '-')
         if has_required and envelope_ok and not (exclude_mods and _has_modifications(mods)):
             status_list.append('accepted')
@@ -3239,9 +3254,9 @@ def run_plots_from_dataframe(args):
         else:
             status_list.append('rejected')
             if not has_required:
-                rejection_reasons.append('Summed MS1 must contain M0, M+1, and M+2')
+                rejection_reasons.append('Summed MS1 must contain M0, M+1, M+2, and M+3')
             elif not envelope_ok:
-                rejection_reasons.append(str(row.get('rejection_reason', 'Isotopic envelope must have M+0 > M+1 or M+1 > M+2')) or 'Isotopic envelope must have M+0 > M+1 or M+1 > M+2')
+                rejection_reasons.append(str(row.get('rejection_reason', 'Isotopic envelope must satisfy M0 and M+1 > M+2 and M+3')) or 'Isotopic envelope must satisfy M0 and M+1 > M+2 and M+3')
             else:
                 rejection_reasons.append('Excluded: peptide has modifications (--exclude-mods)')
 
@@ -5963,28 +5978,28 @@ def run_chromatograms(args):
                         s = str(m).strip().lower()
                         return s not in ('', '-', 'nan', 'none')
                 
-                    # Required isotope indices: M0, M+1, M+2 (summed MS1 must contain all three)
-                    REQUIRED_ISOTOPE_INDICES = (0, 1, 2)  # M0, M+1, M+2
+                    # Required isotope indices: M0, M+1, M+2, M+3 (summed MS1 must contain all four)
+                    REQUIRED_ISOTOPE_INDICES = (0, 1, 2, 3)  # M0, M+1, M+2, M+3
     
                     # Helper function to check if isotopic matches pass filtering criteria
                     def check_isotopic_matches_passed(matched_indices, spectrum_name):
-                        """Check if matched isotopic indices include M0, M+1, and M+2.
+                        """Check if matched isotopic indices include M0, M+1, M+2, and M+3.
                         Returns (passed, reason) tuple."""
                         if len(matched_indices) == 0:
                             return False, f"No isotopic peaks matched in {spectrum_name}"
                         sorted_indices = sorted(matched_indices)
                         matched_iso_names = [f'M+{i}' for i in sorted_indices]
-                        # Require M0, M+1, and M+2
+                        # Require M0, M+1, M+2, and M+3
                         missing = [i for i in REQUIRED_ISOTOPE_INDICES if i not in matched_indices]
                         if missing:
                             missing_names = [f'M+{i}' for i in sorted(missing)]
-                            return False, f"Summed MS1 must contain M0, M+1, and M+2 (missing: {', '.join(missing_names)}; matched: {', '.join(matched_iso_names)})"
+                            return False, f"Summed MS1 must contain M0, M+1, M+2, and M+3 (missing: {', '.join(missing_names)}; matched: {', '.join(matched_iso_names)})"
                         return True, None
     
                     # Check summed spectrum in the INTEGRATION WINDOW (detected_peak_min_rt..max_rt) only.
                     # Core envelope logic (for CSV columns):
-                    #   1) M0, M+1, M+2 present (highest-intensity peak within +/-5 ppm per isotope)
-                    #   2) M0 > M+1 OR M+1 > M+2 using those matched intensities
+                    #   1) M0, M+1, M+2, M+3 present (highest-intensity peak within +/-5 ppm per isotope)
+                    #   2) M0 and M+1 are both > M+2 and M+3
                     core_peak_metrics = get_isotope_peak_metrics(
                         spec_mzs_windowed_integration, spec_ints_windowed_integration, isotope_mzs, ppm_tol=5.0
                     )
@@ -5994,17 +6009,25 @@ def run_chromatograms(args):
                     I0 = float(core_peak_metrics.get(0, {}).get('intensity', 0.0))
                     I1 = float(core_peak_metrics.get(1, {}).get('intensity', 0.0))
                     I2 = float(core_peak_metrics.get(2, {}).get('intensity', 0.0))
+                    I3 = float(core_peak_metrics.get(3, {}).get('intensity', 0.0))
                     m0_gt_m1 = has_required_in_window and I0 > 0 and I1 > 0 and I0 > I1
                     m1_gt_m2 = has_required_in_window and I1 > 0 and I2 > 0 and I1 > I2
                     m0_gt_m1_gt_m2 = bool(m0_gt_m1 or m1_gt_m2)
-                    envelope_ok = m0_gt_m1_gt_m2
+                    m2_le_m0 = bool(has_required_in_window and I2 <= I0)
+                    m0_m1_gt_m2_m3 = bool(has_required_in_window and (I0 > I2) and (I0 > I3) and (I1 > I2) and (I1 > I3))
+                    envelope_ok = bool(m0_m1_gt_m2_m3)
 
-                    # When re-extracting with a primary/alternate filter CSV, trust m0_gt_m1_gt_m2 from the filter
-                    # (those peptides already passed M+0 > M+1 or M+1 > M+2 in the initial run; re-checking in a different
+                    # When re-extracting with a primary/alternate filter CSV, trust envelope criterion from the filter
+                    # (those peptides already passed the envelope criterion in the initial run; re-checking in a different
                     # extraction window can falsely reject due to window shift/narrowing.)
                     filter_envelope_trusted = False
-                    if filter_csv and 'm0_gt_m1_gt_m2' in group.columns and len(group) > 0:
-                        v = group['m0_gt_m1_gt_m2'].iloc[0]
+                    if filter_csv and len(group) > 0:
+                        if 'm0_m1_gt_m2_m3' in group.columns:
+                            v = group['m0_m1_gt_m2_m3'].iloc[0]
+                        elif 'm0_gt_m1_gt_m2' in group.columns:
+                            v = group['m0_gt_m1_gt_m2'].iloc[0]
+                        else:
+                            v = None
                         if v is not None and not (isinstance(v, float) and pd.isna(v)):
                             if isinstance(v, bool) and v:
                                 filter_envelope_trusted = True
@@ -6017,7 +6040,7 @@ def run_chromatograms(args):
                         # Require M0, M+1, M+2 present even when trusting filter envelope
                         envelope_ok = has_required_in_window
                         if not envelope_ok:
-                            rejection_reason = "Summed MS1 must contain M0, M+1, and M+2"
+                            rejection_reason = "Summed MS1 must contain M0, M+1, M+2, and M+3"
                             is_rejected = True
                         else:
                             is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
@@ -6026,7 +6049,7 @@ def run_chromatograms(args):
                         # Require M0, M+1, M+2 present even in no-filter run
                         envelope_ok = has_required_in_window
                         if not envelope_ok:
-                            rejection_reason = "Summed MS1 must contain M0, M+1, and M+2"
+                            rejection_reason = "Summed MS1 must contain M0, M+1, M+2, and M+3"
                             is_rejected = True
                         else:
                             is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
@@ -8262,7 +8285,7 @@ def run_chromatograms(args):
                 mz_vals = group['mz'].dropna().unique().tolist() if 'mz' in group.columns else []
                 rt_range = max(ms1_rts_table) - min(ms1_rts_table) if len(ms1_rts_table) > 1 else 0
         
-                # m0_gt_m1_gt_m2 / envelope_ok are computed above from strict summed-MS1
+                # Envelope metrics are computed above from strict summed-MS1
                 # integration-window logic (highest peak within +/-5 ppm for M0/M+1/M+2).
                 apex_intensity_val = best_peak.get('apex_intensity') if best_peak else None
         
@@ -8272,7 +8295,6 @@ def run_chromatograms(args):
                 'charge': charge,
                 'modifications': mods if pd.notna(mods) else '-',
                 'has_required_isotopes': has_required_in_window,
-                'envelope_ok': envelope_ok,
                 'status': 'rejected' if is_rejected else 'accepted',
                 'rejection_reason': rejection_reason if is_rejected else '',
                 'num_psms': len(group),
@@ -8296,10 +8318,11 @@ def run_chromatograms(args):
                 'using_anchor_window': using_anchor_window,
                 'n_isotopic_matches': len(core_matched_indices),
                 'matched_isotopes': ', '.join([f'M+{i}' for i in core_matched_indices]) if core_matched_indices else '',
-                'm0_gt_m1_gt_m2': m0_gt_m1_gt_m2,
+                'm0_m1_gt_m2_m3': m0_m1_gt_m2_m3,
                 'm0_intensity': I0 if has_required_in_window else 0.0,
                 'm1_intensity': I1 if has_required_in_window else 0.0,
                 'm2_intensity': I2 if has_required_in_window else 0.0,
+                'm3_intensity': I3 if has_required_in_window else 0.0,
                 'm0_ppm_error': core_peak_metrics.get(0, {}).get('ppm_error'),
                 'm1_ppm_error': core_peak_metrics.get(1, {}).get('ppm_error'),
                 'm2_ppm_error': core_peak_metrics.get(2, {}).get('ppm_error'),
@@ -8541,7 +8564,8 @@ def run_chromatograms(args):
             'detected_peak_min_rt', 'detected_peak_max_rt', 'detected_peak_window_size',
             'collection_min_rt', 'collection_max_rt', 'collection_window_size',
             'spectrum_window_min_rt', 'spectrum_window_max_rt', 'spectrum_window_size',
-            'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes', 'envelope_ok', 'm0_gt_m1_gt_m2',
+            'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes',
+            'm0_m1_gt_m2_m3', 'm0_intensity', 'm1_intensity', 'm2_intensity', 'm3_intensity',
             'precursor_mz', 'sequence_start_pos', 'ppm_at_apex',
             'best_score', 'n_candidates', 'total_area', 'coelution_score', 'shape_corr'
         ]
@@ -8640,6 +8664,23 @@ def run_chromatograms(args):
             if front_cols or ms1_cols or frag_tail or ms2_tail:
                 lead_cols = [c for c in df_fmt.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_tail]
                 df_fmt = df_fmt[front_cols + ms1_cols + lead_cols + frag_tail + ms2_tail]
+
+            # Place ppm_at_apex immediately after MS1_mz_error_ppm for extraction readability.
+            if 'MS1_mz_error_ppm' in df_fmt.columns and 'ppm_at_apex' in df_fmt.columns:
+                cols = list(df_fmt.columns)
+                cols.remove('ppm_at_apex')
+                insert_idx = cols.index('MS1_mz_error_ppm') + 1
+                cols = cols[:insert_idx] + ['ppm_at_apex'] + cols[insert_idx:]
+                df_fmt = df_fmt[cols]
+
+            # Final ordering rule: RT columns explicitly in seconds always go last.
+            rt_sec_cols = [
+                c for c in df_fmt.columns
+                if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+            ]
+            if rt_sec_cols:
+                non_rt_sec_cols = [c for c in df_fmt.columns if c not in rt_sec_cols]
+                df_fmt = df_fmt[non_rt_sec_cols + rt_sec_cols]
 
             return df_fmt
         windows_lookup = {}
@@ -10224,7 +10265,8 @@ def run_chromatograms(args):
                 'detected_peak_min_rt', 'detected_peak_max_rt', 'detected_peak_window_size',
                 'collection_min_rt', 'collection_max_rt', 'collection_window_size',
                 'spectrum_window_min_rt', 'spectrum_window_max_rt', 'spectrum_window_size',
-                'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes', 'envelope_ok', 'm0_gt_m1_gt_m2',
+                'using_anchor_window', 'n_isotopic_matches', 'matched_isotopes',
+                'm0_m1_gt_m2_m3', 'm0_intensity', 'm1_intensity', 'm2_intensity', 'm3_intensity',
                 'precursor_mz', 'sequence_start_pos', 'ppm_at_apex',
                 'best_score', 'n_candidates', 'total_area', 'coelution_score'
             ]

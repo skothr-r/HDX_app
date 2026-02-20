@@ -3,8 +3,8 @@
 Generate per-peptide summed MS1 spectrum plots for Envelope step.
 
 Classification criteria (from plotted summed MS1 spectrum):
-  1) M0, M+1, M+2 present (highest-intensity match within +/-5 ppm for each)
-  2) M+0 > M+1 OR M+1 > M+2 (using those matched intensities)
+  1) M0, M+1, M+2, M+3 present (highest-intensity match within +/-5 ppm for each)
+  2) M0 and M+1 are both > M+2 and M+3
 
 Usage:
   python generate_envelope_summed_ms1_plots.py \
@@ -36,6 +36,49 @@ def _mods_norm(v):
     return "-" if not s or s.lower() == "nan" else s
 
 
+def _to_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _resolve_rt_window_seconds(row):
+    """
+    Resolve RT window in seconds across legacy/new extraction column names.
+    Returns (min_rt_sec, max_rt_sec) or (None, None).
+    """
+    # Preferred direct seconds columns
+    min_rt = _to_float(row.get("detected_peak_min_rt"))
+    max_rt = _to_float(row.get("detected_peak_max_rt"))
+    if min_rt is None or max_rt is None:
+        min_rt = _to_float(row.get("collection_min_rt"))
+        max_rt = _to_float(row.get("collection_max_rt"))
+    if min_rt is None or max_rt is None:
+        min_rt = _to_float(row.get("MS1_RT_integration_start_sec"))
+        max_rt = _to_float(row.get("MS1_RT_integration_stop_sec"))
+    if min_rt is None or max_rt is None:
+        min_rt = _to_float(row.get("MS1_RT_collection_start_sec"))
+        max_rt = _to_float(row.get("MS1_RT_collection_stop_sec"))
+    # Minutes fallbacks
+    if min_rt is None or max_rt is None:
+        min_min = _to_float(row.get("MS1_RT_integration_start_minutes"))
+        max_min = _to_float(row.get("MS1_RT_integration_stop_minutes"))
+        if min_min is not None and max_min is not None:
+            min_rt, max_rt = min_min * 60.0, max_min * 60.0
+    if min_rt is None or max_rt is None:
+        min_min = _to_float(row.get("MS1_RT_collection_start_minutes"))
+        max_min = _to_float(row.get("MS1_RT_collection_stop_minutes"))
+        if min_min is not None and max_min is not None:
+            min_rt, max_rt = min_min * 60.0, max_min * 60.0
+
+    if min_rt is None or max_rt is None:
+        return (None, None)
+    if max_rt < min_rt:
+        min_rt, max_rt = max_rt, min_rt
+    return (min_rt, max_rt)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate Envelope summed MS1 plots.")
     ap.add_argument("--input", "-i", required=True, help="Envelope-step input CSV (typically latest _extraction.csv)")
@@ -65,9 +108,13 @@ def main():
         return
 
     # Plot one spectrum per unique peptide key.
-    pep_col = "plain_peptide" if "plain_peptide" in df.columns else ("peptide" if "peptide" in df.columns else "sequence")
+    pep_col = (
+        "plain_peptide" if "plain_peptide" in df.columns else
+        ("peptide" if "peptide" in df.columns else
+         ("peptide_sequence" if "peptide_sequence" in df.columns else "sequence"))
+    )
     if pep_col not in df.columns or "charge" not in df.columns:
-        print("Error: input CSV must contain peptide/plain_peptide/sequence and charge columns.")
+        print("Error: input CSV must contain one of plain_peptide/peptide/peptide_sequence/sequence and charge columns.")
         sys.exit(1)
     df["_mods"] = df.apply(lambda r: _mods_norm(r.get("modifications", "-")), axis=1)
     df["_key"] = df.apply(lambda r: f"{str(r.get(pep_col, '')).strip()}_{int(r.get('charge', 0) or 0)}_{r['_mods']}", axis=1)
@@ -94,7 +141,10 @@ def main():
         key = row["_key"]
         out_name = _safe_name(key) + ".png"
         out_path = os.path.join(args.output_dir, out_name)
-        result = create_summed_ms1_spectrum_figure(row, args.mzml, peptide_key=key, return_metrics=True)
+        min_rt, max_rt = _resolve_rt_window_seconds(row)
+        result = create_summed_ms1_spectrum_figure(
+            row, args.mzml, min_rt=min_rt, max_rt=max_rt, peptide_key=key, return_metrics=True
+        )
         if result is None:
             failed += 1
             continue

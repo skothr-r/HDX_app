@@ -2,10 +2,11 @@
 """
 Step 8: Assess peptide sequence coverage and add valuable_sequence + protect_peptide columns.
 
-Identifies parts of the full protein sequence with very little coverage (<2 single
-AA overhangs). Peptides that cover such regions get valuable_sequence=1 and protect_peptide=True;
-others get 0/False. protect_peptide=True prioritizes peptides for channel assignment and
-prevents them from being dropped during sequence assignment.
+Identifies protein positions where a significant single-AA overhang is unique to one
+peptide (i.e., no other peptide covers that protein position). Peptides that cover any
+such unique position get valuable_sequence=1 and protect_peptide=True; others get 0/False.
+protect_peptide=True prioritizes peptides for channel assignment and prevents them from
+being dropped during sequence assignment.
 
 Output: ..._prefilter_extraction_envelope_significance_sequence.csv
 
@@ -27,7 +28,6 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-MIN_OVERHANGS_FOR_COVERAGE = 2  # positions with <2 overhangs = low coverage
 DEFAULT_INPUT = os.path.join(_PROJECT_ROOT, 'data', 'comet_frags_perc_openMS_prefilter_extraction_envelope_significance.csv')
 DEFAULT_FASTA = os.path.join(_PROJECT_ROOT, 'data', 'Ube2D3.fasta')
 
@@ -83,8 +83,6 @@ def main():
                     help='Directory for unique peptides plots (default: output-dir/sequence_coverage)')
     ap.add_argument('--fasta', '-f', default=DEFAULT_FASTA, help=f'FASTA file for unique peptides plots (default: {os.path.basename(DEFAULT_FASTA)})')
     ap.add_argument('--protein-id', default=None, help='Protein ID in FASTA (default: first sequence)')
-    ap.add_argument('--min-overhangs', type=int, default=MIN_OVERHANGS_FOR_COVERAGE,
-                    help=f'Positions with fewer overhangs = low coverage (default: {MIN_OVERHANGS_FOR_COVERAGE})')
     ap.add_argument('--debug', action='store_true', help='Print extra debug messages')
     args = ap.parse_args()
 
@@ -159,25 +157,25 @@ def main():
         for p in positions:
             position_coverage[p] += 1
 
-    low_coverage_positions = {p for p, c in position_coverage.items() if c < args.min_overhangs}
+    unique_overhang_positions = {p for p, c in position_coverage.items() if c == 1}
     if args.debug:
-        print(f"[Step 8] DEBUG: {len(position_coverage)} positions with coverage; {len(low_coverage_positions)} low-coverage (<{args.min_overhangs})", flush=True)
+        print(f"[Step 8] DEBUG: {len(position_coverage)} positions with overhang coverage; {len(unique_overhang_positions)} unique positions (covered by one peptide)", flush=True)
         if position_coverage:
             cov_vals = sorted(position_coverage.values(), reverse=True)
             print(f"[Step 8] DEBUG: Coverage range: min={min(cov_vals)}, max={max(cov_vals)}, median={cov_vals[len(cov_vals)//2]}", flush=True)
 
-    # valuable_sequence = 1 if peptide covers any low-coverage position
+    # valuable_sequence = 1 if peptide covers any unique overhang position
     # protect_peptide = True/False for channel assignment priority and to avoid dropping during sequence assignment
     df['valuable_sequence'] = 0
     df['protect_peptide'] = False
     for idx in df.index:
         positions = peptide_to_positions.get(idx, set())
-        if positions & low_coverage_positions:
+        if positions & unique_overhang_positions:
             df.at[idx, 'valuable_sequence'] = 1
             df.at[idx, 'protect_peptide'] = True
 
     n_valuable = (df['valuable_sequence'] == 1).sum()
-    print(f"[Step 8] Low-coverage positions (<{args.min_overhangs} overhangs): {len(low_coverage_positions)}", flush=True)
+    print(f"[Step 8] Unique overhang positions (covered by one peptide): {len(unique_overhang_positions)}", flush=True)
     print(f"[Step 8] Peptides with protect_peptide=True (valuable_sequence=1): {n_valuable} / {len(df)}", flush=True)
     # Standardize legacy retention_time headers to RT headers.
     for old, new in [
@@ -221,6 +219,15 @@ def main():
         df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
         df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
         df = df.drop(columns=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'])
+
+    # Final ordering rule: RT columns explicitly in seconds always go last.
+    rt_sec_cols = [
+        c for c in df.columns
+        if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+    ]
+    if rt_sec_cols:
+        non_rt_sec_cols = [c for c in df.columns if c not in rt_sec_cols]
+        df = df[non_rt_sec_cols + rt_sec_cols]
 
     print("[Step 8] Writing output CSV...", flush=True)
     df.to_csv(out_csv, index=False)

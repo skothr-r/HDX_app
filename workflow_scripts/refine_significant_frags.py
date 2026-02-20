@@ -439,6 +439,14 @@ def main():
     if front_cols or ms1_cols or frag_tail or ms2_cols:
         lead_cols = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
         df = df[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
+    # Final ordering rule: RT columns explicitly in seconds always go last.
+    rt_sec_cols = [
+        c for c in df.columns
+        if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+    ]
+    if rt_sec_cols:
+        non_rt_sec_cols = [c for c in df.columns if c not in rt_sec_cols]
+        df = df[non_rt_sec_cols + rt_sec_cols]
 
     _log("[Step 8] Writing output CSV...")
     df.to_csv(out_csv, index=False)

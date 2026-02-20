@@ -396,6 +396,15 @@ def main():
             else:
                 df_filtered = df_filtered.rename(columns={old: new})
 
+    # Final ordering rule: RT columns explicitly in seconds always go last.
+    rt_sec_cols = [
+        c for c in df_filtered.columns
+        if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+    ]
+    if rt_sec_cols:
+        non_rt_sec_cols = [c for c in df_filtered.columns if c not in rt_sec_cols]
+        df_filtered = df_filtered[non_rt_sec_cols + rt_sec_cols]
+
     df_filtered.to_csv(out_csv, index=False)
     n_scans_dropped = n_total - n_pass
     print(f"Significant fragmentation: Output: {out_csv} ({n_pass} scans retained, {n_scans_dropped} scans discarded (0 fragments); {n_frag_excluded} fragments excluded by {args.ppm} ppm)")

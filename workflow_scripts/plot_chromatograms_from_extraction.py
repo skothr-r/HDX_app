@@ -36,6 +36,8 @@ def main():
                     help='Override accepted plots directory (default: output-dir/extraction)')
     ap.add_argument('--output-rejected-dir', default=None,
                     help='Override rejected plots directory (default: output-dir/rejected_extraction)')
+    ap.add_argument('--clear-output', action='store_true',
+                    help='Delete existing PNGs in accepted/rejected output dirs before plotting')
     args = ap.parse_args()
 
     if args.chromatogram_metrics_csv:
@@ -56,6 +58,20 @@ def main():
     accepted_dir = args.output_accepted_dir or os.path.join(out_dir, 'extraction')
     rejected_dir = args.output_rejected_dir or os.path.join(out_dir, 'rejected_extraction')
     dataframes_dir = os.path.dirname(metrics_csv)
+
+    if args.clear_output:
+        for d in (accepted_dir, rejected_dir):
+            if not os.path.isdir(d):
+                continue
+            try:
+                for name in os.listdir(d):
+                    if name.lower().endswith('.png'):
+                        try:
+                            os.remove(os.path.join(d, name))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
 
     if not os.path.exists(metrics_csv):
         print(f'Error: chromatogram_metrics_all.csv not found: {metrics_csv}')
@@ -86,6 +102,8 @@ def main():
         print(f'[Plot Chromatograms] Filter CSV: {args.filter_csv} (current step peptide list used for plotting)')
     print(f'[Plot Chromatograms] Traces: {traces_path}')
     print(f'[Plot Chromatograms] Output: {accepted_dir} / {rejected_dir}')
+    if args.clear_output:
+        print('[Plot Chromatograms] Cleared existing PNGs before plotting')
     run_chromatograms(ns)
 
 

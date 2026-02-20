@@ -400,6 +400,14 @@ def main():
         rest = [c for c in out.columns if c not in lead and c not in frag_tail and c not in ms1_cols and c not in ms2_cols]
         col_order = lead + ms1_cols + rest + frag_tail + ms2_cols
         out = out[[c for c in col_order if c in out.columns]]
+        # Final ordering rule: RT columns explicitly in seconds always go last.
+        rt_sec_cols = [
+            c for c in out.columns
+            if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+        ]
+        if rt_sec_cols:
+            non_rt_sec_cols = [c for c in out.columns if c not in rt_sec_cols]
+            out = out[non_rt_sec_cols + rt_sec_cols]
         if out.empty:
             return out
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Combined significant fragmentation: 5 ppm + min sig frags + 1% max MS2 (all from summed extracted MS2).
+Combined significant fragmentation: 5 ppm + min sig frags + min single-AA overhangs + 1% max MS2
+(all from summed extracted MS2).
 
 Uses summed MS2 spectrum in the integration window for all three filters:
   1) 5 ppm: keep fragments with peak within 5 ppm of theoretical c/z/z+1 m/z
@@ -13,7 +14,7 @@ Output: significant_frags columns (pass all 3 criteria: 5 ppm, min sig frags, 1%
 
 Usage:
   python filter_significant_frags_summed_ms2.py --mzml file.mzML --input extraction.csv --output-dir results
-  python filter_significant_frags_summed_ms2.py --mzml file.mzML --input extraction.csv --min-frac 0.01 --ppm 5 --min-sig-frags 3
+  python filter_significant_frags_summed_ms2.py --mzml file.mzML --input extraction.csv --min-frac 0.01 --ppm 5 --min-sig-frags 5 --min-overhangs 2
 """
 
 import argparse
@@ -29,7 +30,8 @@ if _PROJECT_ROOT not in sys.path:
 
 MIN_INTENSITY_FRAC = 0.01  # 1% of max MS2
 PPM_THRESHOLD = 5.0
-MIN_SIG_FRAGS = 3
+MIN_SIG_FRAGS = 5
+MIN_SINGLE_AA_OVERHANGS = 2
 DEFAULT_INPUT = os.path.join(_PROJECT_ROOT, 'data', 'comet_frags_perc_openMS_prefilter_extraction_envelope.csv')
 DEFAULT_MZML = os.path.join(_PROJECT_ROOT, 'data', 'WT_nep2_0MUrea_08.mzML')
 
@@ -86,9 +88,47 @@ def _significant_pairs_and_overhangs_from_ions(sig_ions, peptide):
     return pairs_str, overhang_str
 
 
+def _first_nonempty_str(row, candidates):
+    """Return first non-empty/non-NaN string value from candidate columns."""
+    for c in candidates:
+        v = row.get(c)
+        if v is None:
+            continue
+        try:
+            import pandas as pd  # local import to keep helper standalone
+            if pd.isna(v):
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        if s and s.lower() != 'nan':
+            return s
+    return ''
+
+
+def _unique_peptide_stats(df):
+    """Return unique peptide counts for sequence-only and peptide+charge."""
+    if df is None or len(df) == 0:
+        return 0, 0
+    pep_set = set()
+    pep_charge_set = set()
+    for _, row in df.iterrows():
+        pep = _first_nonempty_str(row, ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'])
+        if not pep:
+            continue
+        pep_set.add(pep)
+        ch = row.get('charge')
+        try:
+            ch_i = int(float(ch)) if ch is not None else None
+        except Exception:
+            ch_i = None
+        pep_charge_set.add((pep, ch_i))
+    return len(pep_set), len(pep_charge_set)
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description='Combined significant fragmentation: 5 ppm + min sig frags + 1%% max MS2 (all from summed MS2).'
+        description='Combined significant fragmentation: 5 ppm + min sig frags + min single-AA overhangs + 1%% max MS2 (all from summed MS2).'
     )
     ap.add_argument('--mzml', '-m', default=DEFAULT_MZML, help=f'Path to mzML file')
     ap.add_argument('--input', '-i', default=DEFAULT_INPUT, help='Input CSV from extraction (has RT windows)')
@@ -99,6 +139,8 @@ def main():
                     help=f'Min fragment signal as fraction of max MS2 (default: {MIN_INTENSITY_FRAC})')
     ap.add_argument('--min-sig-frags', type=int, default=MIN_SIG_FRAGS,
                     help=f'Min significant fragments per row (default: {MIN_SIG_FRAGS})')
+    ap.add_argument('--min-overhangs', type=int, default=MIN_SINGLE_AA_OVERHANGS,
+                    help=f'Min significant single-AA overhangs per row (default: {MIN_SINGLE_AA_OVERHANGS})')
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -169,21 +211,24 @@ def main():
             df[col] = ''
 
     n_before = len(df)
+    unique_pep_before, unique_pep_charge_before = _unique_peptide_stats(df)
     scatter_data = []
     rows_to_drop = []
     skip_no_rt = 0
     skip_no_peptide = 0
     skip_no_ms2 = 0
+    drop_min_sig = 0
+    drop_min_overhangs = 0
     first_ms2_call = True
 
     def _log(msg):
         print(msg, flush=True)
 
-    _log("[Significant fragmentation] Combined: 5 ppm + min sig frags + 1% max (all from summed MS2)")
+    _log("[Significant fragmentation] Combined: 5 ppm + min sig frags + min single-AA overhangs + 1% max (all from summed MS2)")
     _log(f"[Significant fragmentation] Input: {args.input}")
     _log(f"[Significant fragmentation] mzML: {args.mzml}")
     _log(f"[Significant fragmentation] Output: {out_csv}")
-    _log(f"[Significant fragmentation] PPM: {args.ppm}, min frac: {args.min_frac*100:.2f}%, min sig frags: {args.min_sig_frags}")
+    _log(f"[Significant fragmentation] PPM: {args.ppm}, min frac: {args.min_frac*100:.2f}%, min sig frags: {args.min_sig_frags}, min overhangs: {args.min_overhangs}")
     _log(f"[Significant fragmentation] Processing {n_before} rows...")
     # Report every N rows (finer for small datasets) and at least every 30s
     progress_interval = max(10, min(25, n_before // 20))  # e.g. 1500 -> 25, 500 -> 25
@@ -208,7 +253,7 @@ def main():
             _log(f"[Significant fragmentation]   Progress: {i + 1}/{n_before} ({pct:.1f}%) | {elapsed:.0f}s elapsed | ~{eta:.0f}s left | {rate:.1f} rows/s")
 
         row = df.loc[idx]
-        peptide = row.get('plain_peptide') or row.get('sequence') or ''
+        peptide = _first_nonempty_str(row, ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'])
         if not peptide or not isinstance(peptide, str):
             skip_no_peptide += 1
             rows_to_drop.append(idx)
@@ -280,12 +325,17 @@ def main():
             sig_mz.append(f'{peak_mz:.6f}')
             scatter_data.append((max_ms2, peak_int, True, idx, ion_name))
 
+        pairs_str, overhang_str = _significant_pairs_and_overhangs_from_ions(sig_ions, peptide)
+        overhang_count = len([p for p in str(overhang_str).split(',') if p.strip()])
         if len(sig_ions) < args.min_sig_frags:
+            drop_min_sig += 1
+            rows_to_drop.append(idx)
+        elif overhang_count < args.min_overhangs:
+            drop_min_overhangs += 1
             rows_to_drop.append(idx)
         else:
             df.at[idx, 'significant_frags'] = ','.join(sig_ions)
             df.at[idx, 'significant_frags_mz'] = ','.join(sig_mz)
-            pairs_str, overhang_str = _significant_pairs_and_overhangs_from_ions(sig_ions, peptide)
             df.at[idx, 'single_aa_overhang_fragment_pairs'] = pairs_str
             # Convert peptide positions to protein positions when sequence_start_pos available
             seq_start = row.get('sequence_start_pos') or row.get('sequence_positions')
@@ -329,10 +379,18 @@ def main():
 
     n_passed = len([x for x in scatter_data if x[2]])
     n_failed = len([x for x in scatter_data if not x[2]])
+    n_rejected = n_before - n_after
+    retention_pct = (100.0 * n_after / n_before) if n_before else 0.0
+    unique_pep_after, unique_pep_charge_after = _unique_peptide_stats(df)
+    unique_pep_rejected = unique_pep_before - unique_pep_after
+    unique_pep_charge_rejected = unique_pep_charge_before - unique_pep_charge_after
     t_total = time.perf_counter() - t_start
     _log(f"[Significant fragmentation] Done in {t_total:.0f}s ({n_before / t_total:.1f} rows/s)")
     _log(f"[Significant fragmentation] Fragments: {n_passed} passed, {n_failed} below {args.min_frac*100:.2f}% threshold")
-    _log(f"[Significant fragmentation] Rows: {n_before} -> {n_after} (removed {n_before - n_after})")
+    _log(f"[Significant fragmentation] Peptides: accepted={n_after}, rejected={n_rejected}, retained={retention_pct:.1f}%")
+    _log(f"[Significant fragmentation] Unique peptides: accepted={unique_pep_after}, rejected={unique_pep_rejected}, total={unique_pep_before}")
+    _log(f"[Significant fragmentation] Unique peptide+charge: accepted={unique_pep_charge_after}, rejected={unique_pep_charge_rejected}, total={unique_pep_charge_before}")
+    _log(f"[Significant fragmentation] Rows: {n_before} -> {n_after} (removed {n_rejected})")
     if skip_no_rt or skip_no_peptide or skip_no_ms2:
         parts = []
         if skip_no_rt:
@@ -341,6 +399,10 @@ def main():
             parts.append(f"no peptide ({skip_no_peptide})")
         if skip_no_ms2:
             parts.append(f"no MS2 in window ({skip_no_ms2})")
+        if drop_min_sig:
+            parts.append(f"below min significant fragments ({drop_min_sig})")
+        if drop_min_overhangs:
+            parts.append(f"below min single-AA overhangs ({drop_min_overhangs})")
         _log("[Significant fragmentation] Skipped: " + ", ".join(parts))
 
     # Diagnostic scatter
@@ -384,7 +446,7 @@ def main():
     pos_col = 'protein_position' if 'protein_position' in df.columns else ('sequence_positions' if 'sequence_positions' in df.columns else None)
     seq_col = 'peptide_sequence' if 'peptide_sequence' in df.columns else ('plain_peptide' if 'plain_peptide' in df.columns else None)
     rt_col = 'MS1_RT_sec' if 'MS1_RT_sec' in df.columns else ('MS1_retention_time_sec' if 'MS1_retention_time_sec' in df.columns else None)
-    if pos_col or seq_col:
+    if (pos_col or seq_col) and not df.empty:
         def _start_len(row):
             if pos_col:
                 s = str(row.get(pos_col, '')).strip()
@@ -399,8 +461,13 @@ def main():
             seq = str(row.get(seq_col, '')).strip() if seq_col else ''
             return 999999, (len(seq) if seq else 999999)
         sl = df.apply(_start_len, axis=1, result_type='expand')
-        df['_sort_start'] = sl[0]
-        df['_sort_len'] = sl[1]
+        # Empty dataframes can return no columns from apply(..., result_type='expand').
+        if 0 in sl.columns and 1 in sl.columns:
+            df['_sort_start'] = sl[0]
+            df['_sort_len'] = sl[1]
+        else:
+            df['_sort_start'] = 999999
+            df['_sort_len'] = 999999
         df['_sort_charge'] = pd.to_numeric(df.get('charge'), errors='coerce').fillna(999999)
         df['_sort_rt'] = pd.to_numeric(df.get(rt_col), errors='coerce').fillna(999999.0) if rt_col else 999999.0
         df = df.sort_values(by=['_sort_start', '_sort_len', '_sort_charge', '_sort_rt'], ascending=[True, True, True, True], kind='mergesort')
@@ -415,6 +482,14 @@ def main():
     if front_cols or ms1_cols or frag_tail or ms2_cols:
         lead_cols = [c for c in df.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
         df = df[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
+    # Final ordering rule: RT columns explicitly in seconds always go last.
+    rt_sec_cols = [
+        c for c in df.columns
+        if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+    ]
+    if rt_sec_cols:
+        non_rt_sec_cols = [c for c in df.columns if c not in rt_sec_cols]
+        df = df[non_rt_sec_cols + rt_sec_cols]
 
     _log(f"[Significant fragmentation] Writing: {os.path.abspath(out_csv)}")
     df.to_csv(out_csv, index=False)

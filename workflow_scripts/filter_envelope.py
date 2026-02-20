@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Step 7: Filter by isotopic envelope (M0, M+1, M+2 present; M0 > M1 or M1 > M2).
+Step 7: Filter by isotopic envelope (M0, M+1, M+2 present; M0 and M+1 > M+2 and M+3).
 
 Runs after chromatogram extraction (Step 6). Keeps only rows where:
-  (1) M0, M+1, and M+2 are present in summed MS1 (has_required_isotopes)
-  (2) Envelope passes: M+0 > M+1 OR M+1 > M+2 (envelope_ok / m0_gt_m1_gt_m2)
+  (1) M0, M+1, M+2, and M+3 are present in summed MS1 (has_required_isotopes)
+  (2) Envelope passes: both M0 and M+1 are greater than both M+2 and M+3
+      (computed directly from m0/m1/m2/m3_intensity when available)
 
-Requires envelope_ok or m0_gt_m1_gt_m2 column in the input CSV (written by Step 6).
+Requires extraction envelope columns from Step 6. Prefers direct intensity columns:
+  m0_intensity, m1_intensity, m2_intensity, m3_intensity.
+Falls back to envelope_ok/m0_m1_gt_m2_m3/m0_gt_m1_gt_m2 for older CSVs.
 
 Output: comet_frags_perc_openMS_prefilter_extraction_envelope.csv
 
@@ -47,7 +50,7 @@ def _to_bool(v):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Step 7: Filter by isotopic envelope (M0, M+1, M+2 present; M0>M+1 OR M+1>M+2).'
+        description='Step 7: Filter by isotopic envelope (M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3).'
     )
     ap.add_argument('--input', '-i', default=DEFAULT_INPUT,
                     help=f'Input CSV from Step 6 (default: {os.path.basename(DEFAULT_INPUT)})')
@@ -89,13 +92,20 @@ def main():
     df = pd.read_csv(args.input, sep=',', skiprows=skip, engine='python', quotechar='"', on_bad_lines='warn')
 
     # Check for required envelope columns (written by Step 6 extraction)
+    has_i0 = 'm0_intensity' in df.columns
+    has_i1 = 'm1_intensity' in df.columns
+    has_i2 = 'm2_intensity' in df.columns
+    has_i3 = 'm3_intensity' in df.columns
+    has_intensity_quartet = has_i0 and has_i1 and has_i2 and has_i3
+    has_new_env = 'm0_m1_gt_m2_m3' in df.columns
     has_m0 = 'm0_gt_m1_gt_m2' in df.columns
     has_env_ok = 'envelope_ok' in df.columns
     has_req_iso = 'has_required_isotopes' in df.columns
     has_matched_isotopes = 'matched_isotopes' in df.columns
 
-    if not has_m0 and not has_env_ok:
-        print("Error: Input CSV has no envelope_ok or m0_gt_m1_gt_m2 columns.")
+    if not has_intensity_quartet and not has_new_env and not has_m0 and not has_env_ok:
+        print("Error: Input CSV is missing envelope metrics.")
+        print("Need either m0/m1/m2/m3 intensity columns, or m0_m1_gt_m2_m3/envelope_ok/m0_gt_m1_gt_m2.")
         print("Run chromatogram extraction (Step 6) first to produce the extraction CSV with envelope data.")
         sys.exit(1)
     if not has_req_iso and not has_matched_isotopes:
@@ -104,8 +114,8 @@ def main():
         sys.exit(1)
 
     # Filter criteria from summed MS1 (integration window):
-    #   (1) M0, M+1, M+2 present (has_required_isotopes == True)
-    #   (2) M+0 > M+1 OR M+1 > M+2 (m0_gt_m1_gt_m2 or envelope_ok == True)
+    #   (1) M0, M+1, M+2, M+3 present (has_required_isotopes == True)
+    #   (2) M0 and M+1 both > M+2 and M+3
 
     def _has_required_isotopes(row):
         if has_req_iso:
@@ -116,13 +126,26 @@ def main():
         if pd.isna(mi):
             return False
         s = str(mi).replace(' ', '')
-        return ('M+0' in s) and ('M+1' in s) and ('M+2' in s)
+        return ('M+0' in s) and ('M+1' in s) and ('M+2' in s) and ('M+3' in s)
 
     def _passes_envelope(row):
         if not _has_required_isotopes(row):
             return False
+        m_new = row.get('m0_m1_gt_m2_m3')
         m0 = row.get('m0_gt_m1_gt_m2')
         env = row.get('envelope_ok')
+        # Primary path: compute directly from extraction intensity columns.
+        if has_intensity_quartet:
+            i0 = pd.to_numeric(pd.Series([row.get('m0_intensity')]), errors='coerce').iloc[0]
+            i1 = pd.to_numeric(pd.Series([row.get('m1_intensity')]), errors='coerce').iloc[0]
+            i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
+            i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
+            if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
+                return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+        # Fallback: explicit boolean metric from newer extraction output.
+        if has_new_env and pd.notna(m_new):
+            return _to_bool(m_new)
+        # Legacy fallbacks.
         if has_m0 and pd.notna(m0):
             return _to_bool(m0)
         if has_env_ok and pd.notna(env):
@@ -187,6 +210,14 @@ def main():
     if front_cols or ms1_cols or frag_tail or ms2_cols:
         lead_cols = [c for c in df_out.columns if c not in front_cols and c not in ms1_cols and c not in frag_tail and c not in ms2_cols]
         df_out = df_out[front_cols + ms1_cols + lead_cols + frag_tail + ms2_cols]
+    # Final ordering rule: RT columns explicitly in seconds always go last.
+    rt_sec_cols = [
+        c for c in df_out.columns
+        if (('RT' in c or 'retention_time' in c) and c.endswith('_sec'))
+    ]
+    if rt_sec_cols:
+        non_rt_sec_cols = [c for c in df_out.columns if c not in rt_sec_cols]
+        df_out = df_out[non_rt_sec_cols + rt_sec_cols]
 
     df_out.to_csv(out_csv, index=False)
     print(f"[Step 7] Envelope filter: {n_before} -> {n_after} rows (dropped {n_dropped})")
