@@ -4634,10 +4634,10 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
     Overhangs and fragment pairs use significant data when available (5 ppm + >0.5% intensity).
     Each block: c-fragment rows, main sequence row (deep red = single-AA overhang; elsewhere shaded by summed fragment intensity across scans so darkest where many overlapping fragments have high signal), z-fragment rows.
     When fragment_intensity_c/z are present (from CSV matched fragment ion intensities), main-row darkness = normalized summed intensity; otherwise fallback to coverage count. Fragment rows use transparent blue-black and less saturated yellow at single-AA overhang; letters are Times New Roman, bold, large.
-    Writes two files: ..._unique_peptides.png (ordered by position), ..._unique_peptides_by_total_area.png (ordered by total_area).
+    Writes one file: ..._unique_peptides.png (ordered by position).
     Each row = one unique peptide sequence (PSMs with different charge/modifications merged).
-    When channel_only=True (per-channel view): only the main grid and by_total_area/lowres are written; no family or segment breakdown plots.
-    When families_only=True: only the higher-def family segment plots are written (groups of overlapping sequences); skips main grid, by_total_area, lowres.
+    When channel_only=True (per-channel view): only the main grid is written; no family or segment breakdown plots.
+    When families_only=True: only the higher-def family segment plots are written (groups of overlapping sequences); skips the main grid.
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -5321,18 +5321,6 @@ def create_accepted_peptides_protein_grid(peptides, protein_sequence, protein_id
     # Position-ordered (full resolution) — skip when families_only
     if not families_only:
         draw_one_figure(order_position, output_file, 'rows ordered by protein position')
-        print(f"  [Grid] Drawing total-area-ordered grid...", flush=True)
-        # Total-area-ordered
-        out_by_area = output_file.replace('_unique_peptides.png', '_unique_peptides_by_total_area.png')
-        if out_by_area == output_file:
-            out_by_area = output_file.replace('.png', '_by_total_area.png')
-        draw_one_figure(order_area, out_by_area, 'rows ordered by total area')
-        print(f"  [Grid] Drawing low-res overview...", flush=True)
-        # Low-resolution full overview (position-ordered)
-        out_lowres = output_file.replace('_unique_peptides.png', '_unique_peptides_lowres.png')
-        if out_lowres == output_file:
-            out_lowres = output_file.replace('.png', '_lowres.png')
-        draw_one_figure(order_position, out_lowres, 'rows ordered by protein position (overview)', dpi=LOWRES_DPI)
 
     # Family plots only for combined/total view (not for per-channel); always run when families_only
     if (not channel_only or families_only) and families:

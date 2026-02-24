@@ -3,8 +3,8 @@
 Generate per-peptide summed MS1 spectrum plots for Envelope step.
 
 Classification criteria (from plotted summed MS1 spectrum):
-  1) M0, M+1, M+2, M+3 present (highest-intensity match within +/-5 ppm for each)
-  2) M0 and M+1 are both > M+2 and M+3
+  1) Standard envelope pass: M0 > M+1 OR M+1 > M+2 (within +/-5 ppm matches)
+  2) Larger-envelope-below-M0 reject: M-2 > M-1 > M0 OR M-1 > M0 (using 12 ppm for below-M0 peaks)
 
 Usage:
   python generate_envelope_summed_ms1_plots.py \
@@ -135,6 +135,7 @@ def main():
     failed = 0
     accepted_ct = 0
     rejected_ct = 0
+    rejection_reasons = {}
     total = len(target_df)
     print(f"[Envelope Summed MS1] Mode={args.mode}; candidate peptides: {total}")
     for i, (_, row) in enumerate(target_df.iterrows(), start=1):
@@ -147,13 +148,18 @@ def main():
         )
         if result is None:
             failed += 1
+            rejection_reasons["no spectrum/RT"] = rejection_reasons.get("no spectrum/RT", 0) + 1
             continue
         fig, metrics = result
         passes = bool(metrics.get("passes_envelope", False))
+        reason = metrics.get("rejection_reason")
         if passes:
             accepted_ct += 1
         else:
             rejected_ct += 1
+            if not reason:
+                reason = "unknown rejection reason"
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
         keep = (passes and args.mode == "accepted") or ((not passes) and args.mode == "rejected")
         if not keep:
             plt.close(fig)
@@ -167,6 +173,11 @@ def main():
             print(f"[Envelope Summed MS1] Progress: {i}/{total}")
 
     print(f"[Envelope Summed MS1] Classification from plotted spectra: accepted={accepted_ct}, rejected={rejected_ct}, failed={failed}")
+    if rejection_reasons:
+        reasons_str = ", ".join(f"{k}: {v}" for k, v in sorted(rejection_reasons.items()))
+    else:
+        reasons_str = "none recorded"
+    print(f"[Envelope Summed MS1] Rejection reasons: {reasons_str}")
     print(f"[Envelope Summed MS1] Saved {saved} '{args.mode}' plots to: {os.path.abspath(args.output_dir)}")
     if failed:
         print(f"[Envelope Summed MS1] Skipped {failed} peptides (missing RT window/mz data)")

@@ -11,10 +11,13 @@ Run: streamlit run hdx_filter_app.py
 """
 
 import gc
+import hashlib
 import io
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -221,18 +224,34 @@ def _list_chromatogram_plots_by_status(out_dir: str, step: str = 'extraction') -
             ),
         )
 
+    plot_base_dir = out_dir
+    try:
+        version_key = f'plot_version_{step}'
+        plot_version = st.session_state.get(version_key)
+        if plot_version:
+            candidate = os.path.join(out_dir, 'plots_versions', step, str(plot_version))
+            if os.path.isdir(candidate):
+                plot_base_dir = candidate
+            else:
+                # Backward compatibility with earlier flat version layout.
+                legacy_candidate = os.path.join(out_dir, 'plots_versions', str(plot_version))
+                if os.path.isdir(legacy_candidate):
+                    plot_base_dir = legacy_candidate
+    except Exception:
+        pass
+
     if step == 'extraction':
         accepted_dirs = [
-            os.path.join(out_dir, 'extraction', 'accepted', 'chromatograms_peptides'),
-            os.path.join(out_dir, 'extraction', 'chromatograms_peptides'),
-            os.path.join(out_dir, 'extraction'),
-            os.path.join(out_dir, 'accepted', 'chromatograms_peptides'),
+            os.path.join(plot_base_dir, 'extraction', 'accepted', 'chromatograms_peptides'),
+            os.path.join(plot_base_dir, 'extraction', 'chromatograms_peptides'),
+            os.path.join(plot_base_dir, 'extraction'),
+            os.path.join(plot_base_dir, 'accepted', 'chromatograms_peptides'),
         ]
-        rejected_dirs = [os.path.join(out_dir, 'rejected_extraction')]
+        rejected_dirs = [os.path.join(plot_base_dir, 'rejected_extraction')]
         _delete_suffixed_extraction_plots(accepted_dirs + rejected_dirs)
     else:  # envelope
-        accepted_dirs = [os.path.join(out_dir, 'envelope')]
-        rejected_dirs = [os.path.join(out_dir, 'envelope_rejected')]
+        accepted_dirs = [os.path.join(plot_base_dir, 'envelope')]
+        rejected_dirs = [os.path.join(plot_base_dir, 'envelope_rejected')]
     accepted_paths = []
     rejected_paths = []
 
@@ -282,11 +301,24 @@ def _find_chromatogram_plots(out_dir: str) -> tuple[str | None, str | None]:
     first_chrom = chrom_paths[0] if chrom_paths else None
     ms1_overlay = None
     ms1_overlay_preferred = None
+    plot_base_dir = out_dir
+    try:
+        plot_version = st.session_state.get('plot_version_extraction')
+        if plot_version:
+            candidate = os.path.join(out_dir, 'plots_versions', 'extraction', str(plot_version))
+            if os.path.isdir(candidate):
+                plot_base_dir = candidate
+            else:
+                legacy_candidate = os.path.join(out_dir, 'plots_versions', str(plot_version))
+                if os.path.isdir(legacy_candidate):
+                    plot_base_dir = legacy_candidate
+    except Exception:
+        pass
     candidates = [
-        os.path.join(out_dir, 'extraction', 'accepted', 'chromatograms_peptides'),
-        os.path.join(out_dir, 'extraction', 'chromatograms_peptides'),
-        os.path.join(out_dir, 'extraction'),
-        os.path.join(out_dir, 'accepted', 'chromatograms_peptides'),
+        os.path.join(plot_base_dir, 'extraction', 'accepted', 'chromatograms_peptides'),
+        os.path.join(plot_base_dir, 'extraction', 'chromatograms_peptides'),
+        os.path.join(plot_base_dir, 'extraction'),
+        os.path.join(plot_base_dir, 'accepted', 'chromatograms_peptides'),
     ]
     for d in candidates:
         if not os.path.isdir(d):
@@ -307,12 +339,26 @@ def _find_chromatogram_plots(out_dir: str) -> tuple[str | None, str | None]:
 
 def _list_chromatogram_overview_plots(out_dir: str) -> list[str]:
     """List overview/zoom chromatogram plots emitted by visualization.chromatograms."""
-    if not out_dir or not os.path.isdir(out_dir):
+    plot_base_dir = out_dir
+    try:
+        plot_version = st.session_state.get('plot_version_extraction')
+        if plot_version:
+            candidate = os.path.join(out_dir, 'plots_versions', 'extraction', str(plot_version))
+            if os.path.isdir(candidate):
+                plot_base_dir = candidate
+            else:
+                legacy_candidate = os.path.join(out_dir, 'plots_versions', str(plot_version))
+                if os.path.isdir(legacy_candidate):
+                    plot_base_dir = legacy_candidate
+    except Exception:
+        pass
+
+    if not plot_base_dir or not os.path.isdir(plot_base_dir):
         return []
 
     exts = ('.png', '.jpg', '.jpeg')
     paths = []
-    for f in sorted(os.listdir(out_dir)):
+    for f in sorted(os.listdir(plot_base_dir)):
         fl = f.lower()
         if not fl.endswith(exts):
             continue
@@ -321,7 +367,7 @@ def _list_chromatogram_overview_plots(out_dir: str) -> list[str]:
             or 'zoom_peptides' in fl
             or fl.endswith('_chromatograms.png')
         ):
-            paths.append(os.path.join(out_dir, f))
+            paths.append(os.path.join(plot_base_dir, f))
 
     rank_tokens = [
         'all_peptides_overlay.png',
@@ -344,6 +390,136 @@ def _list_chromatogram_overview_plots(out_dir: str) -> list[str]:
         return (len(rank_tokens), name)
 
     return sorted(set(paths), key=_rank)
+
+
+def _collect_sequence_filter_keys(filter_csv: str) -> set[tuple[str, int, str]]:
+    """Return normalized (peptide, charge, mods) keys from a sequence filter CSV."""
+    if not filter_csv or not os.path.exists(filter_csv):
+        return set()
+    try:
+        df = load_csv(filter_csv)
+    except Exception:
+        return set()
+    pep_cols = ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence']
+    pep_col = next((c for c in pep_cols if c in df.columns), None)
+    if pep_col is None:
+        return set()
+    mods_col = 'modifications' if 'modifications' in df.columns else ('mods' if 'mods' in df.columns else None)
+    keys: set[tuple[str, int, str]] = set()
+    for _, r in df.iterrows():
+        pep = str(r.get(pep_col, '')).strip()
+        if not pep:
+            continue
+        pep = re.sub(r'\[.*?\]', '', pep).strip().upper()
+        if not pep:
+            continue
+        ch = int(pd.to_numeric(r.get('charge', 0), errors='coerce') or 0)
+        mods_raw = str(r.get(mods_col, '-')).strip() if mods_col else '-'
+        if not mods_raw or mods_raw.lower() in ('nan', 'none'):
+            mods_raw = '-'
+        mods_token = re.sub(r'[^a-z0-9]+', '_', mods_raw.lower()).strip('_') or '-'
+        keys.add((pep, ch, mods_token))
+    return keys
+
+
+def _copy_sequence_matched_extraction_plots(filter_csv: str, out_dir: str, seq_acc_dir: str) -> int:
+    """
+    Copy accepted extraction peptide plots that match sequence filter peptides.
+    Matches by normalized peptide token + charge token + mods token in filename.
+    Ambiguous/no-mod matches are skipped to avoid pulling the wrong variant.
+    """
+    keys = _collect_sequence_filter_keys(filter_csv)
+    if not keys:
+        return 0
+    accepted_dirs = [
+        os.path.join(out_dir, 'extraction', 'accepted', 'chromatograms_peptides'),
+        os.path.join(out_dir, 'extraction', 'chromatograms_peptides'),
+        os.path.join(out_dir, 'extraction'),
+        os.path.join(out_dir, 'accepted', 'chromatograms_peptides'),
+    ]
+    copied = 0
+    os.makedirs(seq_acc_dir, exist_ok=True)
+    for d in accepted_dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            nl = name.lower()
+            if not nl.endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            if 'overlay' in nl or '_rejected' in nl:
+                continue
+            src = os.path.join(d, name)
+            base = os.path.basename(src).lower()
+            matched = False
+            for pep, charge, mods_token in keys:
+                pep_token = re.sub(r'[^a-z0-9]+', '_', pep.lower()).strip('_')
+                if not pep_token:
+                    continue
+                charge_ok = (charge <= 0) or (f'_z{charge}' in base or f'z{charge}_' in base or base.endswith(f'z{charge}.png'))
+                if not charge_ok:
+                    continue
+                # Require mods token when available; if mods are '-' skip copy to avoid ambiguous matches.
+                if mods_token == '-':
+                    continue
+                mods_ok = (mods_token in base)
+                if pep_token in base and mods_ok:
+                    matched = True
+                    break
+            if not matched:
+                continue
+            dst = os.path.join(seq_acc_dir, os.path.basename(src))
+            try:
+                shutil.copy(src, dst)
+                os.utime(dst, None)
+                copied += 1
+            except Exception:
+                pass
+    return copied
+
+
+def _summary_counts_from_csv(path: str) -> tuple[str, str, str, str]:
+    """Return (rows, psms, unique_peptides_seq_charge_mods, unique_sequences)."""
+    try:
+        df = load_csv(path)
+    except Exception:
+        return ('—', '—', '—', '—')
+    if df is None or len(df) == 0:
+        return ('0', '0', '0', '0')
+
+    rows = str(len(df))
+    pep_col = next((c for c in ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'] if c in df.columns), None)
+    if pep_col is None:
+        return (rows, rows, rows, rows)
+
+    def _norm_seq(v) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ''
+        # Remove bracketed mass deltas if present; Summary unique sequence should be AA sequence.
+        return re.sub(r'\[.*?\]', '', str(v)).strip().upper()
+
+    def _norm_mods(v) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return '-'
+        s = str(v).strip()
+        return s if s and s.lower() != 'nan' else '-'
+
+    seq = df[pep_col].apply(_norm_seq)
+    charge = pd.to_numeric(df['charge'], errors='coerce').fillna(0).astype(int) if 'charge' in df.columns else pd.Series([0] * len(df), index=df.index)
+    mods_col = 'modifications' if 'modifications' in df.columns else ('mods' if 'mods' in df.columns else None)
+    mods = df[mods_col].apply(_norm_mods) if mods_col else pd.Series(['-'] * len(df), index=df.index)
+
+    unique_sequences = int(pd.Series(seq).replace('', np.nan).dropna().nunique())
+    unique_peptides = int(pd.DataFrame({'seq': seq, 'charge': charge, 'mods': mods}).drop_duplicates().shape[0])
+
+    # PSMs: prefer scan-level identity when scan-like column exists; fallback to rows.
+    scan_col = next((c for c in ['scan', 'scan_num', 'scan_number', 'spectrum_scan', 'scan_id'] if c in df.columns), None)
+    if scan_col:
+        scan = pd.to_numeric(df[scan_col], errors='coerce').fillna(-1).astype(int)
+        psms = int(pd.DataFrame({'seq': seq, 'charge': charge, 'mods': mods, 'scan': scan}).drop_duplicates().shape[0])
+    else:
+        psms = len(df)
+
+    return (rows, str(psms), str(unique_peptides), str(unique_sequences))
 
 
 QVALUE_COLS = ['perc_qvalue', 'percolator_qvalue', 'q-value', 'qvalue', 'percolator_q-value', 'FDR', 'fdr']
@@ -483,7 +659,7 @@ def _render_step_output_csv(out_path: str, key_prefix: str, expanded: bool = Fal
                     skip = 0
                 step_df = pd.read_csv(out_path, sep=',', skiprows=skip, engine='python', quotechar='"', on_bad_lines='warn')
                 step_df = _normalize_matched_frag_columns(step_df)
-                st.dataframe(step_df, use_container_width=True, height=400)
+                st.dataframe(step_df, width='stretch', height=400)
             except Exception as e:
                 st.caption(f'Could not load preview: {e}')
 
@@ -552,17 +728,17 @@ def _latest_csv_with_suffix(out_dir: str, suffixes: list[str]) -> str:
     return matches[0][1]
 
 
-def _pass_confidence(row, df, qcol, pepcol, q_thresh, pep_thresh, enabled=True):
-    if not enabled:
+def _pass_confidence(row, df, qcol, pepcol, q_thresh, pep_thresh, use_q=False, use_pep=False):
+    if not use_q and not use_pep:
         return True
     q_ok = True
-    if qcol and qcol in df.columns and pd.notna(row.get(qcol)):
+    if use_q and qcol and qcol in df.columns and pd.notna(row.get(qcol)):
         try:
             q_ok = float(row[qcol]) <= q_thresh
         except (TypeError, ValueError):
             q_ok = True
     pep_ok = True
-    if pepcol and pepcol in df.columns and pd.notna(row.get(pepcol)):
+    if use_pep and pepcol and pepcol in df.columns and pd.notna(row.get(pepcol)):
         try:
             pep_ok = float(row[pepcol]) <= pep_thresh
         except (TypeError, ValueError):
@@ -878,6 +1054,8 @@ def main():
         st.session_state.script_step = ''
     if 'pending_run' not in st.session_state:
         st.session_state.pending_run = None  # (cmd, step_name, out_suffix, needs_visualization, output_path)
+    if 'pending_run_armed' not in st.session_state:
+        st.session_state.pending_run_armed = False
     if 'last_step_output' not in st.session_state:
         st.session_state.last_step_output = None  # path to last successful step output CSV
     if 'last_step_name' not in st.session_state:
@@ -1036,10 +1214,21 @@ def main():
     pipeline_inputs_ready = bool(
         mzml_path and os.path.exists(mzml_path) and fasta_path and os.path.exists(fasta_path)
     )
-    # Pipeline-first mode: when FASTA+mzML are available, ignore discovered CSVs.
-    # This prevents stale on-disk CSVs from hijacking a fresh run.
+    # Pipeline-first mode: when FASTA+mzML are available, prefer running from inputs.
+    # But if a saved pipeline CSV exists, keep it for state/preview recovery.
     if pipeline_inputs_ready:
-        csv_path = None
+        recovery_suffixes = [
+            '_sequence', '_significance', '_envelope',
+            '_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test', '_extraction_test',
+            '_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction', '_extraction',
+            '_prefilter', '_confidence', '_comet_perc_openMS', '_comet_perc', '_comet'
+        ]
+        search_dir = output_dir_val if output_dir_val and os.path.isdir(output_dir_val) else data_dir
+        recovered_csv = _latest_csv_with_suffix(search_dir, recovery_suffixes)
+        if recovered_csv and os.path.exists(recovered_csv):
+            csv_path = recovered_csv
+        else:
+            csv_path = None
 
     params_files = _find_files(data_dir, ('.params',))
     default_params = os.path.join(_SCRIPT_DIR, 'comet.params.new')
@@ -1117,13 +1306,24 @@ def main():
             tab_name = 'Channels'
         if tab_name:
             st.session_state.tab_focus_request = tab_name
-            st.session_state.tab_focus_ttl = 3
+            # One-shot focus request; avoid stale requests pulling users back on later reruns.
+            st.session_state.tab_focus_ttl = 1
         out_path = output_path or (input_path and _step_output_path(input_path, out_dir, out_suffix))
         st.session_state.pending_run = (cmd, step_name, out_suffix, needs_visualization, out_path, run_cwd, comet_rename)
+        st.session_state.pending_run_armed = True
+
+    def _request_tab_focus(tab_name: str, ttl: int = 1) -> None:
+        """Request focus on a tab on next rerun (one-shot by default)."""
+        st.session_state.tab_focus_request = tab_name
+        st.session_state.tab_focus_ttl = max(1, int(ttl))
 
     def _execute_pending_run(stream_container=None) -> bool:
         """Execute queued command now. Returns True when a run was executed."""
         pending = st.session_state.pending_run
+        pending_armed = bool(st.session_state.get('pending_run_armed', False))
+        if pending and not pending_armed:
+            st.session_state.pending_run = None
+            return False
         if not pending:
             return False
         parts = pending if isinstance(pending, (list, tuple)) else (pending + (None, None, None))
@@ -1132,6 +1332,7 @@ def main():
         run_cwd = parts[5] if len(parts) > 5 else None
         comet_rename = parts[6] if len(parts) > 6 else None
         st.session_state.pending_run = None
+        st.session_state.pending_run_armed = False
         env, run_cmd = _build_env_and_cmd(cmd, needs_visualization)
         proj = os.path.abspath(_SCRIPT_DIR)
         work_dir = run_cwd if run_cwd else proj
@@ -1223,14 +1424,15 @@ def main():
                 except Exception:
                     pass
 
-            if fresh_output_path and os.path.exists(fresh_output_path):
+            # Only set last_step_output to a file path (CSV); never to a directory (e.g. plot dirs).
+            if fresh_output_path and os.path.exists(fresh_output_path) and os.path.isfile(fresh_output_path):
                 st.session_state.last_step_output = fresh_output_path
                 st.session_state.last_step_name = step_name
                 st.session_state.last_step_run_started_ts = run_started_ts
             else:
                 # Don't "forget" prior successful step outputs when timestamp detection is noisy.
                 fallback_output = ''
-                if output_path and os.path.exists(output_path):
+                if output_path and os.path.exists(output_path) and os.path.isfile(output_path):
                     fallback_output = output_path
                 elif out_suffix:
                     try:
@@ -1242,7 +1444,7 @@ def main():
                                     break
                     except Exception:
                         fallback_output = ''
-                if fallback_output and os.path.exists(fallback_output):
+                if fallback_output and os.path.exists(fallback_output) and os.path.isfile(fallback_output):
                     st.session_state.last_step_output = fallback_output
                     st.session_state.last_step_name = step_name
                     st.session_state.last_step_run_started_ts = run_started_ts
@@ -1267,13 +1469,76 @@ def main():
         (upload_dir if upload_dir and data_dir == upload_dir else data_dir)
     )
     os.makedirs(out_dir, exist_ok=True)
+    plots_root_dir = os.path.join(out_dir, 'plots_versions')
+
+    def _plot_version_dir(step_name: str, version: str | None = None) -> str:
+        step = str(step_name).strip().lower()
+        key = f'plot_version_{step}'
+        ver = version or str(st.session_state.get(key) or datetime.now().strftime('%Y%m%d_%H%M%S'))
+        return os.path.join(plots_root_dir, step, ver)
+
+    def _ensure_plot_version_dirs(step_name: str, version: str | None = None) -> str:
+        base = _plot_version_dir(step_name, version)
+        os.makedirs(base, exist_ok=True)
+        step = str(step_name).strip().lower()
+        if step == 'extraction':
+            subdirs = ['diagnostics', 'extraction', 'rejected_extraction']
+        elif step == 'envelope':
+            subdirs = ['envelope', 'envelope_rejected']
+        elif step == 'sequence':
+            subdirs = ['sequence_coverage', 'sequence_unique_chromatograms']
+        else:
+            subdirs = []
+        for sub in subdirs:
+            os.makedirs(os.path.join(base, sub), exist_ok=True)
+        return base
+
+    def _rotate_plot_version(step_name: str) -> str:
+        step = str(step_name).strip().lower()
+        key = f'plot_version_{step}'
+        st.session_state[key] = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return _ensure_plot_version_dirs(step, st.session_state[key])
+
+    # Ensure each plot-producing section has an active version folder.
+    for _step in ['extraction', 'envelope', 'sequence']:
+        _key = f'plot_version_{_step}'
+        if _key not in st.session_state:
+            st.session_state[_key] = datetime.now().strftime('%Y%m%d_%H%M%S')
+        _ensure_plot_version_dirs(_step, str(st.session_state[_key]))
+
     for sub in ['diagnostics', 'extraction', 'rejected_extraction', 'envelope', 'envelope_rejected', 'sequence_coverage', 'channel_assignment', 'fragmentation_source']:
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
+
+    # Recover last successful step output from disk when session state is lost/stale.
+    last_out_state = st.session_state.get('last_step_output')
+    if not last_out_state or not os.path.exists(last_out_state):
+        recovery_order = [
+            ('Sequence coverage', ['_sequence']),
+            ('Significant fragmentation', ['_significance']),
+            ('Envelope', ['_envelope']),
+            ('Extraction', ['_prefilter_extraction_test', '_confidence_accuracy_extraction_test', '_confidence_extraction_test', '_extraction_test',
+                            '_prefilter_extraction', '_confidence_accuracy_extraction', '_confidence_extraction', '_extraction']),
+            ('Prefilter', ['_prefilter', '_confidence']),
+            ('OpenMS MS1', ['_comet_perc_openMS']),
+            ('Percolator', ['_comet_perc']),
+            ('Comet', ['_comet']),
+        ]
+        recovered = ''
+        recovered_name = None
+        for step_name, suffixes in recovery_order:
+            p = _latest_csv_with_suffix(out_dir, suffixes)
+            if p and os.path.exists(p):
+                recovered = p
+                recovered_name = step_name
+                break
+        if recovered:
+            st.session_state.last_step_output = recovered
+            st.session_state.last_step_name = recovered_name
 
     # Resolve chained inputs. conf_base = root name (e.g. comet_frags_perc_openMS).
     # Prefer last successful step output as chain source when available.
     last_out_for_chain = st.session_state.get('last_step_output')
-    chain_csv_path = last_out_for_chain if (last_out_for_chain and os.path.exists(last_out_for_chain)) else csv_path
+    chain_csv_path = last_out_for_chain if (last_out_for_chain and os.path.exists(last_out_for_chain) and os.path.isfile(last_out_for_chain)) else csv_path
     base_for_resolve = os.path.splitext(os.path.basename(chain_csv_path))[0] if chain_csv_path else ''
     for strip in ['_prefilter_extraction_envelope_significance_sequence', '_prefilter_extraction_envelope_significance',
                   '_prefilter_extraction_envelope', '_prefilter_extraction', '_prefilter',
@@ -1301,10 +1566,16 @@ def main():
 
     st.sidebar.divider()
 
-    # Prefer last step output (auto-load after pipeline run) over dropdown selection
+    # Prefer last step output (auto-load after pipeline run) over dropdown selection.
+    # Only use it when it's a file (never a directory, e.g. plot output dir).
     last_out = st.session_state.get('last_step_output')
     if last_out and os.path.exists(last_out):
-        csv_path = last_out
+        if os.path.isfile(last_out):
+            csv_path = last_out
+        else:
+            # Clear stale directory path (e.g. from envelope plot run) so load_csv never sees it.
+            st.session_state.last_step_output = None
+            st.session_state.last_step_name = None
 
     # Intentionally do not show sidebar "Loaded/Auto-loaded CSV" status;
     # inputs are FASTA + mzML and each step writes its own output CSV.
@@ -1431,6 +1702,8 @@ def main():
         'd_mz': _resolve_output('_D_MZ'),
         'sf': _resolve_output('_SF'),
         'channels': _resolve_output('_channels'),
+        'windows_accepted': _resolve_output('_windows_channels_accepted'),
+        'windows_rejected': _resolve_output('_windows_channels_rejected'),
     }
     def _resolve_preview_output(step_name: str, fallback_path: str):
         """
@@ -1474,6 +1747,7 @@ def main():
         'd_mz': ['_D_MZ'],
         'sf': ['_SF'],
         'channels': ['_channels'],
+        'windows': ['_windows_channels_accepted', '_windows_channels_rejected'],
     }
 
     def _tab_is_done(step_name: str) -> bool:
@@ -1490,7 +1764,7 @@ def main():
         return False
 
     green_tabs_css = []
-    for name, path in [('comet', 2), ('percolator', 3), ('openms', 4), ('prefilter', 7), ('extraction', 8), ('envelope', 9), ('significance', 10), ('sequence', 11), ('d_mz', 12), ('sf', 13), ('channels', 14)]:
+    for name, path in [('comet', 2), ('percolator', 3), ('openms', 4), ('prefilter', 7), ('extraction', 8), ('envelope', 9), ('significance', 10), ('sequence', 11), ('windows', 12), ('channels', 13), ('d_mz', 15), ('sf', 16)]:
         if _tab_is_done(name):
             green_tabs_css.append(f'[data-testid="stTabs"] [role="tab"]:nth-child({path}) {{ color: #84cc16 !important; }}')
     # Checkmarks in Metrics tab — blue to match app theme (same as buttons)
@@ -1518,77 +1792,135 @@ def main():
                 st.session_state.last_step_name = None
                 st.rerun()
 
-    filter_steps = ['Summary', 'Comet', 'Percolator', 'OpenMS', 'Metrics', 'Compare', 'Prefilter', 'Extraction', 'Envelope', 'Significance', 'Sequence', 'D_MZ', 'SF', 'Channels', 'Method']
+    filter_steps = ['Summary', 'Comet', 'Percolator', 'OpenMS', 'Metrics', 'Compare', 'Prefilter', 'Extraction', 'Envelope', 'Significance', 'Sequence', 'Windows', 'Channels', 'Inspect', 'D_MZ', 'SF', 'Method']
     filter_tabs = st.tabs(filter_steps)
-    req_tab = st.session_state.get('tab_focus_request')
+    # Temporary stability mode: disable JS-driven tab focus switching.
+    # We only consume focus requests to avoid frontend hangs/spinners.
     req_ttl = int(st.session_state.get('tab_focus_ttl', 0) or 0)
-    if req_tab in filter_steps and req_ttl > 0:
-        components.html(
-            f"""
-            <script>
-            const target = {json.dumps(req_tab)};
-            setTimeout(() => {{
-              const doc = window.parent.document;
-              const tabs = Array.from(doc.querySelectorAll('[data-testid="stTabs"] button[role="tab"]'));
-              const tab = tabs.find(t => (t.textContent || '').trim() === target);
-              if (tab && tab.getAttribute('aria-selected') !== 'true') tab.click();
-            }}, 60);
-            </script>
-            """,
-            height=0,
-        )
-        st.session_state.tab_focus_ttl = req_ttl - 1
-    elif req_ttl <= 0:
+    if req_ttl > 0:
+        st.session_state.tab_focus_request = None
+        st.session_state.tab_focus_ttl = 0
+    else:
         st.session_state.tab_focus_request = None
 
-    # Show banner when a pipeline step is queued (fallback runner executes at end of script)
+    # Clear stale queued runs: all run buttons execute inline in their tab now.
     if st.session_state.pending_run:
-        pending_step = st.session_state.pending_run[1] if isinstance(st.session_state.pending_run, (list, tuple)) else 'step'
-        st.info(f"⏳ **Running {pending_step}…** Live output appears in the terminal near the run button.")
+        st.session_state.pending_run = None
 
-    def _render_terminal():
+    def _render_terminal(panel_key: str = 'default'):
         term_header = f"Terminal — {st.session_state.script_step}" if st.session_state.script_step else "Terminal"
         with st.expander(term_header, expanded=bool(st.session_state.script_output), icon='▶'):
             if st.session_state.script_output:
-                st.code(st.session_state.script_output, language=None)
+                # Use a fixed-height read-only text area so users can scroll long logs.
+                st.text_area(
+                    'Run output',
+                    value=st.session_state.script_output,
+                    height=420,
+                    key=f'terminal_scrollable_output_{panel_key}',
+                    disabled=True,
+                    label_visibility='collapsed',
+                )
             else:
                 st.caption("Run a pipeline step (Step 1–8) to see the latest terminal output here.")
 
-    # Metrics tab — run first so variables are defined before apply filters
+    # Metric defaults must exist even when Metrics is not the active section.
+    enable_conf = bool(st.session_state.get('enable_conf', True))
+    use_q_filter = bool(st.session_state.get('use_q_filter', False))
+    q_thresh = float(st.session_state.get('q_thresh', 0.01))
+    use_pep_filter = bool(st.session_state.get('use_pep_filter', False))
+    pep_thresh = float(st.session_state.get('pep_thresh', 0.05))
+    reject_proline = bool(st.session_state.get('reject_pro', True))
+    reject_mods = bool(st.session_state.get('reject_mods', True))
+    enable_xcorr_filter = bool(st.session_state.get('enable_xcorr_filter', False))
+    xcorr_min = float(st.session_state.get('xcorr_min', 1.5))
+    enable_sp_filter = bool(st.session_state.get('enable_sp_filter', False))
+    sp_min = float(st.session_state.get('sp_min', 50.0))
+    enable_ms1_mz_error_filter = bool(st.session_state.get('enable_ms1_mz_error', True))
+    enable_envelope = bool(st.session_state.get('enable_env', True))
+    envelope_rule_label = str(
+        st.session_state.get(
+            'envelope_rule',
+            'Optional M+3: require M0/M+1/M+2 and M0 > M+2; if M+3 signal exists, require M0 > M+3 and M+2 > M+3',
+        )
+    )
+    envelope_mode = 'm3_optional' if envelope_rule_label.startswith('Optional M+3') else 'strict_m3_required'
+    enable_apex = bool(st.session_state.get('enable_apex', True))
+    apex_min = float(st.session_state.get('apex_min', 1e6))
+    enable_shape = bool(st.session_state.get('enable_shape', True))
+    shape_min = float(st.session_state.get('shape_min', 0.8))
+    enable_coelution = bool(st.session_state.get('enable_coel', True))
+    coelution_min = float(st.session_state.get('coel_min', 0.8))
+    enable_sig_frags = bool(st.session_state.get('enable_sig', True))
+    min_sig_frag_count = int(st.session_state.get('min_sig', 5))
+    sig_frac_pct = float(st.session_state.get('sig_frac', 1.0))
+    ppm_thresh = float(st.session_state.get('ppm_thresh', 5.0))
+    ms1_mz_error_ppm_thresh = float(st.session_state.get('ms1_mz_error_ppm_thresh', 6.0))
+    peak_matching_ppm_threshold = float(st.session_state.get('peak_matching_ppm_threshold', 6.0))
+    apex_ppm_reject_threshold = float(st.session_state.get('apex_ppm_reject_threshold', 6.0))
+    extraction_test = bool(st.session_state.get('extraction_test', False))
+    extraction_extract_only = bool(st.session_state.get('extraction_extract_only', False))
+    channels_count = int(st.session_state.get('channels_count', 3))
+
+    # Metrics section — run first so UI can override defaults before apply filters
     with filter_tabs[4]:
             # Pipeline order: Prefilter → Extraction → Significance. Compact layout, no expanders.
             # Prefilter (Step 4)
             st.caption('Prefilter')
             pf1, pf2, pf3, pf4, pf5 = st.columns(5)
             with pf1:
-                enable_conf = st.checkbox('Prefilter (Proline, Mods, Q/PEP)', True, key='enable_conf')
+                enable_conf = st.checkbox('Prefilter (Proline, Mods, Confidence)', True, key='enable_conf')
             with pf2:
-                use_qpep = st.checkbox('Use Q/PEP', False, key='use_qpep')
+                use_q_filter = st.checkbox('Use Q-value', False, key='use_q_filter')
             with pf3:
-                q_thresh = st.slider('Q-value', 0.001, 0.2, 0.05, 0.001, key='q_thresh', disabled=not use_qpep)
+                q_thresh = st.slider('Q-value', 0.001, 0.2, 0.01, 0.001, key='q_thresh', disabled=not use_q_filter)
             with pf4:
-                pep_thresh = st.slider('PEP', 0.001, 0.2, 0.05, 0.001, key='pep_thresh', disabled=not use_qpep)
+                use_pep_filter = st.checkbox('Use PEP', False, key='use_pep_filter')
             with pf5:
-                reject_proline = st.checkbox('Proline', True, key='reject_pro')
-            pf6a, pf6, pf7, pf8, pf9 = st.columns(5)
+                pep_thresh = st.slider('PEP', 0.001, 0.2, 0.05, 0.001, key='pep_thresh', disabled=not use_pep_filter)
+            pf6a, pf6, pf7, pf8, pf9, pf10 = st.columns(6)
             with pf6a:
-                reject_mods = st.checkbox('Modifications', True, key='reject_mods')
+                reject_proline = st.checkbox('Proline', True, key='reject_pro')
             with pf6:
-                enable_xcorr_filter = st.checkbox('XCorr filter', False, key='enable_xcorr_filter')
+                reject_mods = st.checkbox('Modifications', True, key='reject_mods')
             with pf7:
-                xcorr_min = st.slider('Min XCorr', 0.0, 10.0, 2.0, 0.1, key='xcorr_min')
+                enable_xcorr_filter = st.checkbox('XCorr filter', False, key='enable_xcorr_filter')
             with pf8:
-                enable_sp_filter = st.checkbox('Sp filter', False, key='enable_sp_filter')
+                xcorr_min = st.slider('Min XCorr', 0.0, 10.0, 1.5, 0.1, key='xcorr_min', disabled=not enable_xcorr_filter)
             with pf9:
-                sp_min = st.number_input('Min Sp', 0.0, 1000.0, 50.0, 1.0, key='sp_min')
+                enable_sp_filter = st.checkbox('Sp filter', False, key='enable_sp_filter')
+            with pf10:
+                sp_min = st.number_input('Min Sp', 0.0, 1000.0, 50.0, 1.0, key='sp_min', disabled=not enable_sp_filter)
+            enable_ms1_mz_error_filter = st.checkbox('MS1 m/z error (ppm)', True, key='enable_ms1_mz_error')
             # Extraction (Step 6)
             st.caption('Extraction')
             ex1, ex2, ex3, ex4 = st.columns(4)
             with ex1:
-                enable_envelope = st.checkbox('Envelope (M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3)', True, key='enable_env')
+                enable_envelope = st.checkbox('Envelope filter', True, key='enable_env')
+                envelope_rule_label = st.selectbox(
+                    'Envelope rule',
+                    [
+                        'Strict: require M0/M+1/M+2/M+3 and M0 > M+2 > M+3 (M+2 may exceed M+1)',
+                        'Optional M+3: require M0/M+1/M+2 and M0 > M+2; if M+3 signal exists, require M0 > M+3 and M+2 > M+3',
+                    ],
+                    index=1,
+                    key='envelope_rule',
+                    help='Choose strict M+3-required filtering or an M+3-optional rule.',
+                )
+                envelope_mode = (
+                    'm3_optional'
+                    if envelope_rule_label.startswith('Optional M+3')
+                    else 'strict_m3_required'
+                )
             with ex2:
                 enable_apex = st.checkbox('Apex', True, key='enable_apex')
-                apex_min = st.number_input('Min apex', 1e4, 1e8, 1e5, 1e4, format='%.0e', key='apex_min')
+                apex_options = [1e3, 1e4, 1e5, 1e6, 1e7, 1e8]
+                apex_min = st.selectbox(
+                    'Min apex',
+                    options=apex_options,
+                    index=3,  # default: 1e+6
+                    key='apex_min',
+                    format_func=lambda v: f"1e+{int(np.log10(v))}",
+                )
             with ex3:
                 enable_shape = st.checkbox('Shape', True, key='enable_shape')
                 shape_min = st.slider('Min shape', 0.0, 1.0, 0.8, 0.05, key='shape_min')
@@ -1601,19 +1933,63 @@ def main():
             with sf1:
                 enable_sig_frags = st.checkbox('Sig fragments (5ppm, min sig frags, 1% max)', True, key='enable_sig')
             with sf2:
-                ppm_thresh = st.slider('5ppm', 1.0, 20.0, 5.0, 0.5, key='ppm_thresh', help='PPM tolerance for fragment matching')
+                st.caption('PPM tolerance set below')
             with sf3:
                 min_sig_frag_count = st.number_input('Min sig frags', 0, 50, 5, 1, key='min_sig')
             with sf4:
                 sig_frac_pct = st.slider('1% max peak', 0.1, 5.0, 1.0, 0.1, key='sig_frac', help='Min % of max MS2 for fragment (noise filter)')
+            st.caption('PPM settings')
+            ppm_options = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0]
+            ppm1, ppm2, ppm3, ppm4 = st.columns(4)
+            with ppm1:
+                ppm_thresh = st.selectbox(
+                    'Significance ppm (MS2)',
+                    options=ppm_options,
+                    index=3,  # default 5 ppm
+                    key='ppm_thresh',
+                    help='PPM tolerance for fragment matching in Significant fragmentation.',
+                )
+            with ppm2:
+                ms1_mz_error_ppm_thresh = st.selectbox(
+                    'Max |MS1 ppm|',
+                    options=ppm_options,
+                    index=4,  # default 6 ppm
+                    key='ms1_mz_error_ppm_thresh',
+                    disabled=not enable_ms1_mz_error_filter,
+                    help='MS1 precursor m/z error tolerance used in Prefilter.',
+                )
+            with ppm3:
+                peak_matching_ppm_threshold = st.selectbox(
+                    'Peak matching ppm',
+                    options=ppm_options,
+                    index=4,  # default 6 ppm
+                    key='peak_matching_ppm_threshold',
+                    help='Extraction peak-matching stringency for resolving multiple candidate peaks.',
+                )
+            with ppm4:
+                apex_ppm_reject_threshold = st.selectbox(
+                    'Max |apex MS1 ppm|',
+                    options=ppm_options,
+                    index=4,  # default 6 ppm
+                    key='apex_ppm_reject_threshold',
+                    help='Extraction reject threshold for apex m/z error relative to theoretical precursor m/z.',
+                )
             # Extraction run options
             st.caption('Extraction run')
             opt1, opt2, _ = st.columns(3)
             with opt1:
-                extraction_test = st.checkbox('Test (30 pep)', True, key='extraction_test')
+                extraction_test = st.checkbox('Test (30 pep)', False, key='extraction_test')
             with opt2:
                 extraction_extract_only = st.checkbox('Extract only (no plots)', False, key='extraction_extract_only',
                                                      help='Skip individual chromatogram plots; CSV + traces saved for plotting later')
+            # Channels metric
+            st.caption('Channels')
+            channels_count = st.selectbox(
+                'Number of channels',
+                options=[1, 2, 3, 4, 5],
+                index=2,
+                key='channels_count',
+            )
 
     # ─── Apply filters in pipeline order ────────────────────────────────────
     df_filtered = df.copy()
@@ -1643,9 +2019,15 @@ def main():
         if reject_mods and 'modifications' in df_filtered.columns:
             mask_mods = ~df_filtered['modifications'].apply(_has_modifications)
             df_filtered = df_filtered[mask_mods].copy()
-        # Q-value / PEP
-        if use_qpep and has_confidence and (qcol or pepcol):
-            mask_conf = df_filtered.apply(lambda r: _pass_confidence(r, df_filtered, qcol, pepcol, q_thresh, pep_thresh, enabled=use_qpep), axis=1)
+        # Q-value / PEP (independent toggles)
+        if (use_q_filter or use_pep_filter) and has_confidence and (qcol or pepcol):
+            mask_conf = df_filtered.apply(
+                lambda r: _pass_confidence(
+                    r, df_filtered, qcol, pepcol, q_thresh, pep_thresh,
+                    use_q=use_q_filter, use_pep=use_pep_filter
+                ),
+                axis=1
+            )
             df_filtered = df_filtered[mask_conf].copy()
         # Optional XCorr / Sp filters
         xcorr_col_runtime = _resolve_col(df_filtered, XCORR_COLS)
@@ -1658,6 +2040,13 @@ def main():
             mask_sp = pd.to_numeric(df_filtered[sp_col_runtime], errors='coerce') >= sp_min
             mask_sp = mask_sp | pd.isna(df_filtered[sp_col_runtime])
             df_filtered = df_filtered[mask_sp].copy()
+        # Optional MS1 precursor m/z error filter (ppm)
+        mzerr_col_runtime = 'MS1_mz_error_ppm' if 'MS1_mz_error_ppm' in df_filtered.columns else ('MS1_mz_error' if 'MS1_mz_error' in df_filtered.columns else None)
+        if enable_ms1_mz_error_filter and mzerr_col_runtime:
+            mzerr_vals = pd.to_numeric(df_filtered[mzerr_col_runtime], errors='coerce')
+            mask_mzerr = mzerr_vals.abs() <= float(ms1_mz_error_ppm_thresh)
+            mask_mzerr = mask_mzerr | mzerr_vals.isna()
+            df_filtered = df_filtered[mask_mzerr].copy()
     step_counts.append(('Prefilter', len(df_filtered), n_prev))
     n_prev = len(df_filtered)
 
@@ -1672,7 +2061,7 @@ def main():
             i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
             i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
             if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
-                return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+                return bool((float(i0) > float(i2)) and (float(i1) > float(i2)) and (float(i2) > float(i3)))
             if pd.notna(m_new):
                 return _to_bool(m_new)
             if pd.notna(m0):
@@ -1727,7 +2116,7 @@ def main():
     def _status_all(idx):
         return 'Pass' if idx in passed_all else 'Fail'
     def _pass_conf(r):
-        return _pass_confidence(r, df_orig, qcol, pepcol, q_thresh, pep_thresh, enabled=use_qpep)
+        return _pass_confidence(r, df_orig, qcol, pepcol, q_thresh, pep_thresh, use_q=use_q_filter, use_pep=use_pep_filter)
     def _pass_env(r):
         m_new, m0, env = r.get('m0_m1_gt_m2_m3'), r.get('m0_gt_m1_gt_m2'), r.get('envelope_ok')
         i0 = pd.to_numeric(pd.Series([r.get('m0_intensity')]), errors='coerce').iloc[0]
@@ -1735,7 +2124,7 @@ def main():
         i2 = pd.to_numeric(pd.Series([r.get('m2_intensity')]), errors='coerce').iloc[0]
         i3 = pd.to_numeric(pd.Series([r.get('m3_intensity')]), errors='coerce').iloc[0]
         if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
-            return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+            return bool((float(i0) > float(i2)) and (float(i1) > float(i2)) and (float(i2) > float(i3)))
         if pd.notna(m_new):
             return _to_bool(m_new)
         if pd.notna(m0): return _to_bool(m0)
@@ -1791,7 +2180,7 @@ def main():
             for j, (fig, _) in enumerate(pair):
                 if fig is not None:
                     with cols[j]:
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
 
     # ─── Rest of tabs (Summary, Prefilter, Extraction, etc.) ─────────────────
     with filter_tabs[0]:  # Summary
@@ -1809,9 +2198,10 @@ def main():
                 ('Compare', None, 'Byonic vs Comet: overlap plots + byonic_only/comet_only CSVs'),
                 ('Prefilter', step_outputs.get('prefilter', ''), 'PEP, Q, prolines, mods, ppm → _prefilter.csv'),
                 ('Extraction', step_outputs.get('extraction', ''), 'Envelope, apex ≥10⁵, coelution, shape, S/N 1% max → _extraction.csv'),
-                ('Envelope', step_outputs.get('envelope', ''), 'M0 and M+1 > M+2 and M+3 (requires M+3 present) → _envelope.csv'),
+                ('Envelope', step_outputs.get('envelope', ''), 'M0/M+1 > M+2 > M+3 (requires M+3 present) → _envelope.csv'),
                 ('Significance', step_outputs.get('significance', ''), '5ppm, min sig frags, 1% max peak → _significance.csv'),
                 ('Sequence', step_outputs.get('sequence', ''), 'Unique peptides grid + protect_peptide → _sequence.csv'),
+                ('Windows', None, 'Sequence-passed peptide RT windows + collection-window overlays'),
                 ('D_MZ', step_outputs.get('d_mz', ''), 'Deuterated m/z target range (undeut + max deut) / 2 ± range → _D_MZ.csv'),
                 ('SF', step_outputs.get('sf', ''), 'Source Fragmentation (y=mx+b) → _SF.csv'),
                 ('Channels', step_outputs.get('channels', ''), 'Channel assignment → _channels.csv'),
@@ -1836,31 +2226,264 @@ def main():
                 'SF': ['_SF'],
                 'Channels': ['_channels'],
             }
-            step_rows = '| Tab | Status | Rows | Description |\n|-----|--------|------|-------------|\n'
-            for tab_name, out_path, desc in tab_info:
+            # Resolve outputs in dependency order so Summary does not mix stale files
+            # from different runs (e.g. old _sequence with new _significance).
+            resolved_by_tab: dict[str, str] = {}
+            for tab_name, out_path, _ in tab_info:
                 resolved_out = out_path
                 if (not resolved_out or not os.path.exists(resolved_out)) and tab_name in summary_suffixes:
                     resolved_out = _latest_csv_with_suffix(out_dir, summary_suffixes[tab_name])
+                resolved_by_tab[tab_name] = resolved_out if (resolved_out and os.path.exists(resolved_out)) else ''
+
+            # Chain dependent steps to the same base when available.
+            extraction_out = resolved_by_tab.get('Extraction', '')
+            envelope_out = resolved_by_tab.get('Envelope', '')
+            significance_out = resolved_by_tab.get('Significance', '')
+
+            if extraction_out:
+                env_candidate = os.path.splitext(extraction_out)[0] + '_envelope.csv'
+                if os.path.exists(env_candidate):
+                    envelope_out = env_candidate
+                    resolved_by_tab['Envelope'] = env_candidate
+
+            if envelope_out:
+                sig_candidate = os.path.splitext(envelope_out)[0] + '_significance.csv'
+                if os.path.exists(sig_candidate):
+                    significance_out = sig_candidate
+                    resolved_by_tab['Significance'] = sig_candidate
+
+            if significance_out:
+                seq_candidate = os.path.splitext(significance_out)[0] + '_sequence.csv'
+                if os.path.exists(seq_candidate):
+                    resolved_by_tab['Sequence'] = seq_candidate
+
+            step_rows = '| Tab | Status | Rows | PSMs | Unique peptides (seq+charge+mods) | Unique sequences | Description |\n|-----|--------|------|------|-------------------------------|------------------|-------------|\n'
+            prev_rows_num = None
+            for tab_name, out_path, desc in tab_info:
+                resolved_out = resolved_by_tab.get(tab_name, '') or out_path
                 if resolved_out and os.path.exists(resolved_out):
-                    try:
-                        n = len(load_csv(resolved_out))
-                        rows_str = str(n)
-                    except Exception:
-                        rows_str = '—'
+                    rows_str, psm_str, uniq_pep_str, uniq_seq_str = _summary_counts_from_csv(resolved_out)
                     status = '✓'
                 else:
-                    rows_str = '—'
+                    rows_str, psm_str, uniq_pep_str, uniq_seq_str = ('—', '—', '—', '—')
                     status = '○' if out_path else '—'
-                step_rows += f'| {tab_name} | {status} | {rows_str} | {desc} |\n'
+                # Guardrail: row count increasing in downstream steps usually means mixed/stale outputs.
+                try:
+                    cur_rows_num = int(rows_str) if rows_str not in ('—', '') else None
+                except Exception:
+                    cur_rows_num = None
+                if cur_rows_num is not None and prev_rows_num is not None and cur_rows_num > prev_rows_num:
+                    status = '⚠'
+                if cur_rows_num is not None:
+                    prev_rows_num = cur_rows_num
+                step_rows += f'| {tab_name} | {status} | {rows_str} | {psm_str} | {uniq_pep_str} | {uniq_seq_str} | {desc} |\n'
             st.markdown(step_rows)
-        col1, col2, col3 = st.columns(3)
+            st.caption("Status `⚠` means downstream rows increased vs previous stage (likely mixed/stale outputs from different runs).")
+            with st.expander('Detailed pipeline stages, active thresholds, and commands', expanded=False, icon='▶'):
+                def _p(path: str, label: str) -> str:
+                    return os.path.abspath(path) if path and os.path.exists(path) else f"<{label}>"
+
+                def _cmd(cmd: list[str]) -> str:
+                    return shlex.join([str(x) for x in cmd])
+
+                sum_fasta_base = os.path.splitext(os.path.basename(fasta_path))[0] if fasta_path else 'fasta_base'
+                sum_comet_csv = os.path.join(out_dir, f'{sum_fasta_base}_comet.csv')
+                sum_comet_pin = os.path.join(out_dir, f'{sum_fasta_base}_comet.pin')
+                sum_perc_csv = os.path.join(out_dir, f'{sum_fasta_base}_comet_perc.csv')
+                sum_openms_csv = os.path.join(out_dir, f'{sum_fasta_base}_comet_perc_openMS.csv')
+
+                sum_prefilter_input = ''
+                for candidate in [step_outputs.get('openms', ''), _latest_csv_with_suffix(out_dir, ['_comet_perc_openMS']), csv_path]:
+                    if candidate and os.path.exists(candidate):
+                        sum_prefilter_input = candidate
+                        break
+
+                sum_extraction_input = ''
+                for candidate in [
+                    (step5_input if step5_input and os.path.exists(step5_input) else None),
+                    _latest_csv_with_suffix(out_dir, ['_prefilter', '_confidence']),
+                    (step6_input if step6_input and os.path.exists(step6_input) else None),
+                    csv_path,
+                ]:
+                    if candidate and os.path.exists(candidate):
+                        sum_extraction_input = candidate
+                        break
+
+                sum_envelope_input = _latest_csv_with_suffix(out_dir, ['_extraction', '_extraction_test']) or step6_input or ''
+                sum_sig_input = (
+                    _latest_csv_with_suffix(out_dir, ['_prefilter_extraction_test_envelope', '_prefilter_extraction_envelope', '_envelope'])
+                    or step_outputs.get('envelope', '')
+                    or step_outputs.get('extraction', '')
+                    or ''
+                )
+                sum_seq_input = ''
+                for candidate in [step_outputs.get('significance', ''), step_outputs.get('envelope', ''), step_outputs.get('extraction', '')]:
+                    if candidate and os.path.exists(candidate):
+                        sum_seq_input = candidate
+                        break
+
+                comet_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'run_comet_with_percolator.py'),
+                    '--mzml', _p(mzml_path, 'mzML'),
+                    '--fasta', _p(fasta_path, 'FASTA'),
+                    '--params', _p(params_path, 'comet.params.new'),
+                    '--skip-percolator',
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--output-base', sum_fasta_base,
+                ]
+                if comet_exe_path and str(comet_exe_path).strip():
+                    comet_cmd += ['--comet-exe', comet_exe_path.strip()]
+
+                percolator_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'add_percolator_qvalues.py'),
+                    '--csv', _p(sum_comet_csv, 'comet_csv'),
+                    '--pin', _p(sum_comet_pin, 'comet_pin'),
+                    '--output', _p(sum_perc_csv, 'comet_perc_csv'),
+                    '--fill-unmatched', '1.0',
+                ]
+
+                openms_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'add_ms1_data_openms.py'),
+                    _p(sum_perc_csv, 'comet_perc_csv'),
+                    _p(mzml_path, 'mzML'),
+                    _p(sum_openms_csv, 'comet_perc_openMS_csv'),
+                ]
+
+                prefilter_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_comet_frags_confidence.py'),
+                    '--input', _p(sum_prefilter_input, 'openMS_csv'),
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--q-threshold', str(q_thresh),
+                    '--pep-threshold', str(pep_thresh),
+                    '--xcorr-min', str(xcorr_min),
+                    '--sp-min', str(sp_min),
+                ]
+                if use_q_filter:
+                    prefilter_cmd += ['--use-q']
+                if use_pep_filter:
+                    prefilter_cmd += ['--use-pep']
+                if enable_xcorr_filter:
+                    prefilter_cmd += ['--use-xcorr']
+                if enable_sp_filter:
+                    prefilter_cmd += ['--use-sp']
+                if enable_ms1_mz_error_filter:
+                    prefilter_cmd += ['--ms1-mz-error-ppm', str(ms1_mz_error_ppm_thresh)]
+                else:
+                    prefilter_cmd += ['--disable-ms1-mz-error']
+
+                pipeline_extraction_plot_dir = _rotate_plot_version('extraction')
+                pipeline_sequence_plot_dir = _rotate_plot_version('sequence')
+                extraction_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'extract_chromatograms_from_comet_frags_csv_mzml.py'),
+                    '--mzml', _p(mzml_path, 'mzML'),
+                    '--csv', _p(sum_extraction_input, 'prefilter_csv'),
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--plots-output-dir', _p(pipeline_extraction_plot_dir, 'plots_output_dir'),
+                    '--peak-matching-ppm-threshold', str(peak_matching_ppm_threshold),
+                    '--apex-ppm-reject-threshold', str(apex_ppm_reject_threshold),
+                    '--min-apex-intensity', str(apex_min if enable_apex else 0.0),
+                    '--shape-corr-min', str(shape_min if enable_shape else 0.0),
+                    '--use-nested-dirs',
+                ]
+                if extraction_test:
+                    extraction_cmd.append('--test')
+                if extraction_extract_only:
+                    extraction_cmd.append('--extract-only')
+
+                envelope_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_envelope.py'),
+                    '--input', _p(sum_envelope_input, 'extraction_csv'),
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--no-plots',
+                ]
+
+                sig_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_significant_frags_summed_ms2.py'),
+                    '--mzml', _p(mzml_path, 'mzML'),
+                    '--input', _p(sum_sig_input, 'envelope_or_extraction_csv'),
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--ppm', str(ppm_thresh),
+                    '--min-frac', str(sig_frac_pct / 100.0),
+                    '--min-sig-frags', str(int(min_sig_frag_count)),
+                    '--min-overhangs', '2',
+                ]
+
+                sequence_cmd = [
+                    sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'compare_unique_peptides_sequence.py'),
+                    '--input', _p(sum_seq_input, 'significance_or_envelope_csv'),
+                    '--output-dir', _p(out_dir, 'output_dir'),
+                    '--sequence-coverage-dir', _p(os.path.join(pipeline_sequence_plot_dir, 'sequence_coverage'), 'sequence_coverage_dir'),
+                    '--fasta', _p(fasta_path, 'FASTA'),
+                ]
+
+                detail_md = [
+                    "### Stage Details",
+                    f"- **Comet**: search mzML vs FASTA with Comet params. Parameters: `mzML`, `FASTA`, `params`, `comet_exe(optional)`, `output_base`. Command: `{_cmd(comet_cmd)}`",
+                    f"- **Percolator**: adds q-values from `.pin` to Comet CSV. Parameters: `fill_unmatched=1.0`. Command: `{_cmd(percolator_cmd)}`",
+                    f"- **OpenMS MS1**: annotates MS1 RT/intensity windows. Parameters: `input=comet_perc.csv`, `mzML`, `output=comet_perc_openMS.csv`. Command: `{_cmd(openms_cmd)}`",
+                    f"- **Prefilter**: confidence and quality filters. Active thresholds: `use_q={use_q_filter}`, `q_threshold={q_thresh:.3f}`, `use_pep={use_pep_filter}`, `pep_threshold={pep_thresh:.3f}`, `use_xcorr={enable_xcorr_filter}`, `xcorr_min={xcorr_min:.2f}`, `use_sp={enable_sp_filter}`, `sp_min={sp_min:.2f}`, `use_ms1_mz_error={enable_ms1_mz_error_filter}`, `ms1_mz_error_ppm<={ms1_mz_error_ppm_thresh:.1f}`, plus proline/modification logic from prefilter script. Command: `{_cmd(prefilter_cmd)}`",
+                    f"- **Extraction**: chromatogram extraction and summed MS1/MS2 features. Active options: `test_mode={extraction_test}`, `extract_only={extraction_extract_only}`, `peak_matching_ppm_threshold={peak_matching_ppm_threshold:.1f}`, `apex_ppm_reject_threshold={apex_ppm_reject_threshold:.1f}`, `min_apex_intensity={float(apex_min if enable_apex else 0.0):.0f}`, `shape_corr_min={float(shape_min if enable_shape else 0.0):.2f}`; extraction script computes envelope/apex/coelution/shape features used downstream. Command: `{_cmd(extraction_cmd)}`",
+                    f"- **Envelope**: strict isotope-envelope filter. Criteria: requires `M0,M+1,M+2,M+3` and `M0/M+1 > M+2 > M+3`. Command: `{_cmd(envelope_cmd)}`",
+                    f"- **Significance**: summed MS2 fragment significance filter. Active thresholds: `ppm={ppm_thresh:.1f}`, `min_sig_frags={int(min_sig_frag_count)}`, `min_overhangs=2`, `min_fragment_fraction={sig_frac_pct:.1f}%` of max summed MS2 peak. Command: `{_cmd(sig_cmd)}`",
+                    f"- **Sequence**: sequence coverage/family/valuable-sequence computation and unique peptide outputs. Inputs: significance/envelope/extraction CSV + FASTA. Command: `{_cmd(sequence_cmd)}`",
+                ]
+                st.markdown('\n'.join(detail_md))
+                st.markdown(
+                    "\n".join([
+                        "### Count Definitions",
+                        "- **Rows**: total number of CSV rows at that stage (each row is one record in the table).",
+                        "- **PSMs**: peptide-spectrum matches; when a scan column is present (`scan`, `scan_num`, `scan_number`, `spectrum_scan`, `scan_id`), this is counted as unique `(sequence, charge, modifications, scan)`; otherwise it falls back to row count.",
+                        "- **Unique peptides (seq+charge+mods)**: unique peptide entities at precursor level, counted as unique `(sequence, charge, modifications)` regardless of how many scans/rows support them.",
+                        "- **Unique sequences**: unique amino-acid sequences only (charge/modifications ignored; bracketed mass annotations removed before counting).",
+                    ])
+                )
+        # Top summary metrics should reflect pipeline endpoints, not currently loaded intermediate CSV.
+        comet_rows_num = None
+        comet_unique_pep_num = None
+        final_rows_num = None
+        final_unique_pep_num = None
+        try:
+            comet_out = resolved_by_tab.get('Comet', '')
+            if comet_out and os.path.exists(comet_out):
+                c_rows, _, c_uniq_pep, _ = _summary_counts_from_csv(comet_out)
+                comet_rows_num = int(c_rows) if c_rows not in ('—', '') else None
+                comet_unique_pep_num = int(c_uniq_pep) if c_uniq_pep not in ('—', '') else None
+        except Exception:
+            comet_rows_num = None
+            comet_unique_pep_num = None
+        try:
+            # Prefer Sequence unique peptides, then Significance/Envelope/Extraction unique peptides as fallback.
+            for tname in ['Sequence', 'Significance', 'Envelope', 'Extraction', 'Prefilter']:
+                t_out = resolved_by_tab.get(tname, '')
+                if t_out and os.path.exists(t_out):
+                    f_rows, _, u_pep, _ = _summary_counts_from_csv(t_out)
+                    if f_rows not in ('—', ''):
+                        final_rows_num = int(f_rows)
+                    if u_pep not in ('—', ''):
+                        final_unique_pep_num = int(u_pep)
+                        break
+        except Exception:
+            final_rows_num = None
+            final_unique_pep_num = None
+
+        metric_original_rows = comet_rows_num if comet_rows_num is not None else n_orig
+        metric_final_rows = final_rows_num if final_rows_num is not None else n_final
+        metric_original_unique = comet_unique_pep_num if comet_unique_pep_num is not None else n_orig
+        metric_final_unique = final_unique_pep_num if final_unique_pep_num is not None else n_final
+        metric_retention_unique = (100.0 * metric_final_unique / metric_original_unique) if metric_original_unique and metric_original_unique > 0 else 0.0
+
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.metric('Original', n_orig)
+            st.metric('Original rows', metric_original_rows)
         with col2:
-            st.metric('After filters', n_final)
+            st.metric('Final rows', metric_final_rows)
         with col3:
-            pct = 100 * n_final / n_orig if n_orig > 0 else 0
-            st.metric('Retention %', f'{pct:.1f}%')
+            st.metric('Original unique peptides', metric_original_unique)
+        with col4:
+            st.metric('Final unique peptides', metric_final_unique)
+        with col5:
+            st.metric('Unique peptide retention %', f'{metric_retention_unique:.1f}%')
+        st.caption('Retention is computed using unique peptides (sequence+charge+mods): final / original.')
         st.write('Columns:', ', '.join(df.columns[:20].tolist()) + ('...' if len(df.columns) > 20 else ''))
 
     with filter_tabs[1]:  # Comet
@@ -1956,7 +2579,6 @@ def main():
         else:
             st.caption('OpenMS input CSV: (none detected)')
         run_openms = st.button('Run OpenMS (add MS1 data)', key='run_openms', help='[fasta]_comet_perc.csv → [fasta]_comet_perc_openMS.csv')
-        run_seqpos = st.button('Add sequence positions', key='run_seqpos', help='add_sequence_positions.py')
         if run_openms and openms_csv_in and mzml_path and os.path.exists(mzml_path):
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'add_ms1_data_openms.py'), openms_csv_in, mzml_path, openms_csv_out]
             _queue_run(cmd, 'OpenMS MS1', '_comet_perc_openMS.csv', output_path=openms_csv_out)
@@ -1966,13 +2588,6 @@ def main():
                 st.warning('Run Comet and Percolator first.')
             if not mzml_path or not os.path.exists(mzml_path):
                 st.warning('Select mzML in sidebar.')
-        if run_seqpos and openms_csv_in and fasta_path and os.path.exists(fasta_path):
-            seqpos_out = os.path.join(out_dir, os.path.splitext(os.path.basename(openms_csv_in))[0] + '_positions.csv')
-            cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'add_sequence_positions.py'), openms_csv_in, fasta_path, seqpos_out]
-            _queue_run(cmd, 'Sequence positions', '_positions.csv', output_path=seqpos_out)
-            _execute_pending_run(stream_container=openms_run_live)
-        elif run_seqpos and (not openms_csv_in or not fasta_path):
-            st.warning('Run pipeline first. Select FASTA in sidebar.')
         if openms_csv_out:
             if st.session_state.get('last_step_name') == 'OpenMS MS1':
                 last_openms = st.session_state.get('last_step_output')
@@ -2048,7 +2663,7 @@ def main():
                         fig = px.bar(plot_df, x='Category', y='Count', title='Byonic vs Comet peptide overlap')
                         fig.update_layout(template='plotly_dark', height=350, margin=dict(l=40, r=20, t=40, b=80), showlegend=False)
                         fig.update_xaxes(tickangle=-30)
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
                         byonic_only_df = pd.DataFrame([{'plain_peptide': s, 'charge': z} for (s, z) in sorted(byonic_only)])
                         comet_only_df = pd.DataFrame([{'plain_peptide': p, 'charge': z} for (p, z) in sorted(comet_only)])
                         base = os.path.splitext(os.path.basename(compare_comet_path))[0]
@@ -2090,13 +2705,21 @@ def main():
                 break
         if run_step4 and prefilter_input:
             cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_comet_frags_confidence.py'),
-                   '--input', prefilter_input, '--output-dir', out_dir]
-            if use_qpep:
-                cmd.extend(['--use-qpep', '--q-threshold', str(q_thresh), '--pep-threshold', str(pep_thresh)])
+                   '--input', prefilter_input, '--output-dir', out_dir,
+                   '--q-threshold', str(q_thresh), '--pep-threshold', str(pep_thresh),
+                   '--xcorr-min', str(xcorr_min), '--sp-min', str(sp_min)]
+            if use_q_filter:
+                cmd.extend(['--use-q'])
+            if use_pep_filter:
+                cmd.extend(['--use-pep'])
             if enable_xcorr_filter:
-                cmd.extend(['--use-xcorr', '--xcorr-min', str(xcorr_min)])
+                cmd.extend(['--use-xcorr'])
             if enable_sp_filter:
-                cmd.extend(['--use-sp', '--sp-min', str(sp_min)])
+                cmd.extend(['--use-sp'])
+            if enable_ms1_mz_error_filter:
+                cmd.extend(['--ms1-mz-error-ppm', str(ms1_mz_error_ppm_thresh)])
+            else:
+                cmd.extend(['--disable-ms1-mz-error'])
             _queue_run(cmd, 'Prefilter', '_prefilter.csv', input_path=prefilter_input)
             _execute_pending_run(stream_container=prefilter_run_live)
         elif run_step4:
@@ -2136,7 +2759,8 @@ def main():
                     st_ = [_status_all(i) for i in df_orig[valid].index]
                     fig = _scatter_plotly(x, y, color=st_, title=f'Q-value vs PEP (n={len(x)})',
                                           xlabel='Q-value', ylabel='PEP', log_x=True, log_y=True,
-                                          hline=pep_thresh, vline=q_thresh)
+                                          hline=(pep_thresh if use_pep_filter else None),
+                                          vline=(q_thresh if use_q_filter else None))
                     if fig:
                         prefilter_plots.append((fig, 'qpep'))
             # Xcorr vs Sp
@@ -2275,9 +2899,16 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
 ```
                         """)
                 else:
+                    plot_output_dir = _rotate_plot_version('extraction')
                     cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'extract_chromatograms_from_comet_frags_csv_mzml.py'),
                            '--mzml', os.path.abspath(mzml_path), '--csv', os.path.abspath(extraction_input),
-                           '--output-dir', os.path.abspath(out_dir), '--use-nested-dirs']
+                           '--output-dir', os.path.abspath(out_dir),
+                           '--plots-output-dir', os.path.abspath(plot_output_dir),
+                           '--peak-matching-ppm-threshold', str(peak_matching_ppm_threshold),
+                           '--apex-ppm-reject-threshold', str(apex_ppm_reject_threshold),
+                           '--min-apex-intensity', str(apex_min if enable_apex else 0.0),
+                           '--shape-corr-min', str(shape_min if enable_shape else 0.0),
+                           '--use-nested-dirs']
                     if extraction_test:
                         cmd.append('--test')
                     if extraction_extract_only:
@@ -2292,12 +2923,8 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                     _queue_run(cmd, 'Extraction', out_suffix, needs_visualization=True, input_path=extraction_input, output_path=ext_output_path)
                     _execute_pending_run(stream_container=extraction_run_live)
 
-                    # After a successful extraction run, default to showing chromatogram panels.
-                    if st.session_state.get('script_step') == 'Extraction':
-                        st.session_state.show_extraction_accepted = True
-                        st.session_state.show_extraction_rejected = True
         st.subheader('Extraction')
-        st.caption('Envelope, apex ≥10⁵, coelution, shape correlation, S/N fragments 1% max.')
+        st.caption('Extraction quality gates: apex intensity, shape correlation, and apex MS1 ppm. Envelope filtering is handled in Envelope step.')
         st.caption('Pass/Fail = passed all filters')
         extraction_preview = _resolve_preview_output('Extraction', step_outputs['extraction'])
         if extraction_preview:
@@ -2337,32 +2964,40 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                                 st.session_state.extraction_hires_plot = p
                                 st.session_state.extraction_hires_label = os.path.basename(p)
 
-            # Auto-show plots when they exist (user wants them displayed)
+            # Keep extraction plot rendering opt-in to avoid expensive auto-loading.
             for key in ['show_extraction_accepted', 'show_extraction_rejected']:
                 if key not in st.session_state:
-                    st.session_state[key] = (key == 'show_extraction_accepted' and bool(ext_accepted)) or (key == 'show_extraction_rejected' and bool(ext_rejected))
+                    st.session_state[key] = False
             col_acc, col_rej, _ = st.columns([1, 1, 3])
             with col_acc:
                 if st.button('Generate plots (accepted)', key='gen_extraction_accepted',
                              help='Run plot script and show accepted peptide chromatograms'):
+                    plot_output_dir = _rotate_plot_version('extraction')
                     st.session_state.show_extraction_accepted = True
                     st.session_state.extraction_hires_plot = None
                     st.session_state.extraction_hires_label = ''
                     if has_metrics_traces:
                         plot_cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'plot_chromatograms_from_extraction.py'),
-                                    '--output-dir', os.path.abspath(out_dir), '--clear-output']
+                                    '--output-dir', os.path.abspath(plot_output_dir),
+                                    '--chromatogram-metrics-csv', os.path.abspath(metrics_csv),
+                                    '--chromatogram-traces', os.path.abspath(traces_path),
+                                    '--clear-output']
                         if step_outputs.get('extraction') and os.path.exists(step_outputs['extraction']):
                             plot_cmd.extend(['--filter-csv', step_outputs['extraction']])
                         _queue_run(plot_cmd, 'Chromatogram plots', '_chromatograms', needs_visualization=True)
             with col_rej:
                 if st.button('Generate plots (rejected)', key='gen_extraction_rejected',
                              help='Run plot script and show rejected peptide chromatograms'):
+                    plot_output_dir = _rotate_plot_version('extraction')
                     st.session_state.show_extraction_rejected = True
                     st.session_state.extraction_hires_plot = None
                     st.session_state.extraction_hires_label = ''
                     if has_metrics_traces:
                         plot_cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'plot_chromatograms_from_extraction.py'),
-                                    '--output-dir', os.path.abspath(out_dir), '--clear-output']
+                                    '--output-dir', os.path.abspath(plot_output_dir),
+                                    '--chromatogram-metrics-csv', os.path.abspath(metrics_csv),
+                                    '--chromatogram-traces', os.path.abspath(traces_path),
+                                    '--clear-output']
                         if step_outputs.get('extraction') and os.path.exists(step_outputs['extraction']):
                             plot_cmd.extend(['--filter-csv', step_outputs['extraction']])
                         _queue_run(plot_cmd, 'Chromatogram plots', '_chromatograms', needs_visualization=True)
@@ -2387,60 +3022,47 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                 elif has_metrics_traces:
                     st.info('Click **Generate plots (rejected)** to run the plot script. PNGs will appear after it completes.')
 
-            overview_plots = _list_chromatogram_overview_plots(out_dir)
-            if overview_plots:
-                st.markdown('**Chromatogram overview/zoom plots**')
-                _render_extraction_thumb_gallery(overview_plots, 'ext_overview')
+            show_any_extraction_plots = bool(
+                st.session_state.get('show_extraction_accepted', False)
+                or st.session_state.get('show_extraction_rejected', False)
+            )
+            if show_any_extraction_plots:
+                overview_plots = _list_chromatogram_overview_plots(out_dir)
+                if overview_plots:
+                    st.markdown('**Chromatogram overview/zoom plots**')
+                    _render_extraction_thumb_gallery(overview_plots, 'ext_overview')
 
-            selected_plot = st.session_state.get('extraction_hires_plot')
-            if selected_plot and os.path.exists(selected_plot):
-                plot_label = st.session_state.get('extraction_hires_label') or os.path.basename(selected_plot)
-                if hasattr(st, 'dialog'):
-                    @st.dialog('High-resolution chromatogram plot')
-                    def _show_extraction_plot_dialog():
-                        st.caption(plot_label)
-                        try:
-                            full_bytes = _read_display_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot), max_width=3600)
-                        except Exception:
-                            full_bytes = selected_plot
-                        st.image(full_bytes, width='stretch')
-                        try:
-                            original_bytes = _read_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot))
-                        except Exception:
-                            original_bytes = b''
-                        act_col1, act_col2 = st.columns(2)
-                        with act_col1:
-                            if original_bytes:
-                                st.download_button(
-                                    'Download original PNG',
-                                    data=original_bytes,
-                                    file_name=os.path.basename(selected_plot),
-                                    mime='image/png',
-                                    key=f'dl_extraction_hires_{os.path.basename(selected_plot)}'
-                                )
-                        with act_col2:
-                            if st.button('Close', key='close_extraction_hires_dialog'):
-                                st.session_state.extraction_hires_plot = None
-                                st.session_state.extraction_hires_label = ''
-                                st.rerun()
-
-                    _show_extraction_plot_dialog()
-                else:
-                    # Fallback for older Streamlit versions without modal dialogs.
+                selected_plot = st.session_state.get('extraction_hires_plot')
+                if selected_plot and os.path.exists(selected_plot):
+                    plot_label = st.session_state.get('extraction_hires_label') or os.path.basename(selected_plot)
                     st.markdown('**High-resolution plot viewer**')
-                    viewer_col1, viewer_col2 = st.columns([1, 5])
-                    with viewer_col1:
-                        if st.button('Close', key='close_extraction_hires'):
-                            st.session_state.extraction_hires_plot = None
-                            st.session_state.extraction_hires_label = ''
-                            st.rerun()
-                    with viewer_col2:
-                        st.caption(plot_label)
+                    # Prominent Close button at top so user can always exit
+                    if st.button('← Back to gallery', key='close_extraction_hires', type='primary', use_container_width=True):
+                        st.session_state.extraction_hires_plot = None
+                        st.session_state.extraction_hires_label = ''
+                        st.rerun()
+                    st.caption(plot_label)
+                    # Full resolution: load original PNG bytes (no downscale) for expanded view
                     try:
-                        full_bytes = _read_display_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot), max_width=3600)
+                        original_bytes = _read_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot))
                     except Exception:
-                        full_bytes = selected_plot
-                    st.image(full_bytes, width='stretch')
+                        original_bytes = None
+                    if original_bytes:
+                        st.image(original_bytes, use_container_width=True)
+                        st.download_button(
+                            'Download original PNG',
+                            data=original_bytes,
+                            file_name=os.path.basename(selected_plot),
+                            mime='image/png',
+                            key=f'dl_extraction_hires_{os.path.basename(selected_plot)}'
+                        )
+                    else:
+                        st.image(selected_plot, use_container_width=True)
+                    # Second Close button below image so it's visible after scrolling
+                    if st.button('← Back to gallery', key='close_extraction_hires_bottom', type='primary', use_container_width=True):
+                        st.session_state.extraction_hires_plot = None
+                        st.session_state.extraction_hires_label = ''
+                        st.rerun()
         elif has_extraction:
             st.info('Run Extraction to generate chromatogram_metrics_all.csv and chromatogram_traces.npz.')
 
@@ -2509,6 +3131,7 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
         envelope_run_live = st.container()
         run_step7 = st.button('Run Envelope', key='run_step7', help='Envelope filter')
         if run_step7:
+            _request_tab_focus('Envelope', ttl=1)
             # Envelope runs on the most recent extraction CSV in output dir.
             env_input = _latest_csv_with_suffix(out_dir, ['_extraction', '_extraction_test']) or step6_input
             if not env_input or not os.path.exists(env_input):
@@ -2526,149 +3149,143 @@ export DYLD_LIBRARY_PATH=$(brew --prefix openms)/lib:$DYLD_LIBRARY_PATH
                         st.error('Input CSV has no envelope intensity columns (m0/m1/m2/m3). Run Extraction (Step 6) first.')
                     else:
                         cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'filter_envelope.py'),
-                               '--input', env_input, '--output-dir', out_dir, '--no-plots']
+                               '--input', env_input, '--output-dir', out_dir, '--no-plots',
+                               '--envelope-mode', envelope_mode]
                         _queue_run(cmd, 'Envelope', '_envelope.csv', needs_visualization=True, input_path=env_input)
                         _execute_pending_run(stream_container=envelope_run_live)
                 except Exception as e:
                     st.error(f'Could not verify input: {e}')
         st.subheader('Envelope')
-        st.caption('Require M0, M+1, M+2, M+3 present and both M0/M+1 > M+2/M+3. Output: ..._envelope.csv. Plot buttons below generate per-peptide summed MS1 spectra for accepted/rejected sets.')
+        st.caption('Require M0, M+1, M+2, M+3 present and M0/M+1 > M+2 > M+3. Output: ..._envelope.csv. Plot buttons below generate per-peptide summed MS1 spectra for accepted/rejected sets.')
         envelope_preview = _resolve_preview_output('Envelope', step_outputs['envelope'])
         if envelope_preview:
             _render_step_output_csv(envelope_preview, 'step7_envelope', expanded=(csv_path == envelope_preview))
+        if 'show_envelope_accepted' not in st.session_state:
+            st.session_state.show_envelope_accepted = False
+        if 'show_envelope_rejected' not in st.session_state:
+            st.session_state.show_envelope_rejected = False
 
-        gen_envelope = st.button('Generate plots', key='gen_envelope_plots', help='Build envelope pass/fail diagnostic summary')
-        if gen_envelope:
-            _clear_chromatograms_cache()
-            st.session_state['show_envelope_plots'] = True
-        if st.session_state.get('show_envelope_plots', False):
-            import plotly.express as px
-            envelope_plots = []
-            if has_envelope:
-                env_col = 'm0_m1_gt_m2_m3' if 'm0_m1_gt_m2_m3' in df_orig.columns else ('m0_gt_m1_gt_m2' if 'm0_gt_m1_gt_m2' in df_orig.columns else ('envelope_ok' if 'envelope_ok' in df_orig.columns else None))
-                if env_col:
-                    def _env_status(row):
-                        v = row.get(env_col)
-                        if pd.isna(v): return 'Missing'
-                        if _to_bool(v): return 'Pass (M0 and M+1 > M+2 and M+3)'
-                        return 'Fail'
-                    env_status = df_orig.apply(_env_status, axis=1)
-                    all_status = [_status_all(idx) for idx in df_orig.index]
-                    plot_df = pd.DataFrame({'Envelope': env_status, 'All filters': all_status})
-                    fig = px.histogram(plot_df, x='Envelope', color='All filters', barmode='stack',
-                                       title='Envelope (M0 and M+1 > M+2 and M+3) — Pass all filters by category',
-                                       color_discrete_map={'Fail': 'red', 'Pass': 'dodgerblue'})
-                    _reorder_traces_smaller_on_top(fig, plot_df, 'All filters')
-                    fig.update_layout(template='plotly_dark', height=PLOT_HEIGHT, margin=dict(l=40, r=20, t=40, b=40))
-                    envelope_plots.append((fig, 'envelope'))
-                if envelope_plots:
-                    _plot_grid(envelope_plots)
-            else:
-                st.caption('Load extraction CSV with m0/m1/m2(/m3) intensity columns for envelope diagnostics.')
-        else:
-            st.caption("Click **Generate plots** to load envelope diagnostic plots.")
+        envelope_plot_input = _latest_csv_with_suffix(out_dir, ['_extraction', '_extraction_test']) or step6_input
+        can_gen_envelope_plots = bool(
+            envelope_plot_input and os.path.exists(envelope_plot_input) and mzml_path and os.path.exists(mzml_path)
+        )
 
-        # Summed MS1 spectrum — same as individual extraction subplot
-        if has_envelope and mzml_path and os.path.exists(mzml_path):
-            st.markdown('**Summed MS1 spectrum** (integration window)')
-            try:
-                def _peptide_key_env(r):
-                    m = str(r.get('modifications', '-')).strip() if 'modifications' in r.index else '-'
-                    if not m or m.lower() == 'nan': m = '-'
-                    return f"{str(r.get('plain_peptide', r.get('peptide', ''))).strip()}_{int(r.get('charge', 0) or 0)}_{m}"
-
-                df_env = df_orig.copy()
-                if 'peptide_key' not in df_env.columns:
-                    df_env['peptide_key'] = df_env.apply(_peptide_key_env, axis=1)
-                env_peptides = df_env['peptide_key'].drop_duplicates().tolist()
-                env_options = ['— Select peptide —'] + env_peptides
-                sel_env_pep = st.selectbox('Select peptide for summed MS1 spectrum', env_options, key='envelope_ms1_sel')
-                if sel_env_pep and sel_env_pep != '— Select peptide —':
-                    match = df_env[df_env['peptide_key'] == sel_env_pep].iloc[0]
-                    from visualization.chromatograms import create_summed_ms1_spectrum_figure
-                    fig = create_summed_ms1_spectrum_figure(match, mzml_path, peptide_key=sel_env_pep)
-                    if fig is not None:
-                        st.pyplot(fig)
-                        plt.close(fig)
-                    else:
-                        st.caption('Could not generate spectrum (missing RT windows or m/z).')
-            except ImportError as e:
-                st.caption(f'Summed MS1 spectrum requires visualization.chromatograms: {e}')
-            except Exception as e:
-                st.caption(f'Summed MS1 spectrum error: {e}')
-        elif has_envelope:
-            st.info('Select mzML in sidebar to view summed MS1 spectra.')
-
-        # Envelope summed MS1 spectrum plots — accepted vs rejected
-        env_accepted, env_rejected = _list_chromatogram_plots_by_status(out_dir, 'envelope')
-        env_plot_filter_input = _latest_csv_with_suffix(out_dir, ['_extraction', '_extraction_test']) or step6_input
-        can_generate_env_summed = bool(env_plot_filter_input and os.path.exists(env_plot_filter_input) and mzml_path and os.path.exists(mzml_path))
-
-        def _run_envelope_summed_ms1_plots(mode: str, target_dir: str) -> bool:
-            """Run summed MS1 plot generation using the shared single-terminal runner."""
-            if mode not in ('accepted', 'rejected'):
-                st.error(f'Unknown mode: {mode}')
-                return False
-            if not can_generate_env_summed:
-                st.error('Need latest extraction CSV and mzML to generate summed MS1 envelope plots.')
-                return False
-            plot_cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'generate_envelope_summed_ms1_plots.py'),
-                        '--input', env_plot_filter_input,
-                        '--mzml', mzml_path,
-                        '--mode', mode,
-                        '--output-dir', target_dir,
-                        '--clear-output']
-            _queue_run(
-                plot_cmd,
-                f'Envelope summed MS1 {mode} plots',
-                '_envelope_summed_ms1',
-                needs_visualization=True,
-                input_path=env_plot_filter_input,
-            )
-            return _execute_pending_run(stream_container=envelope_run_live)
-
-        for key in ['show_envelope_accepted', 'show_envelope_rejected']:
-            if key not in st.session_state:
-                st.session_state[key] = False
-        col_env_acc, col_env_rej, _ = st.columns([1, 1, 3])
-        with col_env_acc:
-            if st.button('Generate Plots Accepted Envelopes', key='gen_envelope_accepted',
-                         help='Generate summed MS1 spectrum plots for peptides that pass Envelope criteria'):
+        env_col1, env_col2, env_col3 = st.columns([1, 1, 2])
+        with env_col1:
+            if st.button('Generate plots (accepted envelopes)', key='gen_envelope_accepted'):
                 st.session_state.show_envelope_accepted = True
-                _run_envelope_summed_ms1_plots('accepted', os.path.join(out_dir, 'envelope'))
-        with col_env_rej:
-            if st.button('Generate Plots Rejected Envelopes', key='gen_envelope_rejected',
-                         help='Generate summed MS1 spectrum plots for peptides rejected by Envelope criteria'):
+                if not can_gen_envelope_plots:
+                    st.warning('Need extraction CSV and mzML to generate envelope plots.')
+                else:
+                    plot_output_dir = _rotate_plot_version('envelope')
+                    cmd = [
+                        sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'generate_envelope_summed_ms1_plots.py'),
+                        '--input', os.path.abspath(envelope_plot_input),
+                        '--mzml', os.path.abspath(mzml_path),
+                        '--mode', 'accepted',
+                        '--output-dir', os.path.abspath(os.path.join(plot_output_dir, 'envelope')),
+                        '--clear-output',
+                    ]
+                    _queue_run(
+                        cmd, 'Envelope chromatogram plots', '_envelope_plots',
+                        needs_visualization=True, input_path=envelope_plot_input,
+                        output_path=os.path.join(plot_output_dir, 'envelope')
+                    )
+                    _execute_pending_run(stream_container=envelope_run_live)
+        with env_col2:
+            if st.button('Generate plots (rejected envelopes)', key='gen_envelope_rejected'):
                 st.session_state.show_envelope_rejected = True
-                _run_envelope_summed_ms1_plots('rejected', os.path.join(out_dir, 'envelope_rejected'))
+                if not can_gen_envelope_plots:
+                    st.warning('Need extraction CSV and mzML to generate envelope plots.')
+                else:
+                    plot_output_dir = _rotate_plot_version('envelope')
+                    cmd = [
+                        sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'generate_envelope_summed_ms1_plots.py'),
+                        '--input', os.path.abspath(envelope_plot_input),
+                        '--mzml', os.path.abspath(mzml_path),
+                        '--mode', 'rejected',
+                        '--output-dir', os.path.abspath(os.path.join(plot_output_dir, 'envelope_rejected')),
+                        '--clear-output',
+                    ]
+                    _queue_run(
+                        cmd, 'Envelope chromatogram plots', '_envelope_plots',
+                        needs_visualization=True, input_path=envelope_plot_input,
+                        output_path=os.path.join(plot_output_dir, 'envelope_rejected')
+                    )
+                    _execute_pending_run(stream_container=envelope_run_live)
+        with env_col3:
+            if st.button('Hide envelope plots', key='hide_envelope_plots'):
+                st.session_state.show_envelope_accepted = False
+                st.session_state.show_envelope_rejected = False
+                st.session_state.envelope_hires_plot = None
+                st.session_state.envelope_hires_label = ''
+
+        if 'envelope_hires_plot' not in st.session_state:
+            st.session_state.envelope_hires_plot = None
+        if 'envelope_hires_label' not in st.session_state:
+            st.session_state.envelope_hires_label = ''
+
+        # Single-peptide high-res viewer at TOP when one is selected (full-resolution PNG)
+        selected_env_plot = st.session_state.get('envelope_hires_plot')
+        if selected_env_plot and os.path.exists(selected_env_plot):
+            st.markdown('**Envelope plot — full resolution**')
+            if st.button('← Back to gallery', key='close_envelope_hires', type='primary', use_container_width=True):
+                st.session_state.envelope_hires_plot = None
+                st.session_state.envelope_hires_label = ''
+                st.rerun()
+            st.caption(st.session_state.get('envelope_hires_label') or os.path.basename(selected_env_plot))
+            try:
+                env_full_bytes = _read_image_bytes_cached(selected_env_plot, os.path.getmtime(selected_env_plot))
+            except Exception:
+                env_full_bytes = None
+            if env_full_bytes:
+                st.image(env_full_bytes, use_container_width=True)
+                st.download_button('Download PNG', data=env_full_bytes, file_name=os.path.basename(selected_env_plot), mime='image/png', key='dl_envelope_hires')
+            else:
+                st.image(selected_env_plot, use_container_width=True)
+            if st.button('← Back to gallery', key='close_envelope_hires_bottom', type='primary', use_container_width=True):
+                st.session_state.envelope_hires_plot = None
+                st.session_state.envelope_hires_label = ''
+                st.rerun()
+            st.divider()
+
+        def _render_envelope_thumb_gallery(paths: list[str], gallery_key: str, thumbs_per_row: int = 4, thumb_width: int = 200) -> None:
+            """One thumbnail per unique-peptide PNG; click Expand for full resolution (not the image expand icon)."""
+            for i in range(0, len(paths), thumbs_per_row):
+                chunk = paths[i:i + thumbs_per_row]
+                cols = st.columns(thumbs_per_row)
+                for j, p in enumerate(chunk):
+                    if not os.path.exists(p):
+                        continue
+                    try:
+                        mt = os.path.getmtime(p)
+                        thumb_bytes = _read_thumbnail_bytes_cached(p, mt, max_width=360)
+                    except Exception:
+                        thumb_bytes = p
+                    with cols[j]:
+                        st.image(thumb_bytes, width=thumb_width, caption=os.path.basename(p))
+                        # Stable unique key per path so Expand always works across reruns
+                        btn_key = f"env_expand_{hashlib.md5(p.encode()).hexdigest()[:12]}"
+                        if st.button('Expand (full res)', key=btn_key):
+                            st.session_state.envelope_hires_plot = p
+                            st.session_state.envelope_hires_label = os.path.basename(p)
+                            st.rerun()
+
         env_accepted, env_rejected = _list_chromatogram_plots_by_status(out_dir, 'envelope')
-        plots_per_row, img_width = 2, 550
         if st.session_state.show_envelope_accepted:
-            st.markdown('**Accepted** (envelope/)')
+            st.markdown('**Accepted envelopes** (one PNG per unique peptide)')
             if env_accepted:
-                st.caption('Envelope-passed summed MS1 plots from the current Envelope step input.')
-                for i in range(0, len(env_accepted), plots_per_row):
-                    chunk = env_accepted[i:i + plots_per_row]
-                    cols = st.columns(plots_per_row)
-                    for j, p in enumerate(chunk):
-                        if os.path.exists(p):
-                            with cols[j]:
-                                st.image(p, width=img_width, caption=os.path.basename(p))
-            elif can_generate_env_summed:
-                st.info('Click **Generate Plots Accepted Envelopes** to generate summed MS1 envelope plots.')
+                st.caption('Click **Expand (full res)** below a thumbnail to view that peptide at full resolution above.')
+                _render_envelope_thumb_gallery(env_accepted, 'env_accepted', thumbs_per_row=4, thumb_width=200)
+            else:
+                st.caption('No accepted envelope plots yet. Click generate.')
         if st.session_state.show_envelope_rejected:
-            st.markdown('**Rejected** (envelope_rejected/)')
+            st.markdown('**Rejected envelopes** (one PNG per unique peptide)')
             if env_rejected:
-                st.caption('Envelope-rejected summed MS1 plots from the current Envelope step input.')
-                for i in range(0, len(env_rejected), plots_per_row):
-                    chunk = env_rejected[i:i + plots_per_row]
-                    cols = st.columns(plots_per_row)
-                    for j, p in enumerate(chunk):
-                        if os.path.exists(p):
-                            with cols[j]:
-                                st.image(p, width=img_width, caption=os.path.basename(p))
-            elif can_generate_env_summed:
-                st.info('Click **Generate Plots Rejected Envelopes** to generate summed MS1 envelope plots.')
+                st.caption('Click **Expand (full res)** below a thumbnail to view that peptide at full resolution above.')
+                _render_envelope_thumb_gallery(env_rejected, 'env_rejected', thumbs_per_row=4, thumb_width=200)
+            else:
+                st.caption('No rejected envelope plots yet. Click generate.')
 
     with filter_tabs[9]:  # Significance (combined: 5ppm + min sig frags + 1% max, all from summed MS2)
         sig_frag_run_live = st.container()
@@ -2715,166 +3332,68 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
             f"Min fragment intensity = `{sig_frac_pct:.1f}%` of max summed MS2"
         )
         sig_preview = _resolve_preview_output('Significant fragmentation', step_outputs['significance'])
+        if not sig_preview or not os.path.exists(sig_preview):
+            sig_preview = _latest_csv_with_suffix(out_dir, [
+                '_prefilter_extraction_envelope_significance',
+                '_confidence_accuracy_extraction_envelope_significance',
+                '_confidence_extraction_envelope_significance',
+                '_confidence_extraction_significance',
+                '_confidence_accuracy_extraction_significance',
+                '_prefilter_extraction_test_envelope_significance',
+                '_confidence_accuracy_extraction_test_envelope_significance',
+                '_confidence_extraction_test_envelope_significance',
+                '_confidence_extraction_test_significance',
+                '_confidence_accuracy_extraction_test_significance',
+                '_significance',
+            ])
         if sig_preview:
             _render_step_output_csv(sig_preview, 'sig_frag_output', expanded=(csv_path == sig_preview))
+        else:
+            st.caption('No Significance output detected yet. Run Significant fragmentation to generate ..._significance.csv.')
+        if 'show_significance_plots' not in st.session_state:
+            st.session_state.show_significance_plots = False
+        sig_btn1, sig_btn2, _ = st.columns([1, 1, 3])
+        with sig_btn1:
+            if st.button('Load significance plots', key='load_significance_plots'):
+                st.session_state.show_significance_plots = True
+        with sig_btn2:
+            if st.button('Hide significance plots', key='hide_significance_plots'):
+                st.session_state.show_significance_plots = False
         if has_sig_frags:
-            sigfrag_plots = []
-            counts = df_orig.apply(_count_sig, axis=1)
-            effective_min = max(1, min_sig_frag_count) if enable_sig_frags else min_sig_frag_count
-            if has_extraction and 'total_area' in df_orig.columns:
-                valid = df_orig['total_area'].notna() & counts.notna()
-                if valid.sum() > 0:
-                    x = df_orig.loc[valid, 'total_area'].values
-                    y = counts[valid].values
-                    status = [_status_all(idx) for idx in df_orig[valid].index]
-                    fig = _scatter_plotly(x, y, color=status, title=f'Sig fragment count vs total area (min={effective_min}) — Pass all filters',
-                                          xlabel='Total area', ylabel='Sig fragment count', log_x=True)
-                    if fig:
-                        sigfrag_plots.append((fig, 'sig_area'))
-            import plotly.express as px
-            plot_df = pd.DataFrame({'Count': counts, 'All filters': [_status_all(idx) for idx in df_orig.index]})
-            fig2 = px.histogram(plot_df, x='Count', color='All filters', barmode='stack',
-                                title='Sig fragment count — Pass all filters',
-                                   color_discrete_map={'Fail': 'red', 'Pass': 'dodgerblue'})
-            _reorder_traces_smaller_on_top(fig2, plot_df, 'All filters')
-            fig2.update_layout(template='plotly_dark', height=PLOT_HEIGHT, margin=dict(l=40, r=20, t=40, b=40))
-            sigfrag_plots.append((fig2, 'sig_hist'))
-            _plot_grid(sigfrag_plots)
-
-            # MS2 spectrum plots — button-triggered so Significance tab loads fast and Sequence tab is not blocked
-            st.subheader('MS2 spectra')
-            can_show_ms2 = bool(mzml_path and os.path.exists(mzml_path) and
-                              (SIGNIFICANT_FRAGS_COL in df_orig.columns))
-            if not mzml_path or not os.path.exists(mzml_path):
-                st.warning('Select an mzML file in the sidebar (Files) to view MS2 spectra.')
-            elif not (SIGNIFICANT_FRAGS_COL in df_orig.columns):
-                st.warning('CSV needs significant_frags column. Run Significant fragmentation first.')
+            if st.session_state.show_significance_plots:
+                sigfrag_plots = []
+                counts = df_orig.apply(
+                    lambda row: 0 if pd.isna(row.get(SIGNIFICANT_FRAGS_COL))
+                    else len([p for p in str(row.get(SIGNIFICANT_FRAGS_COL)).replace(',', ' ').split() if p.strip()]),
+                    axis=1,
+                )
+                effective_min = max(1, min_sig_frag_count) if enable_sig_frags else min_sig_frag_count
+                if has_extraction and 'total_area' in df_orig.columns:
+                    valid = df_orig['total_area'].notna() & counts.notna()
+                    if valid.sum() > 0:
+                        x = df_orig.loc[valid, 'total_area'].values
+                        y = counts[valid].values
+                        status = [_status_all(idx) for idx in df_orig[valid].index]
+                        fig = _scatter_plotly(
+                            x, y, color=status,
+                            title=f'Sig fragment count vs total area (min={effective_min}) — Pass all filters',
+                            xlabel='Total area', ylabel='Sig fragment count', log_x=True
+                        )
+                        if fig:
+                            sigfrag_plots.append((fig, 'sig_area'))
+                import plotly.express as px
+                plot_df = pd.DataFrame({'Count': counts, 'All filters': [_status_all(idx) for idx in df_orig.index]})
+                fig2 = px.histogram(
+                    plot_df, x='Count', color='All filters', barmode='stack',
+                    title='Sig fragment count — Pass all filters',
+                    color_discrete_map={'Fail': 'red', 'Pass': 'dodgerblue'}
+                )
+                _reorder_traces_smaller_on_top(fig2, plot_df, 'All filters')
+                fig2.update_layout(template='plotly_dark', height=PLOT_HEIGHT, margin=dict(l=40, r=20, t=40, b=40))
+                sigfrag_plots.append((fig2, 'sig_hist'))
+                _plot_grid(sigfrag_plots)
             else:
-                if 'show_ms2_spectra' not in st.session_state:
-                    st.session_state.show_ms2_spectra = False
-                col_btn, _ = st.columns([1, 4])
-                with col_btn:
-                    if st.button('Generate MS2 spectra', key='gen_ms2_spectra', help='Load mzML and render spectra for accepted + rejected peptides. May take a while.'):
-                        _clear_chromatograms_cache()
-                        st.session_state.show_ms2_spectra = True
-                    if st.button('Hide MS2 spectra', key='hide_ms2_spectra', help='Stop showing MS2 plots to speed up tab loading.'):
-                        st.session_state.show_ms2_spectra = False
-                if st.session_state.show_ms2_spectra and can_show_ms2:
-                    # Accepted peptides — one plot per unique peptide, summed MS2 in integration window
-                    if passed_all and len(passed_all) > 0:
-                        st.markdown('**Accepted peptides**')
-                        accepted_rows = df_orig.loc[list(passed_all)]
-                        rt_cols = ['detected_peak_min_rt', 'detected_peak_max_rt', 'collection_min_rt', 'collection_max_rt', 'anchor_rt', 'MS1_retention_time_sec']
-                        has_rt = any(c in accepted_rows.columns for c in rt_cols)
-                        if not has_rt:
-                            st.warning('CSV needs RT columns (detected_peak_min_rt, collection_min_rt, or MS1_retention_time_sec). Load the extraction or significance CSV.')
-                        else:
-                            try:
-                                from visualization.chromatograms import create_ms2_spectrum_figure
-                                st.caption('One plot per unique peptide. Summed MS2 spectra within integration window. Significant fragments labeled.')
-                                # Group by unique peptide (plain_peptide, charge, modifications); pick best row per peptide for integration window
-                                def _pep_key(r):
-                                    pep = str(r.get('plain_peptide', '')).strip() or str(r.get('sequence', '')).strip()
-                                    ch = int(r.get('charge', 1)) if pd.notna(r.get('charge')) else 1
-                                    m = str(r.get('modifications', '-')).strip() if pd.notna(r.get('modifications')) else '-'
-                                    if not m or m.lower() == 'nan': m = '-'
-                                    return (pep, ch, m)
-                                qcol = _resolve_col(accepted_rows, QVALUE_COLS)
-                                best_rows = []
-                                for _, group in accepted_rows.groupby(accepted_rows.apply(_pep_key, axis=1)):
-                                    if qcol and qcol in group.columns:
-                                        g = group.copy()
-                                        g['_qv'] = pd.to_numeric(g[qcol], errors='coerce')
-                                        best_idx = g['_qv'].idxmin()
-                                        best_rows.append(g.loc[best_idx])
-                                    else:
-                                        best_rows.append(group.iloc[0])
-                                unique_peptides_df = pd.DataFrame(best_rows) if best_rows else pd.DataFrame()
-                                rows_data = list(unique_peptides_df.iterrows()) if len(unique_peptides_df) > 0 else []
-                                plots_per_row = 4
-                                n_shown = 0
-                                for i in range(0, len(rows_data), plots_per_row):
-                                    chunk = rows_data[i : i + plots_per_row]
-                                    cols = st.columns(plots_per_row)
-                                    for j, (idx, row) in enumerate(chunk):
-                                        with cols[j]:
-                                            pep = str(row.get('plain_peptide', '')).strip() or str(row.get('sequence', '')).strip()
-                                            ch = int(row.get('charge', 1)) if pd.notna(row.get('charge')) else 1
-                                            label = f"{pep[:25]}{'...' if len(pep) > 25 else ''} +{ch}"
-                                            fig = create_ms2_spectrum_figure(row, mzml_path, figsize=(6, 3))
-                                            if fig is not None:
-                                                st.pyplot(fig)
-                                                plt.close(fig)
-                                                n_shown += 1
-                                                with st.expander(f'Expand {label}', expanded=False, icon='▶'):
-                                                    fig_large = create_ms2_spectrum_figure(row, mzml_path, figsize=(14, 7))
-                                                    if fig_large is not None:
-                                                        st.pyplot(fig_large)
-                                                        plt.close(fig_large)
-                                            else:
-                                                st.caption(f'{label} — no MS2')
-                                if n_shown == 0 and len(rows_data) > 0:
-                                    st.caption('No MS2 spectra could be generated. Check that mzML matches the experiment and RT windows are valid.')
-                            except ImportError as e:
-                                st.caption(f'MS2 plots require visualization.chromatograms: {e}')
-                            except Exception as e:
-                                st.error(f'MS2 spectrum plot error: {e}')
-                    elif not passed_all or len(passed_all) == 0:
-                        st.info('No peptides passed all filters. Adjust thresholds or load a CSV with accepted peptides.')
-
-                    # Rejected peptides — one plot per unique peptide, summed MS2 in integration window
-                    rejected_indices = set(df_orig.index) - passed_all
-                    if rejected_indices:
-                        st.markdown('**Rejected peptides**')
-                        rejected_rows = df_orig.loc[list(rejected_indices)]
-                        rt_cols = ['detected_peak_min_rt', 'detected_peak_max_rt', 'collection_min_rt', 'collection_max_rt', 'anchor_rt', 'MS1_retention_time_sec']
-                        has_rt_rej = any(c in rejected_rows.columns for c in rt_cols)
-                        if has_rt_rej:
-                            try:
-                                from visualization.chromatograms import create_ms2_spectrum_figure
-                                st.caption('One plot per unique peptide. Summed MS2 in integration window. Uses significant_frags labels.')
-                                def _pep_key_rej(r):
-                                    pep = str(r.get('plain_peptide', '')).strip() or str(r.get('sequence', '')).strip()
-                                    ch = int(r.get('charge', 1)) if pd.notna(r.get('charge')) else 1
-                                    m = str(r.get('modifications', '-')).strip() if pd.notna(r.get('modifications')) else '-'
-                                    if not m or m.lower() == 'nan': m = '-'
-                                    return (pep, ch, m)
-                                qcol_rej = _resolve_col(rejected_rows, QVALUE_COLS)
-                                best_rows_rej = []
-                                for _, group in rejected_rows.groupby(rejected_rows.apply(_pep_key_rej, axis=1)):
-                                    if qcol_rej and qcol_rej in group.columns:
-                                        g = group.copy()
-                                        g['_qv'] = pd.to_numeric(g[qcol_rej], errors='coerce')
-                                        best_idx = g['_qv'].idxmin()
-                                        best_rows_rej.append(g.loc[best_idx])
-                                    else:
-                                        best_rows_rej.append(group.iloc[0])
-                                unique_rej_df = pd.DataFrame(best_rows_rej) if best_rows_rej else pd.DataFrame()
-                                rows_data_rej = list(unique_rej_df.iterrows()) if len(unique_rej_df) > 0 else []
-                                plots_per_row = 4
-                                for i in range(0, len(rows_data_rej), plots_per_row):
-                                    chunk = rows_data_rej[i : i + plots_per_row]
-                                    cols = st.columns(plots_per_row)
-                                    for j, (idx, row) in enumerate(chunk):
-                                        with cols[j]:
-                                            pep = str(row.get('plain_peptide', '')).strip() or str(row.get('sequence', '')).strip()
-                                            ch = int(row.get('charge', 1)) if pd.notna(row.get('charge')) else 1
-                                            label = f"{pep[:25]}{'...' if len(pep) > 25 else ''} +{ch}"
-                                            fig = create_ms2_spectrum_figure(row, mzml_path, figsize=(6, 3))
-                                            if fig is not None:
-                                                st.pyplot(fig)
-                                                plt.close(fig)
-                                                with st.expander(f'Expand {label}', expanded=False, icon='▶'):
-                                                    fig_large = create_ms2_spectrum_figure(row, mzml_path, figsize=(14, 7))
-                                                    if fig_large is not None:
-                                                        st.pyplot(fig_large)
-                                                        plt.close(fig_large)
-                                            else:
-                                                st.caption(f'{label} — no MS2')
-                            except ImportError:
-                                pass
-                            except Exception as e:
-                                st.error(f'Rejected MS2 plot error: {e}')
+                st.caption('Click **Load significance plots** to render significance diagnostics.')
         else:
             st.info('No significant_frags column. Run Significant fragmentation.')
 
@@ -2896,7 +3415,8 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                 elif not fasta_path or not os.path.exists(fasta_path):
                     st.error('Select a FASTA file in the sidebar (Files).')
                 else:
-                    seq_cov_dir = os.path.join(out_dir, 'sequence_coverage')
+                    plot_output_dir = _rotate_plot_version('sequence')
+                    seq_cov_dir = os.path.join(plot_output_dir, 'sequence_coverage')
                     os.makedirs(seq_cov_dir, exist_ok=True)
                     cmd = [sys.executable, os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'compare_unique_peptides_sequence.py'),
                            '--input', seq_cov_input, '--output-dir', out_dir,
@@ -2904,34 +3424,866 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                     _queue_run(cmd, 'Sequence coverage', '_sequence.csv', needs_visualization=True, input_path=seq_cov_input)
                     _execute_pending_run(stream_container=seq_cov_run_live)
             seq_output_path = _resolve_preview_output('Sequence coverage', step_outputs.get('sequence'))
+            if not seq_output_path or not os.path.exists(seq_output_path):
+                seq_output_path = _latest_csv_with_suffix(out_dir, [
+                    '_prefilter_extraction_envelope_significance_sequence',
+                    '_confidence_extraction_envelope_significance_sequence',
+                    '_prefilter_extraction_test_envelope_significance_sequence',
+                    '_confidence_extraction_test_envelope_significance_sequence',
+                    '_significance_sequence',
+                    '_sequence',
+                ])
             if seq_output_path and os.path.exists(seq_output_path):
+                try:
+                    df_seq = load_csv(seq_output_path)
+                    overhang_col = (
+                        'significant_single_aa_overhangs_protein_positions'
+                        if 'significant_single_aa_overhangs_protein_positions' in df_seq.columns
+                        else ('single_aa_overhangs_protein_positions' if 'single_aa_overhangs_protein_positions' in df_seq.columns else None)
+                    )
+                    unique_positions = set()
+                    if overhang_col:
+                        pos_to_rows = {}
+                        for ridx, r in df_seq.iterrows():
+                            raw = r.get(overhang_col)
+                            if pd.isna(raw) or raw is None:
+                                continue
+                            for tok in str(raw).split(','):
+                                tok = tok.strip()
+                                if not tok:
+                                    continue
+                                if tok[-1].isalpha() and tok[:-1]:
+                                    tok = tok[:-1]
+                                try:
+                                    p = int(float(tok))
+                                except Exception:
+                                    continue
+                                pos_to_rows.setdefault(p, set()).add(ridx)
+                        unique_positions = {p for p, rows in pos_to_rows.items() if len(rows) == 1}
+                    valuable_col = 'valuable_sequence' if 'valuable_sequence' in df_seq.columns else None
+                    if valuable_col:
+                        n_valuable = int(pd.to_numeric(df_seq[valuable_col], errors='coerce').fillna(0).astype(int).gt(0).sum())
+                    else:
+                        n_valuable = 0
+                    st.info(
+                        f"Sequence summary: unique overhang positions = `{len(unique_positions)}` | "
+                        f"valuable peptides = `{n_valuable}` / `{len(df_seq)}`"
+                    )
+                except Exception:
+                    pass
                 _render_step_output_csv(seq_output_path, 'seq_cov_sequence', expanded=False)
-            seq_cov_dir = os.path.join(out_dir, 'sequence_coverage')
-            seq_cov_files = _build_results_tree(seq_cov_dir) if os.path.isdir(seq_cov_dir) else []
-            unique_pep_plots = [(d, p) for d, p in seq_cov_files if 'unique_peptides' in p.lower()]
-            other_plots = [(d, p) for d, p in seq_cov_files if 'unique_peptides' not in p.lower()]
-            if unique_pep_plots:
-                st.markdown('**Unique peptides plots**')
-                for disp, fp in unique_pep_plots:
-                    st.image(fp, caption=disp, use_container_width=True)
-            if other_plots:
-                st.markdown('**Other sequence coverage plots**')
-                path_map = {disp: fp for disp, fp in other_plots}
-                options = ['— Select a plot —'] + [disp for disp, _ in other_plots]
-                sel = st.selectbox('Plots', options, key='seq_cov_plot_sel')
-                if sel and sel != '— Select a plot —':
-                    st.image(path_map[sel], use_container_width=True)
-            if not seq_cov_files:
-                if not seq_cov_input or not os.path.exists(seq_cov_input):
-                    st.info('Run Significance first, then click "Run Sequence coverage" to generate unique peptides plots. Select FASTA in the sidebar.')
+            else:
+                st.caption('No Sequence output detected yet. Run Sequence coverage to generate ..._sequence.csv.')
+            if 'show_sequence_plots' not in st.session_state:
+                st.session_state.show_sequence_plots = False
+            seq_btn1, seq_btn2, _ = st.columns([1, 1, 3])
+            with seq_btn1:
+                if st.button('Load sequence plots', key='load_sequence_plots'):
+                    st.session_state.show_sequence_plots = True
+            with seq_btn2:
+                if st.button('Hide sequence plots', key='hide_sequence_plots'):
+                    st.session_state.show_sequence_plots = False
+
+            if st.session_state.show_sequence_plots:
+                def _render_sequence_thumb_gallery(paths: list[str], gallery_key: str, thumbs_per_row: int = 4, thumb_width: int = 180) -> None:
+                    for i in range(0, len(paths), thumbs_per_row):
+                        chunk = paths[i:i + thumbs_per_row]
+                        cols = st.columns(thumbs_per_row)
+                        for j, p in enumerate(chunk):
+                            if not os.path.exists(p):
+                                continue
+                            try:
+                                mt = os.path.getmtime(p)
+                                thumb_bytes = _read_thumbnail_bytes_cached(p, mt, max_width=360)
+                            except Exception:
+                                thumb_bytes = p
+                            with cols[j]:
+                                st.image(thumb_bytes, width=thumb_width, caption=os.path.basename(p))
+
+                seq_plot_base_dir = _plot_version_dir('sequence')
+                seq_cov_dir = os.path.join(seq_plot_base_dir, 'sequence_coverage')
+                seq_cov_plots = []
+                if os.path.isdir(seq_cov_dir):
+                    seq_cov_plots = [
+                        os.path.join(seq_cov_dir, name)
+                        for name in sorted(os.listdir(seq_cov_dir))
+                        if name.lower().endswith('.png')
+                        and 'lowres' not in name.lower()
+                    ]
+                if seq_cov_plots:
+                    st.markdown('**Sequence coverage plots**')
+                    _render_sequence_thumb_gallery(seq_cov_plots, 'seq_cov_manual')
                 else:
-                    st.info('Click "Run Sequence coverage" to generate unique peptides plots (requires FASTA in sidebar).')
+                    st.caption('No sequence coverage PNGs found yet.')
+
+                seq_chrom_dir = os.path.join(seq_plot_base_dir, 'sequence_unique_chromatograms')
+                seq_chrom_plots = []
+                if os.path.isdir(seq_chrom_dir):
+                    for root, _, files in os.walk(seq_chrom_dir):
+                        for fn in files:
+                            if fn.lower().endswith('.png'):
+                                seq_chrom_plots.append(os.path.join(root, fn))
+                    seq_chrom_plots = sorted(seq_chrom_plots)
+                if seq_chrom_plots:
+                    st.markdown('**Sequence chromatogram plots**')
+                    _render_sequence_thumb_gallery(seq_chrom_plots, 'seq_chrom_manual')
+                else:
+                    st.caption('No sequence chromatogram PNGs found yet.')
+            else:
+                st.caption('Click **Load sequence plots** to render saved sequence plots.')
         except Exception as e:
             st.error(f'Sequence tab error: {e}')
             import traceback
             st.code(traceback.format_exc())
 
-    with filter_tabs[11]:  # D_MZ (Estimated Deuterated MZ target range)
+    with filter_tabs[11]:  # Windows
+        st.subheader('Windows')
+        st.caption('Sequence-passed unique peptides only. Y-axis: peptide key. X-axis: MS1 RT (min). Each peptide window is drawn only during its collection RT range.')
+        try:
+            sequence_csv = _resolve_preview_output('Sequence coverage', step_outputs.get('sequence'))
+            if not sequence_csv or not os.path.exists(sequence_csv):
+                sequence_csv = _latest_csv_with_suffix(out_dir, [
+                    '_prefilter_extraction_envelope_significance_sequence',
+                    '_confidence_extraction_envelope_significance_sequence',
+                    '_prefilter_extraction_test_envelope_significance_sequence',
+                    '_confidence_extraction_test_envelope_significance_sequence',
+                    '_significance_sequence',
+                    '_sequence',
+                ])
+
+            dataframes_dir = os.path.join(out_dir, 'dataframes')
+            metrics_csv_windows = os.path.join(dataframes_dir, 'chromatogram_metrics_all.csv')
+            traces_npz_windows = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
+
+            if not sequence_csv or not os.path.exists(sequence_csv):
+                st.info('Run Sequence first to generate a ..._sequence.csv output.')
+            elif not os.path.exists(metrics_csv_windows) or not os.path.exists(traces_npz_windows):
+                st.info('Run Extraction first to generate chromatogram_metrics_all.csv and chromatogram_traces.npz.')
+            else:
+                try:
+                    import plotly.graph_objects as go
+                except ImportError:
+                    st.warning('Plotly is required for Windows plots.')
+                    go = None
+
+                if go is not None:
+                    df_seq = load_csv(sequence_csv).copy()
+                    df_metrics = pd.read_csv(metrics_csv_windows)
+
+                    def _mods_norm(v):
+                        if v is None or (isinstance(v, float) and pd.isna(v)):
+                            return '-'
+                        s = str(v).strip()
+                        return s if s and s.lower() != 'nan' else '-'
+
+                    def _pep_col(df_):
+                        for c in ('plain_peptide', 'peptide', 'peptide_sequence', 'sequence'):
+                            if c in df_.columns:
+                                return c
+                        return None
+
+                    seq_pep_col = _pep_col(df_seq)
+                    met_pep_col = _pep_col(df_metrics)
+                    if not seq_pep_col or not met_pep_col or 'charge' not in df_seq.columns or 'charge' not in df_metrics.columns:
+                        st.error('Need peptide + charge columns in both Sequence output and chromatogram metrics.')
+                    else:
+                        df_seq['_key_pep'] = df_seq[seq_pep_col].astype(str).str.strip()
+                        df_seq['_key_charge'] = pd.to_numeric(df_seq['charge'], errors='coerce').fillna(0).astype(int)
+                        df_seq['_key_mods'] = df_seq.apply(lambda r: _mods_norm(r.get('modifications', '-')), axis=1)
+                        seq_keys = set(zip(df_seq['_key_pep'], df_seq['_key_charge'], df_seq['_key_mods']))
+
+                        df_metrics['_key_pep'] = df_metrics[met_pep_col].astype(str).str.strip()
+                        df_metrics['_key_charge'] = pd.to_numeric(df_metrics['charge'], errors='coerce').fillna(0).astype(int)
+                        df_metrics['_key_mods'] = df_metrics.apply(lambda r: _mods_norm(r.get('modifications', '-')), axis=1)
+                        df_metrics['_key'] = df_metrics.apply(lambda r: (r['_key_pep'], int(r['_key_charge']), r['_key_mods']), axis=1)
+                        df_metrics = df_metrics[df_metrics['_key'].isin(seq_keys)].copy()
+                        if df_metrics.empty:
+                            st.info('No Sequence-passed peptides matched chromatogram metrics.')
+                        else:
+                            # Keep one representative chromatogram per unique sequence+charge+mods key.
+                            if 'trace_index' in df_metrics.columns:
+                                df_metrics = df_metrics.sort_values(['_key_pep', '_key_charge', '_key_mods', 'trace_index']).drop_duplicates(subset=['_key'], keep='first')
+                            else:
+                                df_metrics = df_metrics.drop_duplicates(subset=['_key'], keep='first')
+
+                            rows = []
+                            if 'collection_min_rt' not in df_metrics.columns or 'collection_max_rt' not in df_metrics.columns:
+                                st.error('Missing required collection-window columns in chromatogram metrics: need collection_min_rt and collection_max_rt for every peptide.')
+                            else:
+                                missing_collection = int(
+                                    (pd.to_numeric(df_metrics['collection_min_rt'], errors='coerce').isna() |
+                                     pd.to_numeric(df_metrics['collection_max_rt'], errors='coerce').isna()).sum()
+                                )
+                                if missing_collection > 0:
+                                    st.error(
+                                        f'Missing collection-window values for {missing_collection} peptide(s). '
+                                        'Every peptide must have collection_min_rt and collection_max_rt.'
+                                    )
+                                else:
+                                    traces_data = np.load(traces_npz_windows)
+                                    for _, row in df_metrics.iterrows():
+                                        try:
+                                            trace_idx = int(row['trace_index']) if 'trace_index' in df_metrics.columns and pd.notna(row.get('trace_index')) else int(_)
+                                        except Exception:
+                                            continue
+                                        rts_key = f'trace_{trace_idx}_rts'
+                                        int_key = f'trace_{trace_idx}_int'
+                                        if rts_key not in traces_data or int_key not in traces_data:
+                                            continue
+                                        rts = np.asarray(traces_data[rts_key], dtype=float).flatten()
+                                        intensity_matrix = np.asarray(traces_data[int_key], dtype=float)
+                                        if intensity_matrix.ndim > 1:
+                                            total_int = np.sum(intensity_matrix, axis=1)
+                                        else:
+                                            total_int = np.asarray(intensity_matrix, dtype=float).flatten()
+                                        n = min(len(rts), len(total_int))
+                                        if n < 2:
+                                            continue
+                                        rts = rts[:n]
+                                        total_int = total_int[:n]
+                                        coll_min = float(row.get('collection_min_rt'))
+                                        coll_max = float(row.get('collection_max_rt'))
+                                        if coll_max < coll_min:
+                                            coll_min, coll_max = coll_max, coll_min
+                                        win_mask = (rts >= coll_min) & (rts <= coll_max)
+                                        if not np.any(win_mask):
+                                            continue
+                                        pep = str(row.get(met_pep_col, '')).strip()
+                                        ch = int(row.get('charge', 0)) if pd.notna(row.get('charge')) else 0
+                                        mods = _mods_norm(row.get('modifications', '-'))
+                                        label = f"{pep} +{ch} | {mods}"
+                                        rows.append({
+                                            'label': label,
+                                            'pep': pep,
+                                            'charge': ch,
+                                            'mods': mods,
+                                            'rts_sec': rts,
+                                            'rts_min': rts / 60.0,
+                                            'ints': total_int,
+                                            'mask': win_mask,
+                                            'min_rt_sec': float(row.get('detected_peak_min_rt')) if pd.notna(row.get('detected_peak_min_rt')) else coll_min,
+                                            'max_rt_sec': float(row.get('detected_peak_max_rt')) if pd.notna(row.get('detected_peak_max_rt')) else coll_max,
+                                            'collection_min_rt_sec': coll_min,
+                                            'collection_max_rt_sec': coll_max,
+                                            'coll_min_min': coll_min / 60.0,
+                                            'coll_max_min': coll_max / 60.0,
+                                            'seq_start': int(row.get('sequence_start_pos', 999999)) if pd.notna(row.get('sequence_start_pos')) else 999999,
+                                            'total_area': float(row.get('total_area')) if pd.notna(row.get('total_area')) else None,
+                                        })
+
+                            if not rows:
+                                st.info('No usable traces found for Sequence-passed peptides.')
+                            else:
+                                windows_sort = st.selectbox(
+                                    'Order windows by',
+                                    ['RT (earliest to latest)', 'Position (N-terminus at top)'],
+                                    key='windows_sort_mode'
+                                )
+                                if windows_sort.startswith('RT'):
+                                    rows = sorted(rows, key=lambda d: (d['coll_min_min'], d['seq_start'], d['label']))
+                                else:
+                                    rows = sorted(rows, key=lambda d: (d['seq_start'], d['coll_min_min'], d['label']))
+
+                                # 1) Windows plot: one horizontal segment per peptide, clipped to collection window.
+                                fig_tracks = go.Figure()
+                                try:
+                                    from visualization.chromatograms import _total_area_colormap_for_overlay
+                                except Exception:
+                                    _total_area_colormap_for_overlay = None
+                                area_norm_win = None
+                                cmap_win = None
+                                if _total_area_colormap_for_overlay is not None:
+                                    valid_areas_win = [
+                                        max(0.0, float(r.get('total_area') or 0.0))
+                                        for r in rows
+                                        if r.get('total_area') is not None
+                                    ]
+                                    valid_areas_win = [v for v in valid_areas_win if np.isfinite(v)]
+                                    if len(valid_areas_win) > 1 and max(valid_areas_win) > min(valid_areas_win):
+                                        from matplotlib.colors import Normalize
+                                        area_norm_win = Normalize(vmin=min(valid_areas_win), vmax=max(valid_areas_win))
+                                        cmap_win = _total_area_colormap_for_overlay()
+                                y_order = [r['label'] for r in rows]
+                                for i, r in enumerate(rows):
+                                    if area_norm_win is not None and cmap_win is not None:
+                                        ta = max(0.0, float(r.get('total_area') or 0.0))
+                                        win_color = matplotlib.colors.to_hex(cmap_win(area_norm_win(ta)))
+                                    else:
+                                        win_color = '#8b8b8b'
+                                    fig_tracks.add_trace(go.Scatter(
+                                        x=[r['coll_min_min'], r['coll_max_min']],
+                                        y=[r['label'], r['label']],
+                                        mode='lines',
+                                        line=dict(width=4, color=win_color),
+                                        hovertemplate=(
+                                            f"{r['label']}<br>"
+                                            f"total_area: {float(r.get('total_area') or 0.0):.2e}<br>"
+                                            "Collection window: %{x:.2f} min"
+                                            "<extra></extra>"
+                                        ),
+                                        showlegend=False,
+                                    ))
+                                fig_tracks.update_layout(
+                                    template='plotly_dark',
+                                    height=max(350, min(1600, 22 * len(rows))),
+                                    margin=dict(l=20, r=20, t=40, b=40),
+                                    title=f'MS1 collection windows (Sequence-passed peptides; ordered by {windows_sort})',
+                                    xaxis_title='MS1 RT (min)',
+                                    yaxis_title='Peptide',
+                                    yaxis=dict(type='category', categoryorder='array', categoryarray=y_order, autorange='reversed'),
+                                )
+                                st.plotly_chart(fig_tracks, width='stretch')
+
+                                # 1b) Iterative channel thinning (valuable_sequence is annotation only).
+                                st.markdown('**Channel thinning (iterative; no valuable-sequence protection)**')
+                                st.caption(
+                                    'Run iterative thinning so overlap at any RT is <= selected channel count. '
+                                    'At each conflict RT, remove the lowest relative-area peptide regardless of valuable_sequence. '
+                                    'After each thinning pass, valuable_sequence is recomputed on the remaining set for annotation only.'
+                                )
+
+                                def _parse_seq_start_for_positions(v):
+                                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                                        return None
+                                    s = str(v).strip()
+                                    if not s:
+                                        return None
+                                    try:
+                                        if '-' in s:
+                                            return int(s.split('-')[0].strip())
+                                        if ',' in s:
+                                            return int(s.split(',')[0].strip())
+                                        return int(float(s))
+                                    except Exception:
+                                        return None
+
+                                def _parse_overhang_positions(val, seq_start=None):
+                                    pos_set = set()
+                                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                                        return pos_set
+                                    txt = str(val).strip()
+                                    if not txt or txt.lower() == 'nan':
+                                        return pos_set
+                                    for part in txt.split(','):
+                                        p = part.strip()
+                                        if not p:
+                                            continue
+                                        num = p[:-1] if p[-1].isalpha() else p
+                                        if not num.replace('.', '').replace('-', '').isdigit():
+                                            continue
+                                        try:
+                                            pos = int(float(num))
+                                        except Exception:
+                                            continue
+                                        if seq_start is not None and seq_start > 0 and pos <= 1000:
+                                            pos = seq_start + pos - 1
+                                        pos_set.add(pos)
+                                    return pos_set
+
+                                def _recompute_valuable(entries, accepted_idx):
+                                    coverage = {}
+                                    for ii in accepted_idx:
+                                        for pos in entries[ii].get('overhang_positions', set()):
+                                            coverage[pos] = coverage.get(pos, 0) + 1
+                                    unique_pos = {p for p, c in coverage.items() if c == 1}
+                                    for ii in accepted_idx:
+                                        pos = entries[ii].get('overhang_positions', set())
+                                        val = 1 if (pos & unique_pos) else 0
+                                        entries[ii]['valuable_sequence'] = val
+                                        entries[ii]['protect_peptide'] = bool(val)
+                                    n_val = sum(int(entries[ii].get('valuable_sequence', 0)) for ii in accepted_idx)
+                                    return n_val, len(unique_pos)
+
+                                def _max_overlap(entries, accepted_idx):
+                                    worst_count, _, _ = _worst_overlap_segment(entries, accepted_idx)
+                                    return int(worst_count)
+
+                                def _worst_overlap_segment(entries, accepted_idx):
+                                    """Return (count, mid_t_sec, overlapping_indices) for worst positive-width RT segment."""
+                                    if not accepted_idx:
+                                        return 0, None, []
+                                    pts = []
+                                    for ii in accepted_idx:
+                                        a = float(entries[ii]['collection_min_rt_sec'])
+                                        b = float(entries[ii]['collection_max_rt_sec'])
+                                        if b < a:
+                                            a, b = b, a
+                                        pts.extend([a, b])
+                                    pts = sorted(set(pts))
+                                    if len(pts) < 2:
+                                        return len(accepted_idx), None, list(accepted_idx)
+                                    worst_count = 0
+                                    worst_t = None
+                                    worst_overlap = []
+                                    for j in range(len(pts) - 1):
+                                        left = float(pts[j])
+                                        right = float(pts[j + 1])
+                                        if right <= left:
+                                            continue
+                                        mid = 0.5 * (left + right)
+                                        ov = []
+                                        for ii in accepted_idx:
+                                            e = entries[ii]
+                                            lo = float(e['collection_min_rt_sec'])
+                                            hi = float(e['collection_max_rt_sec'])
+                                            if hi < lo:
+                                                lo, hi = hi, lo
+                                            # Positive-width overlap on segment interior.
+                                            if lo < mid < hi:
+                                                ov.append(ii)
+                                        if len(ov) > worst_count:
+                                            worst_count = len(ov)
+                                            worst_t = mid
+                                            worst_overlap = ov
+                                    return int(worst_count), worst_t, worst_overlap
+
+                                run_windows_thin = st.button(
+                                    'Run window channel thinning',
+                                    key='run_windows_channel_thinning',
+                                    help='Iteratively thin overlap by channel limit, preserving valuable_sequence peptides.',
+                                )
+
+                                if run_windows_thin:
+                                    # Add sequence-coverage metadata (valuable_sequence + overhang positions) onto rows by peptide key.
+                                    overhang_col = (
+                                        'significant_single_aa_overhangs_protein_positions'
+                                        if 'significant_single_aa_overhangs_protein_positions' in df_seq.columns
+                                        else ('single_aa_overhangs_protein_positions' if 'single_aa_overhangs_protein_positions' in df_seq.columns else None)
+                                    )
+                                    seq_start_col = 'sequence_start_pos' if 'sequence_start_pos' in df_seq.columns else ('sequence_positions' if 'sequence_positions' in df_seq.columns else None)
+                                    val_col = 'valuable_sequence' if 'valuable_sequence' in df_seq.columns else None
+
+                                    seq_meta = {}
+                                    for _, srow in df_seq.iterrows():
+                                        k = (
+                                            str(srow.get('_key_pep', '')).strip(),
+                                            int(pd.to_numeric(srow.get('_key_charge'), errors='coerce') or 0),
+                                            _mods_norm(srow.get('_key_mods', '-')),
+                                        )
+                                        start_val = _parse_seq_start_for_positions(srow.get(seq_start_col)) if seq_start_col else None
+                                        positions = _parse_overhang_positions(srow.get(overhang_col), seq_start=start_val) if overhang_col else set()
+                                        meta = seq_meta.get(k, {'positions': set(), 'valuable_init': 0})
+                                        meta['positions'] |= positions
+                                        init_val = int(pd.to_numeric(pd.Series([srow.get(val_col, 0)]), errors='coerce').fillna(0).astype(int).iloc[0] > 0) if val_col else 0
+                                        meta['valuable_init'] = max(meta['valuable_init'], init_val)
+                                        seq_meta[k] = meta
+
+                                    entries = []
+                                    for r in rows:
+                                        key = (str(r.get('pep', '')).strip(), int(r.get('charge', 0) or 0), _mods_norm(r.get('mods', '-')))
+                                        meta = seq_meta.get(key, {'positions': set(), 'valuable_init': 0})
+                                        e = dict(r)
+                                        e['key'] = key
+                                        e['overhang_positions'] = set(meta.get('positions', set()))
+                                        e['valuable_sequence'] = int(meta.get('valuable_init', 0))
+                                        e['protect_peptide'] = bool(meta.get('valuable_init', 0))
+                                        e['removed_reason'] = ''
+                                        e['removed_iteration'] = None
+                                        entries.append(e)
+
+                                    accepted = set(range(len(entries)))
+                                    unresolvable_conflicts = 0
+                                    max_iter = max(5, len(entries) * 3)
+                                    thinning_logs = []
+
+                                    def _log(msg):
+                                        thinning_logs.append(msg)
+                                        print(f"[Windows thinning] {msg}", flush=True)
+
+                                    _log(f"Starting iterative thinning with channel limit = {int(channels_count)} across {len(entries)} peptides.")
+                                    for iter_idx in range(1, max_iter + 1):
+                                        if not accepted:
+                                            _log(f"Iteration {iter_idx}: no accepted peptides remain, stopping.")
+                                            break
+                                        _log(f"Iteration {iter_idx}: scanning valuable sequence evaluation on {len(accepted)} current peptides.")
+                                        n_val, n_unique_pos = _recompute_valuable(entries, accepted)
+                                        _log(
+                                            f"Iteration {iter_idx}: valuable sequence evaluation complete "
+                                            f"(valuable_sequence=1 for {n_val}, unique overhang positions={n_unique_pos})."
+                                        )
+                                        areas = {ii: max(0.0, float(entries[ii].get('total_area') or 0.0)) for ii in accepted}
+                                        area_sum = sum(areas.values())
+                                        rel = {ii: (areas[ii] / area_sum if area_sum > 0 else 0.0) for ii in accepted}
+                                        changed = False
+                                        _log(f"Iteration {iter_idx}: scanning channel selection conflicts across RT windows.")
+                                        while True:
+                                            worst_count, worst_t, worst_overlap = _worst_overlap_segment(entries, sorted(accepted))
+                                            if worst_count <= int(channels_count):
+                                                break
+                                            candidates = list(worst_overlap)
+                                            if not candidates:
+                                                unresolvable_conflicts += 1
+                                                _log(
+                                                    f"Iteration {iter_idx}: conflict at RT={float(worst_t or 0)/60.0:.2f} min has {len(worst_overlap)} overlaps, "
+                                                    "but no removable candidates were found."
+                                                )
+                                                break
+                                            drop_idx = min(
+                                                candidates,
+                                                key=lambda ii: (rel.get(ii, 0.0), areas.get(ii, 0.0), str(entries[ii].get('label', '')))
+                                            )
+                                            accepted.remove(drop_idx)
+                                            _log(
+                                                f"Iteration {iter_idx}: removed peptide '{entries[drop_idx].get('label', 'unknown')}' "
+                                                f"at RT={float(worst_t or 0)/60.0:.2f} min (relative_area={rel.get(drop_idx, 0.0):.4f}, "
+                                                f"total_area={areas.get(drop_idx, 0.0):.2f})."
+                                            )
+                                            entries[drop_idx]['removed_reason'] = (
+                                                f'overlap>{int(channels_count)} and lowest relative area '
+                                                f'at RT={float(worst_t or 0)/60.0:.2f} min'
+                                            )
+                                            entries[drop_idx]['removed_iteration'] = iter_idx
+                                            changed = True
+                                        if not changed:
+                                            _log(f"Iteration {iter_idx}: no removals in channel selection scan, convergence reached.")
+                                            break
+
+                                    if accepted:
+                                        _log(f"Final pass: scanning valuable sequence evaluation on {len(accepted)} accepted peptides.")
+                                        n_val_final, n_unique_final = _recompute_valuable(entries, accepted)
+                                        _log(
+                                            f"Final pass: valuable sequence evaluation complete "
+                                            f"(valuable_sequence=1 for {n_val_final}, unique overhang positions={n_unique_final})."
+                                        )
+                                    accepted_idx = sorted(list(accepted))
+                                    rejected_idx = sorted([i for i in range(len(entries)) if i not in accepted])
+                                    max_ov = _max_overlap(entries, accepted_idx)
+                                    _log(
+                                        f"Finished thinning: accepted={len(accepted_idx)}, rejected={len(rejected_idx)}, "
+                                        f"max_overlap_after={int(max_ov)}, unresolvable_conflicts={int(unresolvable_conflicts)}."
+                                    )
+
+                                    # Persist accepted/rejected CSVs with updated valuable_sequence designation.
+                                    seq_out = df_seq.copy()
+                                    status_by_key = {}
+                                    for ii, e in enumerate(entries):
+                                        status_by_key[e['key']] = {
+                                            'accepted': (ii in accepted),
+                                            'valuable_sequence': int(e.get('valuable_sequence', 0)),
+                                            'protect_peptide': bool(e.get('protect_peptide', False)),
+                                            'removed_reason': e.get('removed_reason', ''),
+                                        }
+                                    seq_out['windows_channel_thinning_status'] = seq_out.apply(
+                                        lambda rr: (
+                                            'accepted'
+                                            if status_by_key.get(
+                                                (str(rr.get('_key_pep', '')).strip(), int(pd.to_numeric(rr.get('_key_charge'), errors='coerce') or 0), _mods_norm(rr.get('_key_mods', '-'))),
+                                                {'accepted': False}
+                                            )['accepted']
+                                            else 'rejected'
+                                        ),
+                                        axis=1,
+                                    )
+                                    seq_out['valuable_sequence'] = seq_out.apply(
+                                        lambda rr: status_by_key.get(
+                                            (str(rr.get('_key_pep', '')).strip(), int(pd.to_numeric(rr.get('_key_charge'), errors='coerce') or 0), _mods_norm(rr.get('_key_mods', '-'))),
+                                            {'valuable_sequence': int(pd.to_numeric(pd.Series([rr.get('valuable_sequence', 0)]), errors='coerce').fillna(0).astype(int).iloc[0])}
+                                        )['valuable_sequence'],
+                                        axis=1,
+                                    )
+                                    seq_out['protect_peptide'] = seq_out.apply(
+                                        lambda rr: bool(status_by_key.get(
+                                            (str(rr.get('_key_pep', '')).strip(), int(pd.to_numeric(rr.get('_key_charge'), errors='coerce') or 0), _mods_norm(rr.get('_key_mods', '-'))),
+                                            {'protect_peptide': False}
+                                        )['protect_peptide']),
+                                        axis=1,
+                                    )
+                                    seq_out['windows_reject_reason'] = seq_out.apply(
+                                        lambda rr: status_by_key.get(
+                                            (str(rr.get('_key_pep', '')).strip(), int(pd.to_numeric(rr.get('_key_charge'), errors='coerce') or 0), _mods_norm(rr.get('_key_mods', '-'))),
+                                            {'removed_reason': ''}
+                                        )['removed_reason'],
+                                        axis=1,
+                                    )
+
+                                    seq_base = os.path.splitext(os.path.basename(sequence_csv))[0]
+                                    accepted_csv = os.path.join(out_dir, f'{seq_base}_windows_channels_accepted.csv')
+                                    rejected_csv = os.path.join(out_dir, f'{seq_base}_windows_channels_rejected.csv')
+                                    seq_out[seq_out['windows_channel_thinning_status'] == 'accepted'].to_csv(accepted_csv, index=False)
+                                    seq_out[seq_out['windows_channel_thinning_status'] == 'rejected'].to_csv(rejected_csv, index=False)
+
+                                    st.session_state.windows_thinning_result = {
+                                        'accepted_csv': accepted_csv,
+                                        'rejected_csv': rejected_csv,
+                                        'channels_count': int(channels_count),
+                                        'n_input': len(entries),
+                                        'n_accepted': len(accepted_idx),
+                                        'n_rejected': len(rejected_idx),
+                                        'max_overlap_after': int(max_ov),
+                                        'unresolvable_conflicts': int(unresolvable_conflicts),
+                                        'accepted_rows': [entries[i] for i in accepted_idx],
+                                        'rejected_rows': [entries[i] for i in rejected_idx],
+                                        'log_lines': thinning_logs,
+                                    }
+
+                                thin_res = st.session_state.get('windows_thinning_result')
+                                if thin_res:
+                                    st.caption(
+                                        f"Thinning summary: kept {thin_res.get('n_accepted', 0)} / {thin_res.get('n_input', 0)} "
+                                        f"(rejected {thin_res.get('n_rejected', 0)}), "
+                                        f"max overlap after thinning = {thin_res.get('max_overlap_after', 0)} "
+                                        f"with channel limit = {thin_res.get('channels_count', int(channels_count))}."
+                                    )
+                                    if int(thin_res.get('unresolvable_conflicts', 0)) > 0:
+                                        st.warning(
+                                            f"{thin_res.get('unresolvable_conflicts', 0)} overlap region(s) could not be reduced "
+                                            "because no removable candidates were found."
+                                        )
+                                    if thin_res.get('accepted_csv') and os.path.exists(thin_res['accepted_csv']):
+                                        st.markdown(f"- Accepted CSV: `{thin_res['accepted_csv']}`")
+                                    if thin_res.get('rejected_csv') and os.path.exists(thin_res['rejected_csv']):
+                                        st.markdown(f"- Rejected CSV: `{thin_res['rejected_csv']}`")
+                                    logs = thin_res.get('log_lines', [])
+                                    if logs:
+                                        with st.expander('Windows thinning log', expanded=False):
+                                            st.text_area(
+                                                'Windows thinning log output',
+                                                value='\n'.join(logs),
+                                                height=260,
+                                                key='windows_thinning_logs_view',
+                                                disabled=True,
+                                                label_visibility='collapsed',
+                                            )
+
+                                # 2) Extraction-style overlay PNGs (linear/log/tracks), restricted to this subset.
+                                st.markdown('**Extraction-style overlay plots (subset only)**')
+                                st.caption('These are the same overlay plot types created during Extraction, regenerated here for the current Sequence-passed subset.')
+                                try:
+                                    from visualization.chromatograms import _create_overlay_figures, _create_zoom_all_linear_log_tracks_from_overlay
+                                    if 'plot_version_windows' not in st.session_state:
+                                        st.session_state.plot_version_windows = datetime.now().strftime('%Y%m%d_%H%M%S')
+                                    windows_plot_dir = os.path.join(plots_root_dir, 'windows', str(st.session_state.plot_version_windows))
+                                    os.makedirs(windows_plot_dir, exist_ok=True)
+
+                                    overlay_subset = []
+                                    for r in rows:
+                                        overlay_subset.append({
+                                            'rts': np.asarray(r['rts_sec'], dtype=float),
+                                            'rts_min': np.asarray(r['rts_min'], dtype=float),
+                                            'total_intensities': np.asarray(r['ints'], dtype=float),
+                                            'label': r['label'],
+                                            'total_area': r.get('total_area'),
+                                            'sequence_start_pos': r.get('seq_start', 999999),
+                                            'min_rt': r.get('min_rt_sec'),
+                                            'max_rt': r.get('max_rt_sec'),
+                                            'collection_min_rt': r.get('collection_min_rt_sec'),
+                                            'collection_max_rt': r.get('collection_max_rt_sec'),
+                                        })
+
+                                    regen = st.button(
+                                        'Regenerate extraction-style overlays (subset)',
+                                        key='regen_windows_subset_overlays',
+                                        help='Create linear/log/tracks overlay PNGs for only the Sequence-passed subset.'
+                                    )
+                                    linear_png = os.path.join(windows_plot_dir, 'windows_subset_chromatograms_zoom_peptides_all_linear.png')
+                                    log_png = os.path.join(windows_plot_dir, 'windows_subset_chromatograms_zoom_peptides_all_log.png')
+                                    tracks_png = os.path.join(windows_plot_dir, 'windows_subset_chromatograms_zoom_peptides_all_tracks.png')
+                                    combined_png = os.path.join(
+                                        windows_plot_dir,
+                                        'windows_subset_chromatograms_zoom_peptides_all_linear_log_tracks.png',
+                                    )
+                                    if regen or not (
+                                        os.path.exists(linear_png)
+                                        and os.path.exists(log_png)
+                                        and os.path.exists(tracks_png)
+                                    ) and not os.path.exists(combined_png):
+                                        _create_overlay_figures(overlay_subset, windows_plot_dir)
+                                        _create_zoom_all_linear_log_tracks_from_overlay(
+                                            overlay_subset, windows_plot_dir, 'windows_subset_chromatograms'
+                                        )
+
+                                    if os.path.exists(linear_png) and os.path.exists(log_png) and os.path.exists(tracks_png):
+                                        show_paths = [linear_png, log_png, tracks_png]
+                                        labels = ['All peptides overlay (linear)', 'All peptides overlay (log)', 'All peptides overlay (tracks)']
+                                        for p, t in zip(show_paths, labels):
+                                            st.markdown(f'**{t}**')
+                                            st.image(p, use_container_width=True)
+                                    elif os.path.exists(combined_png):
+                                        st.markdown('**All peptides overlay (linear + log + tracks)**')
+                                        st.image(combined_png, use_container_width=True)
+                                    else:
+                                        show_paths = [linear_png, log_png, tracks_png, combined_png]
+                                        for p in show_paths:
+                                            st.caption(f'Missing plot: {os.path.basename(p)}')
+
+                                    # Generate accepted/rejected overlays after window channel thinning.
+                                    thin_res = st.session_state.get('windows_thinning_result')
+                                    if thin_res and (thin_res.get('accepted_rows') is not None or thin_res.get('rejected_rows') is not None):
+                                        st.markdown('**Post-thinning subset overlays**')
+                                        acc_col, rej_col = st.columns(2)
+                                        with acc_col:
+                                            show_acc_overlay = st.button(
+                                                'Show Accepted overlay (linear + log + tracks)',
+                                                key='show_windows_thinning_overlay_accepted',
+                                                help='Generate/show combined all-peptides overlay for accepted subset.',
+                                            )
+                                            show_acc_zoom_segments = st.button(
+                                                'Show Accepted zoom segments',
+                                                key='show_windows_thinning_overlay_accepted_segments',
+                                                help='Generate/show per-segment accepted overlays for closer overlap inspection.',
+                                            )
+                                        with rej_col:
+                                            show_rej_overlay = st.button(
+                                                'Show Rejected overlay (linear + log + tracks)',
+                                                key='show_windows_thinning_overlay_rejected',
+                                                help='Generate/show combined all-peptides overlay for rejected subset.',
+                                            )
+
+                                        def _render_thinning_subset_overlay(subset_name, subset_rows, force_regen=False):
+                                            if not subset_rows:
+                                                st.caption(f'No {subset_name} peptides available after thinning.')
+                                                return
+                                            subset_dir = os.path.join(windows_plot_dir, 'channel_thinning', subset_name)
+                                            os.makedirs(subset_dir, exist_ok=True)
+                                            overlay_subset = []
+                                            for r in subset_rows:
+                                                overlay_subset.append({
+                                                    'rts': np.asarray(r['rts_sec'], dtype=float),
+                                                    'rts_min': np.asarray(r['rts_min'], dtype=float),
+                                                    'total_intensities': np.asarray(r['ints'], dtype=float),
+                                                    'label': r['label'],
+                                                    'total_area': r.get('total_area'),
+                                                    'sequence_start_pos': r.get('seq_start', 999999),
+                                                    'min_rt': r.get('min_rt_sec'),
+                                                    'max_rt': r.get('max_rt_sec'),
+                                                    'collection_min_rt': r.get('collection_min_rt_sec'),
+                                                    'collection_max_rt': r.get('collection_max_rt_sec'),
+                                                })
+                                            base_nm = f'windows_{subset_name}_chromatograms'
+                                            comb_png = os.path.join(subset_dir, f'{base_nm}_zoom_peptides_all_linear_log_tracks.png')
+                                            if force_regen or regen or not os.path.exists(comb_png):
+                                                _create_overlay_figures(overlay_subset, subset_dir)
+                                                _create_zoom_all_linear_log_tracks_from_overlay(
+                                                    overlay_subset,
+                                                    subset_dir,
+                                                    base_nm,
+                                                    add_peak_labels=True,
+                                                )
+                                            if os.path.exists(comb_png):
+                                                st.markdown(f'**{subset_name.capitalize()} subset overlay (linear + log + tracks)**')
+                                                st.image(comb_png, use_container_width=True)
+                                            else:
+                                                st.caption(f'Missing plot: {os.path.basename(comb_png)}')
+
+                                        def _build_collection_segments(subset_rows):
+                                            intervals = []
+                                            for rr in subset_rows:
+                                                a = float(rr.get('collection_min_rt_sec', 0.0))
+                                                b = float(rr.get('collection_max_rt_sec', 0.0))
+                                                if b < a:
+                                                    a, b = b, a
+                                                intervals.append((a, b))
+                                            if not intervals:
+                                                return []
+                                            intervals.sort(key=lambda t: t[0])
+                                            merged = [list(intervals[0])]
+                                            for a, b in intervals[1:]:
+                                                if a <= merged[-1][1]:
+                                                    merged[-1][1] = max(merged[-1][1], b)
+                                                else:
+                                                    merged.append([a, b])
+                                            return [(float(a), float(b)) for a, b in merged]
+
+                                        def _segment_max_overlap(subset_rows, seg_start, seg_end):
+                                            pts = [seg_start, seg_end]
+                                            for rr in subset_rows:
+                                                a = float(rr.get('collection_min_rt_sec', 0.0))
+                                                b = float(rr.get('collection_max_rt_sec', 0.0))
+                                                if b < a:
+                                                    a, b = b, a
+                                                if b < seg_start or a > seg_end:
+                                                    continue
+                                                pts.extend([max(seg_start, a), min(seg_end, b)])
+                                            pts = sorted(set(pts))
+                                            if len(pts) < 2:
+                                                return len(subset_rows)
+                                            m = 0
+                                            for j in range(len(pts) - 1):
+                                                left, right = float(pts[j]), float(pts[j + 1])
+                                                if right <= left:
+                                                    continue
+                                                mid = 0.5 * (left + right)
+                                                c = 0
+                                                for rr in subset_rows:
+                                                    a = float(rr.get('collection_min_rt_sec', 0.0))
+                                                    b = float(rr.get('collection_max_rt_sec', 0.0))
+                                                    if b < a:
+                                                        a, b = b, a
+                                                    if a < mid < b:
+                                                        c += 1
+                                                m = max(m, c)
+                                            return int(m)
+
+                                        def _render_accepted_zoom_segments(subset_rows, force_regen=False):
+                                            if not subset_rows:
+                                                st.caption('No accepted peptides available for segment zoom plots.')
+                                                return
+                                            segments = _build_collection_segments(subset_rows)
+                                            if not segments:
+                                                st.caption('No valid accepted collection-window segments found.')
+                                                return
+                                            seg_dir = os.path.join(windows_plot_dir, 'channel_thinning', 'accepted', 'segments')
+                                            os.makedirs(seg_dir, exist_ok=True)
+                                            st.markdown('**Accepted overlay zoom segments**')
+                                            for seg_idx, (seg_start, seg_end) in enumerate(segments, start=1):
+                                                seg_rows = []
+                                                for rr in subset_rows:
+                                                    a = float(rr.get('collection_min_rt_sec', 0.0))
+                                                    b = float(rr.get('collection_max_rt_sec', 0.0))
+                                                    if b < a:
+                                                        a, b = b, a
+                                                    if not (b < seg_start or a > seg_end):
+                                                        seg_rows.append(rr)
+                                                if not seg_rows:
+                                                    continue
+                                                overlay_subset = []
+                                                for r in seg_rows:
+                                                    overlay_subset.append({
+                                                        'rts': np.asarray(r['rts_sec'], dtype=float),
+                                                        'rts_min': np.asarray(r['rts_min'], dtype=float),
+                                                        'total_intensities': np.asarray(r['ints'], dtype=float),
+                                                        'label': r['label'],
+                                                        'total_area': r.get('total_area'),
+                                                        'sequence_start_pos': r.get('seq_start', 999999),
+                                                        'min_rt': r.get('min_rt_sec'),
+                                                        'max_rt': r.get('max_rt_sec'),
+                                                        'collection_min_rt': r.get('collection_min_rt_sec'),
+                                                        'collection_max_rt': r.get('collection_max_rt_sec'),
+                                                    })
+                                                base_nm = f'windows_accepted_segment_{seg_idx:02d}'
+                                                seg_png = os.path.join(seg_dir, f'{base_nm}_zoom_peptides_all_linear_log_tracks.png')
+                                                if force_regen or regen or not os.path.exists(seg_png):
+                                                    _create_overlay_figures(overlay_subset, seg_dir)
+                                                    _create_zoom_all_linear_log_tracks_from_overlay(
+                                                        overlay_subset,
+                                                        seg_dir,
+                                                        base_nm,
+                                                        add_peak_labels=True,
+                                                    )
+                                                seg_max_overlap = _segment_max_overlap(seg_rows, seg_start, seg_end)
+                                                st.caption(
+                                                    f"Segment {seg_idx}: RT {seg_start/60.0:.2f}-{seg_end/60.0:.2f} min | "
+                                                    f"peptides={len(seg_rows)} | max overlap={seg_max_overlap}"
+                                                )
+                                                if os.path.exists(seg_png):
+                                                    st.image(seg_png, use_container_width=True)
+                                                else:
+                                                    st.caption(f'Missing plot: {os.path.basename(seg_png)}')
+
+                                        if show_acc_overlay:
+                                            _render_thinning_subset_overlay('accepted', thin_res.get('accepted_rows', []), force_regen=True)
+                                        if show_acc_zoom_segments:
+                                            _render_accepted_zoom_segments(thin_res.get('accepted_rows', []), force_regen=True)
+                                        if show_rej_overlay:
+                                            _render_thinning_subset_overlay('rejected', thin_res.get('rejected_rows', []), force_regen=True)
+                                except Exception as e:
+                                    st.warning(f'Could not generate extraction-style subset overlays: {e}')
+        except Exception as e:
+            st.error(f'Windows tab error: {e}')
+            import traceback
+            st.code(traceback.format_exc())
+
+    with filter_tabs[14]:  # D_MZ (Estimated Deuterated MZ target range)
         st.subheader('Estimated Deuterated MZ target range calculation')
         st.caption('Max deuteration = peptide length − 2 (termini lack amide) − prolines (no amide bond). Target m/z = (undeuterated + deuterated) / 2; ± defines range from min to max.')
         d_mz_input = None
@@ -3015,9 +4367,9 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                     _render_step_output_csv(dmz_preview, 'dmz_output', expanded=(csv_path == dmz_preview))
         else:
             st.info('Load a CSV with plain_peptide (or peptide/sequence), charge, and theoretical_mz to run D_MZ calculation.')
-        _render_terminal()
+        _render_terminal('dmz')
 
-    with filter_tabs[12]:  # SF (Source Fragmentation)
+    with filter_tabs[15]:  # SF (Source Fragmentation)
         st.subheader('Estimated Source Fragmentation Calculation')
         st.caption('User-configurable y = mx + b (SF = m × theoretical_m/z + b). Group peptides with SF within N units; assign group_SF = midpoint of each bin (e.g. 30–40 → 35, 40–50 → 45).')
         sf_input = None
@@ -3080,111 +4432,600 @@ export DYLD_LIBRARY_PATH=$CONDA_PREFIX/lib:$DYLD_LIBRARY_PATH
                     _render_step_output_csv(sf_preview, 'sf_output', expanded=(csv_path == sf_preview))
         else:
             st.info('Load a CSV with theoretical_mz (or mz, calc_neutral_mass+charge) to run SF grouping.')
-        _render_terminal()
+        _render_terminal('sf')
 
-    with filter_tabs[13]:  # Channels
-        st.subheader('Channels')
-        st.caption('Assign each SF group to minimum number of channels based on non-overlapping RT. Peptides in same channel have non-overlapping retention times.')
-        ch_input = None
-        if csv_path and os.path.exists(csv_path):
-            try:
-                cols = load_csv(csv_path).columns
-                if 'group_SF' in cols:
-                    ch_input = csv_path
-            except Exception:
-                pass
-        if not ch_input and os.path.isdir(out_dir):
-            for f in os.listdir(out_dir):
-                if f.endswith('_SF.csv'):
-                    cand = os.path.join(out_dir, f)
-                    if os.path.isfile(cand):
-                        ch_input = cand
-                        break
+    with filter_tabs[13]:  # Inspect
+        st.subheader('Inspect')
+        st.caption('Individual extraction plots for peptides that survived Windows thinning and channel assignment.')
+        ch_res = st.session_state.get('windows_accepted_channels_result')
+        channelized_csv = ch_res.get('out_csv') if isinstance(ch_res, dict) else None
+        if not channelized_csv or not os.path.exists(channelized_csv):
+            channelized_csv = _latest_csv_with_suffix(out_dir, ['_channels'])
+        dataframes_dir = os.path.join(out_dir, 'dataframes')
+        metrics_csv = os.path.join(dataframes_dir, 'chromatogram_metrics_all.csv')
+        traces_path = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
 
-        def _get_rt_window(row):
-            min_rt = row.get('detected_peak_min_rt') or row.get('collection_min_rt')
-            max_rt = row.get('detected_peak_max_rt') or row.get('collection_max_rt')
-            if pd.notna(min_rt) and pd.notna(max_rt) and float(min_rt) < float(max_rt):
-                return (float(min_rt), float(max_rt))
-            rt = row.get('MS1_retention_time_sec') or row.get('anchor_rt')
-            if pd.notna(rt):
-                t = float(rt)
-                return (t - 30, t + 30)  # 30 s window around single RT
-            return None
-
-        def _assign_channels(intervals):
-            """Greedy interval coloring: assign each to min channel with no overlap."""
-            if not intervals:
-                return []
-            idx_start = sorted(range(len(intervals)), key=lambda i: intervals[i][0])
-            channels = [-1] * len(intervals)
-            for i in idx_start:
-                s, e = intervals[i]
-                k = 0
-                while True:
-                    overlap = False
-                    for j in range(len(intervals)):
-                        if channels[j] == k and j != i:
-                            sj, ej = intervals[j]
-                            if s < ej and sj < e:
-                                overlap = True
-                                break
-                    if not overlap:
-                        channels[i] = k
-                        break
-                    k += 1
-            return channels
-
-        if ch_input and os.path.exists(ch_input):
-            df_ch = load_csv(ch_input)
-            if 'group_SF' not in df_ch.columns:
-                st.info('Run SF grouping first. Input needs group_SF column.')
-            else:
-                run_ch = st.button('Run Channel assignment', key='run_channels',
-                                   help='Assign peptides to channels by non-overlapping RT within each SF group')
-                if run_ch:
-                    try:
-                        df_ch = df_ch.copy()
-                        rt_windows = df_ch.apply(_get_rt_window, axis=1)
-                        valid_rt = rt_windows.notna()
-                        if valid_rt.sum() == 0:
-                            st.error('No valid RT found. CSV needs detected_peak_min_rt/max_rt, collection_min_rt/max_rt, or MS1_retention_time_sec.')
-                        else:
-                            df_ch['channel'] = np.nan
-                            valid_both = valid_rt & df_ch['group_SF'].notna()
-                            for gval, grp in df_ch.loc[valid_both].groupby('group_SF'):
-                                idx = grp.index.tolist()
-                                intervals = [rt_windows[i] for i in idx]
-                                ch_assign = _assign_channels(intervals)
-                                for j, i in enumerate(idx):
-                                    df_ch.at[i, 'channel'] = ch_assign[j] + 1
-                            base = os.path.splitext(os.path.basename(ch_input))[0]
-                            ch_base = base.replace('_SF', '') if base.endswith('_SF') else base
-                            ch_out = os.path.join(out_dir, ch_base + '_channels.csv')
-                            df_ch.to_csv(ch_out, index=False)
-                            st.session_state.last_step_output = ch_out
-                            st.session_state.last_step_name = 'Channels'
-                            st.success(f'Saved {os.path.basename(ch_out)} with channel column.')
-                    except Exception as e:
-                        st.error(f'Channel assignment error: {e}')
-                        import traceback
-                        st.code(traceback.format_exc())
-                ch_base = os.path.splitext(os.path.basename(ch_input))[0].replace('_SF', '') if ch_input and '_SF' in os.path.basename(ch_input) else (os.path.splitext(os.path.basename(ch_input))[0] if ch_input else '')
-                ch_out_path = os.path.join(out_dir, ch_base + '_channels.csv') if ch_base else None
-                if ch_out_path and os.path.exists(ch_out_path):
-                    channels_preview = _resolve_preview_output('Channels', ch_out_path)
-                    if channels_preview:
-                        _render_step_output_csv(channels_preview, 'channels_output', expanded=(csv_path == channels_preview))
+        if not channelized_csv or not os.path.exists(channelized_csv):
+            st.info('Run **Channels** assignment first to create the channelized accepted CSV.')
+        elif not (os.path.exists(metrics_csv) and os.path.exists(traces_path)):
+            st.info('Run Extraction first to generate chromatogram_metrics_all.csv and chromatogram_traces.npz.')
         else:
-            st.info('Run SF grouping first, then load the SF output CSV to assign channels.')
-        _render_terminal()
+            if 'show_inspect_plots' not in st.session_state:
+                st.session_state.show_inspect_plots = False
+            if 'inspect_hires_plot' not in st.session_state:
+                st.session_state.inspect_hires_plot = None
+            if 'inspect_hires_label' not in st.session_state:
+                st.session_state.inspect_hires_label = ''
 
-    with filter_tabs[14]:  # Method
+            col_gen, col_hide = st.columns([1, 1])
+            with col_gen:
+                if st.button(
+                    'Generate inspect plots',
+                    key='gen_inspect_plots',
+                    help='Generate individual extraction plots for channel-assigned accepted peptides only.',
+                ):
+                    inspect_plot_dir = _rotate_plot_version('inspect')
+                    st.session_state.show_inspect_plots = True
+                    st.session_state.inspect_hires_plot = None
+                    st.session_state.inspect_hires_label = ''
+                    plot_cmd = [
+                        sys.executable,
+                        os.path.join(_SCRIPT_DIR, 'workflow_scripts', 'plot_chromatograms_from_extraction.py'),
+                        '--output-dir', os.path.abspath(inspect_plot_dir),
+                        '--chromatogram-metrics-csv', os.path.abspath(metrics_csv),
+                        '--chromatogram-traces', os.path.abspath(traces_path),
+                        '--clear-output',
+                        '--filter-csv', os.path.abspath(channelized_csv),
+                    ]
+                    _queue_run(plot_cmd, 'Inspect chromatogram plots', '_inspect_chromatograms', needs_visualization=True)
+                    st.caption(f'Inspect plot output dir: `{inspect_plot_dir}`')
+            with col_hide:
+                if st.button('Hide inspect plots', key='hide_inspect_plots'):
+                    st.session_state.show_inspect_plots = False
+                    st.session_state.inspect_hires_plot = None
+                    st.session_state.inspect_hires_label = ''
+
+            inspect_plot_dir = _plot_version_dir('inspect')
+
+            def _list_inspect_individual_plots(base_dir: str) -> list[str]:
+                if not base_dir or not os.path.isdir(base_dir):
+                    return []
+                out = []
+                for root, _, files in os.walk(base_dir):
+                    for f in files:
+                        fl = f.lower()
+                        if not fl.endswith(('.png', '.jpg', '.jpeg')):
+                            continue
+                        if 'overlay' in fl or 'zoom_peptides' in fl or '_rejected' in fl:
+                            continue
+                        out.append(os.path.join(root, f))
+                def _rt_key(path: str):
+                    name = os.path.basename(path).lower()
+                    m = re.search(r'_rt([0-9]+(?:p[0-9]+)?)_', name)
+                    if m:
+                        try:
+                            return float(m.group(1).replace('p', '.'))
+                        except Exception:
+                            return float('inf')
+                    return float('inf')
+                return sorted(set(out), key=lambda p: (_rt_key(p), os.path.basename(p).lower()))
+
+            def _render_inspect_thumb_gallery(paths: list[str], gallery_key: str, thumbs_per_row: int = 3, thumb_width: int = 240) -> None:
+                for i in range(0, len(paths), thumbs_per_row):
+                    chunk = paths[i:i + thumbs_per_row]
+                    cols = st.columns(thumbs_per_row)
+                    for j, p in enumerate(chunk):
+                        if not os.path.exists(p):
+                            continue
+                        try:
+                            mt = os.path.getmtime(p)
+                            thumb_bytes = _read_thumbnail_bytes_cached(p, mt, max_width=360)
+                        except Exception:
+                            thumb_bytes = p
+                        with cols[j]:
+                            st.image(thumb_bytes, width=thumb_width, caption=os.path.basename(p))
+                            if st.button('Expand', key=f'{gallery_key}_expand_{i}_{j}_{os.path.basename(p)}'):
+                                st.session_state.inspect_hires_plot = p
+                                st.session_state.inspect_hires_label = os.path.basename(p)
+
+            if st.session_state.get('show_inspect_plots', False):
+                inspect_paths = _list_inspect_individual_plots(inspect_plot_dir)
+                if inspect_paths:
+                    st.caption(f"Showing {len(inspect_paths)} individual accepted/channel-assigned extraction plots.")
+                    _render_inspect_thumb_gallery(inspect_paths, 'inspect_gallery')
+                else:
+                    st.info('Click **Generate inspect plots** to build individual plots for the channel-assigned accepted subset.')
+
+                selected_plot = st.session_state.get('inspect_hires_plot')
+                if selected_plot and os.path.exists(selected_plot):
+                    plot_label = st.session_state.get('inspect_hires_label') or os.path.basename(selected_plot)
+                    st.markdown('**Inspect high-resolution viewer**')
+                    if st.button('← Back to inspect gallery', key='close_inspect_hires', type='primary', use_container_width=True):
+                        st.session_state.inspect_hires_plot = None
+                        st.session_state.inspect_hires_label = ''
+                        st.rerun()
+                    st.caption(plot_label)
+                    try:
+                        original_bytes = _read_image_bytes_cached(selected_plot, os.path.getmtime(selected_plot))
+                    except Exception:
+                        original_bytes = None
+                    if original_bytes:
+                        st.image(original_bytes, use_container_width=True)
+                    else:
+                        st.image(selected_plot, use_container_width=True)
+
+            _render_terminal('inspect')
+
+    with filter_tabs[12]:  # Channels
+        st.subheader('Channels')
+        st.caption('Assign accepted Windows-thinning peptides to channels so no peptides overlap within a channel (collection-window RT).')
+        thin_res = st.session_state.get('windows_thinning_result')
+        windows_accepted_csv = _latest_csv_with_suffix(out_dir, ['_windows_channels_accepted'])
+        if not thin_res and windows_accepted_csv and os.path.exists(windows_accepted_csv):
+            st.caption(f'Loaded saved Windows accepted set: `{os.path.basename(windows_accepted_csv)}`')
+        if (not thin_res or not thin_res.get('accepted_rows')) and not (windows_accepted_csv and os.path.exists(windows_accepted_csv)):
+            st.info('Run Windows channel thinning first, then return here to assign channels on the accepted subset.')
+        else:
+            try:
+                import plotly.graph_objects as go
+            except ImportError:
+                st.warning('Plotly is required for Channels (Accepted) visualization.')
+                go = None
+
+            accepted_rows = thin_res.get('accepted_rows', []) if thin_res else []
+            if not accepted_rows and windows_accepted_csv and os.path.exists(windows_accepted_csv):
+                try:
+                    df_acc_in = load_csv(windows_accepted_csv).copy()
+                    dataframes_dir = os.path.join(out_dir, 'dataframes')
+                    metrics_csv = os.path.join(dataframes_dir, 'chromatogram_metrics_all.csv')
+                    traces_path = os.path.join(dataframes_dir, 'chromatogram_traces.npz')
+                    if os.path.exists(metrics_csv) and os.path.exists(traces_path):
+                        df_metrics = pd.read_csv(metrics_csv)
+                        traces_data = np.load(traces_path)
+                        if 'peptide_sequence' in df_metrics.columns and 'plain_peptide' not in df_metrics.columns:
+                            df_metrics['plain_peptide'] = df_metrics['peptide_sequence']
+                        if 'peptide_sequence' in df_acc_in.columns and 'plain_peptide' not in df_acc_in.columns:
+                            df_acc_in['plain_peptide'] = df_acc_in['peptide_sequence']
+                        df_acc_in['_key_pep'] = df_acc_in.get('_key_pep', df_acc_in.get('plain_peptide', pd.Series([''] * len(df_acc_in)))).astype(str).str.strip()
+                        df_acc_in['_key_charge'] = pd.to_numeric(df_acc_in.get('_key_charge', df_acc_in.get('charge', 0)), errors='coerce').fillna(0).astype(int)
+                        df_acc_in['_key_mods'] = df_acc_in.apply(lambda r: _mods_norm(r.get('_key_mods', r.get('modifications', '-'))), axis=1)
+                        acc_keys = set(zip(df_acc_in['_key_pep'], df_acc_in['_key_charge'], df_acc_in['_key_mods']))
+                        df_metrics['_key_pep'] = df_metrics.get('plain_peptide', pd.Series([''] * len(df_metrics))).astype(str).str.strip()
+                        df_metrics['_key_charge'] = pd.to_numeric(df_metrics.get('charge', 0), errors='coerce').fillna(0).astype(int)
+                        df_metrics['_key_mods'] = df_metrics.apply(lambda r: _mods_norm(r.get('modifications', '-')), axis=1)
+                        df_metrics['_key'] = df_metrics.apply(lambda r: (r['_key_pep'], int(r['_key_charge']), r['_key_mods']), axis=1)
+                        df_metrics = df_metrics[df_metrics['_key'].isin(acc_keys)].copy()
+                        if 'trace_index' in df_metrics.columns:
+                            df_metrics = df_metrics.sort_values(['_key_pep', '_key_charge', '_key_mods', 'trace_index']).drop_duplicates(subset=['_key'], keep='first')
+                        else:
+                            df_metrics = df_metrics.drop_duplicates(subset=['_key'], keep='first')
+                        for _, row in df_metrics.iterrows():
+                            try:
+                                trace_idx = int(row['trace_index']) if 'trace_index' in df_metrics.columns and pd.notna(row.get('trace_index')) else int(_)
+                            except Exception:
+                                continue
+                            rts_key = f'trace_{trace_idx}_rts'
+                            int_key = f'trace_{trace_idx}_int'
+                            if rts_key not in traces_data or int_key not in traces_data:
+                                continue
+                            rts = np.asarray(traces_data[rts_key], dtype=float).flatten()
+                            intensity_matrix = np.asarray(traces_data[int_key], dtype=float)
+                            total_int = np.sum(intensity_matrix, axis=1) if intensity_matrix.ndim > 1 else np.asarray(intensity_matrix, dtype=float).flatten()
+                            n = min(len(rts), len(total_int))
+                            if n < 2:
+                                continue
+                            rts = rts[:n]
+                            total_int = total_int[:n]
+                            coll_min = row.get('collection_min_rt')
+                            coll_max = row.get('collection_max_rt')
+                            if pd.isna(coll_min) or pd.isna(coll_max):
+                                continue
+                            coll_min = float(coll_min); coll_max = float(coll_max)
+                            if coll_max < coll_min:
+                                coll_min, coll_max = coll_max, coll_min
+                            pep = str(row.get('plain_peptide', '')).strip()
+                            ch = int(row.get('charge', 0)) if pd.notna(row.get('charge')) else 0
+                            mods = _mods_norm(row.get('modifications', '-'))
+                            accepted_rows.append({
+                                'label': f"{pep} +{ch} | {mods}",
+                                'key': (pep, ch, mods),
+                                'pep': pep,
+                                'charge': ch,
+                                'mods': mods,
+                                'rts_sec': rts,
+                                'rts_min': rts / 60.0,
+                                'ints': total_int,
+                                'min_rt_sec': float(row.get('detected_peak_min_rt')) if pd.notna(row.get('detected_peak_min_rt')) else coll_min,
+                                'max_rt_sec': float(row.get('detected_peak_max_rt')) if pd.notna(row.get('detected_peak_max_rt')) else coll_max,
+                                'collection_min_rt_sec': coll_min,
+                                'collection_max_rt_sec': coll_max,
+                                'seq_start': int(row.get('sequence_start_pos', 999999)) if pd.notna(row.get('sequence_start_pos')) else 999999,
+                                'total_area': float(row.get('total_area')) if pd.notna(row.get('total_area')) else None,
+                            })
+                except Exception:
+                    accepted_rows = []
+
+            if not accepted_rows:
+                st.info('No accepted peptides available to channelize.')
+            else:
+                run_acc_channels = st.button(
+                    'Assign channels for accepted peptides',
+                    key='run_windows_accepted_channels',
+                    help='Greedy channel assignment from accepted peptides using collection-window overlap only.',
+                )
+
+                if run_acc_channels:
+                    # Build interval table from accepted rows.
+                    chan_rows = []
+                    for r in accepted_rows:
+                        a = float(r.get('collection_min_rt_sec', 0.0))
+                        b = float(r.get('collection_max_rt_sec', 0.0))
+                        if b < a:
+                            a, b = b, a
+                        if b <= a:
+                            continue
+                        label = str(r.get('label', '')).split('|')[0].strip() or str(r.get('label', ''))
+                        key = r.get('key')
+                        apex_rt_sec = None
+                        try:
+                            rr = np.asarray(r.get('rts_sec', []), dtype=float)
+                            ii = np.asarray(r.get('ints', []), dtype=float)
+                            if len(rr) > 0 and len(ii) > 0:
+                                n_ap = min(len(rr), len(ii))
+                                apex_idx = int(np.nanargmax(ii[:n_ap]))
+                                if 0 <= apex_idx < n_ap:
+                                    apex_rt_sec = float(rr[apex_idx])
+                        except Exception:
+                            apex_rt_sec = None
+                        if apex_rt_sec is None or not np.isfinite(apex_rt_sec):
+                            apex_rt_sec = 0.5 * (a + b)
+                        chan_rows.append({
+                            'key': key,
+                            'label': label,
+                            'collection_min_rt_sec': a,
+                            'collection_max_rt_sec': b,
+                            'apex_rt_sec': float(apex_rt_sec),
+                            'total_area': float(r.get('total_area') or 0.0),
+                        })
+
+                    if not chan_rows:
+                        st.error('No valid accepted collection windows found for channel assignment.')
+                    else:
+                        # Greedy interval coloring (minimal channel count), with spacing optimization:
+                        # among feasible channels, pick the one that maximizes separation from previous apex.
+                        order = sorted(range(len(chan_rows)), key=lambda i: (chan_rows[i]['collection_min_rt_sec'], chan_rows[i]['collection_max_rt_sec']))
+                        channel_ends = []   # end RT per channel
+                        channel_last_apex = []  # apex RT of last peptide in each channel
+                        assigned = [None] * len(chan_rows)
+                        for i in order:
+                            start_i = chan_rows[i]['collection_min_rt_sec']
+                            apex_i = chan_rows[i].get('apex_rt_sec', 0.5 * (
+                                chan_rows[i]['collection_min_rt_sec'] + chan_rows[i]['collection_max_rt_sec']
+                            ))
+                            feasible = []
+                            for ch_idx, ch_end in enumerate(channel_ends):
+                                if start_i >= ch_end:
+                                    gap = float(apex_i) - float(channel_last_apex[ch_idx])
+                                    feasible.append((gap, ch_idx))
+                            if not feasible:
+                                assigned_ch = len(channel_ends)
+                                channel_ends.append(chan_rows[i]['collection_max_rt_sec'])
+                                channel_last_apex.append(float(apex_i))
+                            else:
+                                # Maximize peak spacing; tie-break by earlier channel index for stability.
+                                feasible.sort(key=lambda t: (-t[0], t[1]))
+                                assigned_ch = feasible[0][1]
+                                channel_ends[assigned_ch] = chan_rows[i]['collection_max_rt_sec']
+                                channel_last_apex[assigned_ch] = float(apex_i)
+                            assigned[i] = assigned_ch + 1
+                        for i, ch in enumerate(assigned):
+                            chan_rows[i]['channel'] = int(ch)
+                        ch_map = {tuple(rr['key']): int(rr['channel']) for rr in chan_rows if rr.get('key') is not None}
+                        accepted_rows_with_channel = []
+                        for rr in accepted_rows:
+                            k = rr.get('key')
+                            if k is None:
+                                continue
+                            chv = ch_map.get(tuple(k))
+                            if chv is None:
+                                continue
+                            row_ch = dict(rr)
+                            row_ch['channel'] = int(chv)
+                            accepted_rows_with_channel.append(row_ch)
+
+                        # Save channelized accepted CSV by mapping channel back onto accepted CSV rows.
+                        accepted_csv = thin_res.get('accepted_csv') if thin_res else windows_accepted_csv
+                        out_csv = None
+                        if accepted_csv and os.path.exists(accepted_csv):
+                            try:
+                                df_acc = load_csv(accepted_csv).copy()
+                                df_acc['channel'] = df_acc.apply(
+                                    lambda rr: ch_map.get(
+                                        (str(rr.get('_key_pep', '')).strip(), int(pd.to_numeric(rr.get('_key_charge'), errors='coerce') or 0), _mods_norm(rr.get('_key_mods', '-'))),
+                                        np.nan,
+                                    ),
+                                    axis=1,
+                                )
+                                base_acc = os.path.splitext(os.path.basename(accepted_csv))[0]
+                                clean_base = base_acc
+                                for suf in ['_windows_channels_accepted', '_accepted']:
+                                    if clean_base.endswith(suf):
+                                        clean_base = clean_base[:-len(suf)]
+                                        break
+                                out_csv = os.path.join(out_dir, clean_base + '_channels.csv')
+                                df_acc.to_csv(out_csv, index=False)
+                                st.session_state.last_step_output = out_csv
+                                st.session_state.last_step_name = 'Channels'
+                            except Exception:
+                                out_csv = None
+
+                        st.session_state.windows_accepted_channels_result = {
+                            'rows': chan_rows,
+                            'n_channels': int(max(r['channel'] for r in chan_rows)),
+                            'out_csv': out_csv,
+                            'accepted_rows_with_channel': accepted_rows_with_channel,
+                        }
+
+                ch_res = st.session_state.get('windows_accepted_channels_result')
+                if ch_res and ch_res.get('rows'):
+                    ch_rows = ch_res.get('rows', [])
+                    n_channels = int(ch_res.get('n_channels', 0))
+                    st.caption(f'Assigned {len(ch_rows)} accepted peptides across {n_channels} channels (no overlap within each channel).')
+                    if ch_res.get('out_csv') and os.path.exists(ch_res['out_csv']):
+                        st.markdown(f"- Channelized accepted CSV: `{ch_res['out_csv']}`")
+
+                    if go is not None:
+                        try:
+                            from visualization.chromatograms import _total_area_colormap_for_overlay
+                        except Exception:
+                            _total_area_colormap_for_overlay = None
+                        area_norm_ui = None
+                        cmap_ui = None
+                        if _total_area_colormap_for_overlay is not None:
+                            valid_areas_ui = [
+                                max(0.0, float(r.get('total_area') or 0.0))
+                                for r in ch_rows
+                                if r.get('total_area') is not None
+                            ]
+                            valid_areas_ui = [v for v in valid_areas_ui if np.isfinite(v)]
+                            if len(valid_areas_ui) > 1 and max(valid_areas_ui) > min(valid_areas_ui):
+                                from matplotlib.colors import Normalize
+                                area_norm_ui = Normalize(vmin=min(valid_areas_ui), vmax=max(valid_areas_ui))
+                                cmap_ui = _total_area_colormap_for_overlay()
+
+                        def _ui_row_color(row_):
+                            if area_norm_ui is not None and cmap_ui is not None:
+                                aval = max(0.0, float(row_.get('total_area') or 0.0))
+                                return matplotlib.colors.to_hex(cmap_ui(area_norm_ui(aval)))
+                            return '#8b8b8b'
+
+                        fig_ch = go.Figure()
+                        y_order = [f'Channel {i}' for i in range(1, n_channels + 1)]
+                        for r in ch_rows:
+                            ylab = f"Channel {int(r['channel'])}"
+                            fig_ch.add_trace(go.Scatter(
+                                x=[r['collection_min_rt_sec'] / 60.0, r['collection_max_rt_sec'] / 60.0],
+                                y=[ylab, ylab],
+                                mode='lines',
+                                line=dict(width=5, color=_ui_row_color(r)),
+                                hovertemplate=(
+                                    f"{r['label']}<br>"
+                                    f"Channel: {int(r['channel'])}<br>"
+                                    f"total_area: {float(r.get('total_area') or 0.0):.2e}<br>"
+                                    "Collection window: %{x:.2f} min"
+                                    "<extra></extra>"
+                                ),
+                                showlegend=False,
+                            ))
+                        fig_ch.update_layout(
+                            template='plotly_dark',
+                            height=max(320, min(1400, 80 + 38 * n_channels)),
+                            margin=dict(l=20, r=20, t=40, b=40),
+                            title='Accepted peptides assigned to non-overlapping channels',
+                            xaxis_title='MS1 RT (min)',
+                            yaxis_title='Channel',
+                            yaxis=dict(type='category', categoryorder='array', categoryarray=y_order),
+                        )
+                        st.plotly_chart(fig_ch, width='stretch')
+
+                    labeled_tracks_btn, labeled_overlay_btn = st.columns(2)
+                    with labeled_tracks_btn:
+                        show_tracks_by_channel = st.button(
+                            'Show labeled tracks plots by channel',
+                            key='show_labeled_tracks_by_channel',
+                            help='Generate tracks-only labeled chromatogram plots for each channel.',
+                        )
+                    with labeled_overlay_btn:
+                        show_overlays_by_channel = st.button(
+                            'Show labeled overlays by channel',
+                            key='show_labeled_overlays_by_channel',
+                            help='Generate labeled linear+log+tracks overlays for each channel.',
+                        )
+
+                    rows_with_channel = ch_res.get('accepted_rows_with_channel', [])
+                    if (show_tracks_by_channel or show_overlays_by_channel) and rows_with_channel:
+                        try:
+                            from visualization.chromatograms import (
+                                _create_zoom_all_linear_log_tracks_from_overlay,
+                                _total_area_colormap_for_overlay,
+                            )
+                        except Exception:
+                            _create_zoom_all_linear_log_tracks_from_overlay = None
+                            _total_area_colormap_for_overlay = None
+
+                        channel_plot_dir = os.path.join(plots_root_dir, 'channel_assignment', 'accepted_by_channel')
+                        os.makedirs(channel_plot_dir, exist_ok=True)
+                        channels_sorted = sorted(set(int(r.get('channel', 0)) for r in rows_with_channel if int(r.get('channel', 0)) > 0))
+                        area_norm_global = None
+                        cmap_global = None
+                        if show_tracks_by_channel and _total_area_colormap_for_overlay is not None:
+                            valid_areas_global = [
+                                max(0.0, float(r.get('total_area') or 0.0))
+                                for r in rows_with_channel
+                                if r.get('total_area') is not None
+                            ]
+                            valid_areas_global = [v for v in valid_areas_global if np.isfinite(v)]
+                            if len(valid_areas_global) > 1 and max(valid_areas_global) > min(valid_areas_global):
+                                from matplotlib.colors import Normalize
+                                area_norm_global = Normalize(vmin=min(valid_areas_global), vmax=max(valid_areas_global))
+                                cmap_global = _total_area_colormap_for_overlay()
+
+                        for chv in channels_sorted:
+                            subset_rows = [r for r in rows_with_channel if int(r.get('channel', 0)) == chv]
+                            if not subset_rows:
+                                continue
+                            overlay_subset = []
+                            for r in subset_rows:
+                                overlay_subset.append({
+                                    'rts': np.asarray(r['rts_sec'], dtype=float),
+                                    'rts_min': np.asarray(r['rts_min'], dtype=float),
+                                    'total_intensities': np.asarray(r['ints'], dtype=float),
+                                    'label': r['label'],
+                                    'total_area': r.get('total_area'),
+                                    'sequence_start_pos': r.get('seq_start', 999999),
+                                    'min_rt': r.get('min_rt_sec'),
+                                    'max_rt': r.get('max_rt_sec'),
+                                    'collection_min_rt': r.get('collection_min_rt_sec'),
+                                    'collection_max_rt': r.get('collection_max_rt_sec'),
+                                })
+
+                            if show_overlays_by_channel and _create_zoom_all_linear_log_tracks_from_overlay is not None:
+                                base_nm = f'accepted_channel_{chv}'
+                                overlay_png = os.path.join(channel_plot_dir, f'{base_nm}_zoom_peptides_all_linear_log_tracks.png')
+                                _create_zoom_all_linear_log_tracks_from_overlay(
+                                    overlay_subset,
+                                    channel_plot_dir,
+                                    base_nm,
+                                    add_peak_labels=True,
+                                )
+                                if os.path.exists(overlay_png):
+                                    st.markdown(f'**Channel {chv} overlay (linear + log + tracks)**')
+                                    st.image(overlay_png, use_container_width=True)
+
+                            if show_tracks_by_channel:
+                                subset_rows = sorted(subset_rows, key=lambda x: (float(x.get('collection_min_rt_sec', 0.0)), str(x.get('label', ''))))
+                                fig_h = max(8, min(44, 1.1 * len(subset_rows) + 4))
+                                fig_tr, ax_tr = plt.subplots(figsize=(24, fig_h))
+                                fig_tr.patch.set_facecolor('black')
+                                ax_tr.set_facecolor('black')
+                                area_sum_channel = sum(max(0.0, float(r.get('total_area') or 0.0)) for r in subset_rows)
+                                x_vals = []
+                                track_h = 1.45
+                                track_gap = 0.35
+                                placed_label_points = []
+                                for idx, r in enumerate(subset_rows):
+                                    rts = np.asarray(r.get('rts_min', []), dtype=float)
+                                    ints = np.asarray(r.get('ints', []), dtype=float)
+                                    if len(rts) < 2 or len(ints) < 2:
+                                        continue
+                                    imax = float(np.nanmax(ints)) if np.isfinite(np.nanmax(ints)) and float(np.nanmax(ints)) > 0 else 1.0
+                                    y0 = idx * (track_h + track_gap)
+                                    y = (ints / imax) * track_h + y0
+                                    cmin = float(r.get('collection_min_rt_sec', 0.0)) / 60.0
+                                    cmax = float(r.get('collection_max_rt_sec', 0.0)) / 60.0
+                                    if cmax < cmin:
+                                        cmin, cmax = cmax, cmin
+                                    mask = (rts >= cmin) & (rts <= cmax)
+                                    y_fill = np.where(mask, y, y0)
+                                    area_val = max(0.0, float(r.get('total_area') or 0.0))
+                                    if area_norm_global is not None and cmap_global is not None and np.isfinite(area_val):
+                                        col = cmap_global(area_norm_global(area_val))
+                                    else:
+                                        col = (0.55, 0.55, 0.55, 0.95)
+                                    ax_tr.fill_between(rts, y0, y_fill, color=col, alpha=0.95, zorder=3)
+                                    ax_tr.plot(rts, y, color=col, linewidth=2.5, alpha=1.0, zorder=4)
+                                    lab = str(r.get('label', f'#{idx+1}')).split('|')[0].strip()
+                                    if len(lab) > 38:
+                                        lab = lab[:35] + '...'
+                                    try:
+                                        i_apex = int(np.nanargmax(ints))
+                                    except Exception:
+                                        i_apex = -1
+                                    rel_pct = (100.0 * area_val / area_sum_channel) if area_sum_channel > 0 else 0.0
+                                    if 0 <= i_apex < len(rts):
+                                        x_peak = float(rts[i_apex])
+                                        y_peak = float(y[i_apex])
+                                        x_offset = 0.040 * max(1e-6, float(np.nanmax(rts) - np.nanmin(rts)))
+                                        seq_txt = lab
+                                        rt_window_txt = f"[{cmin:.2f}, {cmax:.2f}] min"
+                                        area_txt = f"A={area_val:.2e} | {rel_pct:.1f}% | {rt_window_txt}"
+                                        # Place labels directly adjacent to the peak, then nudge right if needed to avoid overlap.
+                                        y_seq = y_peak + track_h * 0.06
+                                        y_area = y_peak - track_h * 0.22
+                                        x_seq = x_peak + x_offset
+                                        x_area = x_peak + x_offset
+                                        x_span_local = max(1e-6, float(np.nanmax(rts) - np.nanmin(rts)))
+                                        x_step = 0.018 * x_span_local
+                                        x_min_sep = 0.020 * x_span_local
+                                        y_min_sep = 0.18 * track_h
+
+                                        def _occupied(xx, yy):
+                                            for px, py in placed_label_points:
+                                                if abs(xx - px) < x_min_sep and abs(yy - py) < y_min_sep:
+                                                    return True
+                                            return False
+
+                                        guard = 0
+                                        while (_occupied(x_seq, y_seq) or _occupied(x_area, y_area)) and guard < 40:
+                                            x_seq += x_step
+                                            x_area += x_step
+                                            guard += 1
+                                        ax_tr.text(
+                                            x_seq,
+                                            y_seq,
+                                            seq_txt,
+                                            va='bottom',
+                                            ha='left',
+                                            fontsize=17,
+                                            fontfamily='serif',
+                                            fontweight='bold',
+                                            color='0.98',
+                                            bbox=dict(boxstyle='round,pad=0.30', fc=(0, 0, 0, 0.72), ec=col, linewidth=1.2),
+                                            zorder=7,
+                                        )
+                                        ax_tr.text(
+                                            x_area,
+                                            y_area,
+                                            area_txt,
+                                            va='bottom',
+                                            ha='left',
+                                            fontsize=14,
+                                            fontfamily='serif',
+                                            fontweight='bold',
+                                            color='0.95',
+                                            bbox=dict(boxstyle='round,pad=0.26', fc=(0, 0, 0, 0.68), ec=col, linewidth=1.1),
+                                            zorder=6,
+                                        )
+                                        placed_label_points.append((x_seq, y_seq))
+                                        placed_label_points.append((x_area, y_area))
+                                    x_vals.extend([float(np.nanmin(rts)), float(np.nanmax(rts))])
+                                if x_vals:
+                                    x_min = min(x_vals)
+                                    x_max = max(x_vals)
+                                    pad = max(0.25, (x_max - x_min) * 0.18)
+                                    ax_tr.set_xlim(x_min - pad, x_max + pad)
+                                ax_tr.set_ylim(-0.2, len(subset_rows) * (track_h + track_gap) - track_gap + 0.2)
+                                ax_tr.set_title(f'Channel {chv} tracks (labeled)', fontsize=16, fontweight='bold', fontfamily='serif', color='0.95')
+                                ax_tr.set_xlabel('MS1 RT (min)', fontsize=14, fontfamily='serif', color='0.9')
+                                ax_tr.set_ylabel('Track (shape norm.)', fontsize=13, fontfamily='serif', color='0.9')
+                                ax_tr.set_yticks([])
+                                ax_tr.tick_params(axis='x', colors='0.85', labelsize=12)
+                                for spine in ax_tr.spines.values():
+                                    spine.set_color('0.6')
+                                ax_tr.grid(True, axis='x', alpha=0.25)
+                                tracks_png = os.path.join(channel_plot_dir, f'accepted_channel_{chv}_tracks_labeled.png')
+                                fig_tr.tight_layout()
+                                fig_tr.savefig(tracks_png, dpi=320, bbox_inches='tight', facecolor='black', pad_inches=0.2)
+                                plt.close(fig_tr)
+                                if os.path.exists(tracks_png):
+                                    st.markdown(f'**Channel {chv} tracks (labeled)**')
+                                    st.image(tracks_png, use_container_width=True)
+
+        _render_terminal('channels')
+
+    with filter_tabs[16]:  # Method
         st.subheader('Method')
         st.caption('Method parameters and documentation.')
-
-    # Fallback: execute pending run at end for steps not started inline in their tab
-    _execute_pending_run()
 
 if __name__ == '__main__':
     main()

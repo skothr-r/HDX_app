@@ -2,8 +2,8 @@
 """
 Step 4: Filter Comet fragments by confidence (Q-value and PEP).
 
-Q/PEP thresholds are optional (disabled by default). When enabled,
-rows must satisfy Q-value ≤ threshold AND PEP ≤ threshold.
+Q-value and PEP thresholds are optional (disabled by default),
+and each can be enabled independently.
 Removes peptides where prev_aa or next_aa is proline (P).
 Output column order: protein_position, peptide_sequence, charge, theoretical_mz, MS1_RT_minutes, qvalue, pep, sp, then fragment columns.
 Creates diagnostics/ directory and a scatter plot of PEP vs Q-value with thresholds.
@@ -26,10 +26,6 @@ QVALUE_COLUMNS = ['perc_qvalue', 'percolator_qvalue', 'q-value', 'qvalue', 'perc
 PEP_COLUMNS = ['perc_PEP', 'percolator_PEP', 'PEP', 'pep']
 SP_COLUMNS = ['sp_score', 'sp', 'Sp']
 XCORR_COLUMNS = ['xcorr', 'XCorr', 'xCorr']
-Q_THRESHOLD_DEFAULT = 0.05
-PEP_THRESHOLD_DEFAULT = 0.05
-MS1_MZ_ERROR_PPM_THRESHOLD = 6.0
-
 # Output column order: lead columns, then fragment columns, then rest
 LEAD_COLS = ['protein_position', 'peptide_sequence', 'charge', 'observed_mz', 'theoretical_mz', 'MS1_mz_error_ppm', 'MS1_RT_minutes']
 FRAGMENT_COLS = ['comet_matched_frags', 'comet_matched_frags_mz', 'comet_matched_frags_intensities', 'comet_matched_frags_quality_scores',
@@ -47,19 +43,27 @@ def main():
     ap.add_argument('--threshold', type=float, default=None,
                     help=f'[Deprecated] Use --q-threshold and --pep-threshold. If set, applies to both.')
     ap.add_argument('--use-qpep', action='store_true',
-                    help='Enable Q-value/PEP thresholds. Off by default.')
-    ap.add_argument('--q-threshold', type=float, default=Q_THRESHOLD_DEFAULT,
-                    help=f'Q-value threshold (default: {Q_THRESHOLD_DEFAULT})')
-    ap.add_argument('--pep-threshold', type=float, default=PEP_THRESHOLD_DEFAULT,
-                    help=f'PEP threshold (default: {PEP_THRESHOLD_DEFAULT})')
+                    help='[Legacy alias] Enable both Q-value and PEP thresholds.')
+    ap.add_argument('--use-q', action='store_true',
+                    help='Enable Q-value threshold filter.')
+    ap.add_argument('--use-pep', action='store_true',
+                    help='Enable PEP threshold filter.')
+    ap.add_argument('--q-threshold', type=float, default=None,
+                    help='Q-value threshold (required when --use-q is enabled)')
+    ap.add_argument('--pep-threshold', type=float, default=None,
+                    help='PEP threshold (required when --use-pep is enabled)')
     ap.add_argument('--use-xcorr', action='store_true',
                     help='Enable XCorr threshold filter')
-    ap.add_argument('--xcorr-min', type=float, default=0.0,
-                    help='Minimum XCorr when --use-xcorr is enabled (default: 0.0)')
+    ap.add_argument('--xcorr-min', type=float, default=None,
+                    help='Minimum XCorr when --use-xcorr is enabled')
     ap.add_argument('--use-sp', action='store_true',
                     help='Enable Sp threshold filter')
-    ap.add_argument('--sp-min', type=float, default=0.0,
-                    help='Minimum Sp when --use-sp is enabled (default: 0.0)')
+    ap.add_argument('--sp-min', type=float, default=None,
+                    help='Minimum Sp when --use-sp is enabled')
+    ap.add_argument('--ms1-mz-error-ppm', type=float, default=None,
+                    help='Max absolute MS1 m/z error in ppm (required unless --disable-ms1-mz-error)')
+    ap.add_argument('--disable-ms1-mz-error', action='store_true',
+                    help='Disable MS1 m/z error filter')
     ap.add_argument('--allow-carbamidomethyl', action='store_true',
                     help='Allow peptides with only Carbamidomethyl (C, 57.0215). Default: reject all modifications.')
     args = ap.parse_args()
@@ -67,6 +71,24 @@ def main():
         args.use_qpep = True
         args.q_threshold = args.threshold
         args.pep_threshold = args.threshold
+    if args.use_qpep:
+        args.use_q = True
+        args.use_pep = True
+    if args.use_q and args.q_threshold is None:
+        print("Error: --q-threshold is required when --use-q is enabled.")
+        sys.exit(1)
+    if args.use_pep and args.pep_threshold is None:
+        print("Error: --pep-threshold is required when --use-pep is enabled.")
+        sys.exit(1)
+    if args.use_xcorr and args.xcorr_min is None:
+        print("Error: --xcorr-min is required when --use-xcorr is enabled.")
+        sys.exit(1)
+    if args.use_sp and args.sp_min is None:
+        print("Error: --sp-min is required when --use-sp is enabled.")
+        sys.exit(1)
+    if not args.disable_ms1_mz_error and args.ms1_mz_error_ppm is None:
+        print("Error: --ms1-mz-error-ppm is required unless --disable-ms1-mz-error is set.")
+        sys.exit(1)
 
     if not os.path.exists(args.input):
         print(f"Error: Input file not found: {args.input}")
@@ -140,17 +162,7 @@ def main():
             break
     mzerrcol = 'MS1_mz_error_ppm' if 'MS1_mz_error_ppm' in df.columns else None
 
-    active_criteria = ['prolines', 'modifications']
-    if mzerrcol:
-        active_criteria.append(f'|MS1_mz_error_ppm| ≤ {MS1_MZ_ERROR_PPM_THRESHOLD:g}')
-    if args.use_qpep:
-        active_criteria.append(f'Q-value ≤ {args.q_threshold}')
-        active_criteria.append(f'PEP ≤ {args.pep_threshold}')
-    if args.use_xcorr:
-        active_criteria.append(f'XCorr ≥ {args.xcorr_min}')
-    if args.use_sp:
-        active_criteria.append(f'Sp ≥ {args.sp_min}')
-    print("Prefilter active exclusion criteria: " + "; ".join(active_criteria))
+    use_ms1_mz_error = (not args.disable_ms1_mz_error)
 
     def _pass(row):
         q_ok = True
@@ -169,7 +181,11 @@ def main():
                 pep_ok = True
         else:
             pep_ok = True
-        conf_ok = (q_ok and pep_ok) if args.use_qpep else True
+        conf_ok = True
+        if args.use_q:
+            conf_ok = conf_ok and q_ok
+        if args.use_pep:
+            conf_ok = conf_ok and pep_ok
         xcorr_ok = True
         if args.use_xcorr and xcorrcol and xcorrcol in df.columns and pd.notna(row.get(xcorrcol)):
             try:
@@ -183,35 +199,20 @@ def main():
             except (TypeError, ValueError):
                 sp_ok = True
         mzerr_ok = True
-        if mzerrcol and mzerrcol in df.columns and pd.notna(row.get(mzerrcol)):
+        if use_ms1_mz_error and mzerrcol and mzerrcol in df.columns and pd.notna(row.get(mzerrcol)):
             try:
-                mzerr_ok = abs(float(row[mzerrcol])) <= MS1_MZ_ERROR_PPM_THRESHOLD
+                mzerr_ok = abs(float(row[mzerrcol])) <= args.ms1_mz_error_ppm
             except (TypeError, ValueError):
                 mzerr_ok = True
         return conf_ok and xcorr_ok and sp_ok and mzerr_ok
 
-    n_before_qpep = len(df)
-    if args.use_qpep:
-        if qcol is None and pepcol is None:
-            print("Warning: Q/PEP filter enabled but no Q-value or PEP column found. Keeping all rows.")
-            df_filtered = df.copy()
-        else:
-            mask = df.apply(_pass, axis=1)
-            df_filtered = df.loc[mask].copy()
-        n_qpep_removed = n_before_qpep - len(df_filtered)
-        if n_qpep_removed > 0:
-            extra = []
-            if args.use_xcorr:
-                extra.append(f'XCorr ≥ {args.xcorr_min}')
-            if args.use_sp:
-                extra.append(f'Sp ≥ {args.sp_min}')
-            extra_txt = (' and ' + ' and '.join(extra)) if extra else ''
-            print(f"Removed {n_qpep_removed} rows (kept rows with Q-value ≤ {args.q_threshold} and PEP ≤ {args.pep_threshold}{extra_txt})")
-    else:
-        df_filtered = df.copy()
-        print("Q/PEP thresholds disabled (columns kept for diagnostics).")
-    if mzerrcol:
-        print(f"MS1 m/z error filter: |MS1_mz_error_ppm| ≤ {MS1_MZ_ERROR_PPM_THRESHOLD:g}")
+    if args.use_q and qcol is None:
+        print("Warning: Q-value filter enabled but no Q-value column found. Q criterion will be skipped.")
+    if args.use_pep and pepcol is None:
+        print("Warning: PEP filter enabled but no PEP column found. PEP criterion will be skipped.")
+    n_before_prefilter = len(df)
+    mask = df.apply(_pass, axis=1)
+    df_filtered = df.loc[mask].copy()
 
     # Remove peptides with modifications. Default: reject all (unmodified only).
     # With --allow-carbamidomethyl: allow only Carbamidomethyl (C, 57.0215).
@@ -247,10 +248,6 @@ def main():
     if 'modifications' in df_filtered.columns:
         mask_mods = ~df_filtered['modifications'].apply(_has_modifications_to_reject)
         df_filtered = df_filtered.loc[mask_mods].copy()
-        n_mods_removed = n_before_mods - len(df_filtered)
-        if n_mods_removed > 0:
-            mod_desc = 'modifications (unmodified only)' if not args.allow_carbamidomethyl else 'variable modifications'
-            print(f"Removed {n_mods_removed} rows ({mod_desc})")
 
     # Remove peptides where prev_aa or next_aa is proline (P), or peptide starts/ends with proline
     n_before_pro = len(df_filtered)
@@ -268,9 +265,6 @@ def main():
         return False
     mask_pro = ~df_filtered.apply(_is_proline_reject, axis=1)
     df_filtered = df_filtered.loc[mask_pro].copy()
-    n_pro_removed = n_before_pro - len(df_filtered)
-    if n_pro_removed > 0:
-        print(f"Removed {n_pro_removed} rows (proline: flanking or peptide termini)")
 
     # Build per-row rejection reason tags against original input rows.
     # These tags are used for rejected CSV + rejection-reason diagnostics.
@@ -284,18 +278,22 @@ def main():
     sp_fail = pd.Series(False, index=idx_all)
     mzppm_fail = pd.Series(False, index=idx_all)
 
-    # Confidence failure matches current logic when enabled: q_ok AND pep_ok must pass.
+    # Confidence failure reflects independently enabled Q-value/PEP criteria.
     q_ok_series = pd.Series(True, index=idx_all)
     pep_ok_series = pd.Series(True, index=idx_all)
-    if qcol and qcol in df.columns:
+    if args.use_q and qcol and qcol in df.columns:
         q_num = pd.to_numeric(df[qcol], errors='coerce')
         q_fail = q_num.notna() & (q_num > args.q_threshold)
         q_ok_series = ~q_fail
-    if pepcol and pepcol in df.columns:
+    if args.use_pep and pepcol and pepcol in df.columns:
         pep_num = pd.to_numeric(df[pepcol], errors='coerce')
         pep_fail = pep_num.notna() & (pep_num > args.pep_threshold)
         pep_ok_series = ~pep_fail
-    conf_fail = ~(q_ok_series & pep_ok_series) if args.use_qpep else pd.Series(False, index=idx_all)
+    conf_fail = pd.Series(False, index=idx_all)
+    if args.use_q:
+        conf_fail = conf_fail | q_fail
+    if args.use_pep:
+        conf_fail = conf_fail | pep_fail
 
     if 'modifications' in df.columns:
         mods_fail = df['modifications'].apply(_has_modifications_to_reject)
@@ -306,9 +304,99 @@ def main():
     if args.use_sp and spcol and spcol in df.columns:
         sv = pd.to_numeric(df[spcol], errors='coerce')
         sp_fail = sv.notna() & (sv < args.sp_min)
-    if mzerrcol and mzerrcol in df.columns:
+    if use_ms1_mz_error and mzerrcol and mzerrcol in df.columns:
         mv = pd.to_numeric(df[mzerrcol], errors='coerce')
-        mzppm_fail = mv.notna() & (mv.abs() > MS1_MZ_ERROR_PPM_THRESHOLD)
+        mzppm_fail = mv.notna() & (mv.abs() > args.ms1_mz_error_ppm)
+
+    # Clear, per-criterion summary for user-facing logs.
+    print("Prefilter criteria summary:")
+    if args.use_q:
+        print(f"  - Q-value <= {args.q_threshold:g}: failed {int(q_fail.sum())}")
+    else:
+        print("  - Q-value filter: disabled (failed 0)")
+    if args.use_pep:
+        print(f"  - PEP <= {args.pep_threshold:g}: failed {int(pep_fail.sum())}")
+    else:
+        print("  - PEP filter: disabled (failed 0)")
+    if args.use_xcorr:
+        print(f"  - XCorr >= {args.xcorr_min:g}: failed {int(xcorr_fail.sum())}")
+    else:
+        print("  - XCorr filter: disabled (failed 0)")
+    if args.use_sp:
+        print(f"  - Sp >= {args.sp_min:g}: failed {int(sp_fail.sum())}")
+    else:
+        print("  - Sp filter: disabled (failed 0)")
+    if use_ms1_mz_error and mzerrcol and mzerrcol in df.columns:
+        print(f"  - |MS1_mz_error_ppm| <= {args.ms1_mz_error_ppm:g}: failed {int(mzppm_fail.sum())}")
+    elif use_ms1_mz_error:
+        print("  - |MS1_mz_error_ppm| filter enabled but column missing: failed 0")
+    else:
+        print("  - MS1 m/z ppm filter: disabled (failed 0)")
+    mod_desc = 'unmodified only' if not args.allow_carbamidomethyl else 'allow Carbamidomethyl only'
+    print(f"  - Modifications ({mod_desc}): failed {int(mods_fail.sum())}")
+    print(f"  - Proline (flanking or peptide termini): failed {int(pro_fail.sum())}")
+
+    combined_fail = mods_fail | pro_fail
+    if args.use_q or args.use_pep:
+        combined_fail = combined_fail | conf_fail
+    if args.use_xcorr:
+        combined_fail = combined_fail | xcorr_fail
+    if args.use_sp:
+        combined_fail = combined_fail | sp_fail
+    if use_ms1_mz_error and mzerrcol and mzerrcol in df.columns:
+        combined_fail = combined_fail | mzppm_fail
+    print(f"Total failed: {int(combined_fail.sum())} / {len(df)}")
+
+    # Rows-summary helper (PSMs, unique sequences, unique peptides by sequence+charge)
+    def _rows_counts(df_rows):
+        if df_rows is None or len(df_rows) == 0:
+            return (0, 0, 0)
+
+        seq_col = next((c for c in ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'] if c in df_rows.columns), None)
+        if seq_col is None:
+            return (len(df_rows), 0, 0)
+
+        seq_series = df_rows[seq_col].astype(str).str.strip()
+        valid_seq_mask = seq_series.ne('') & seq_series.str.lower().ne('nan')
+        seq_series = seq_series[valid_seq_mask]
+        if len(seq_series) == 0:
+            return (len(df_rows), 0, 0)
+
+        unique_sequences_passed = int(seq_series.nunique())
+
+        if 'charge' in df_rows.columns:
+            charge_series = pd.to_numeric(df_rows.loc[valid_seq_mask, 'charge'], errors='coerce')
+            unique_peptides_passed = int(
+                pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values}).drop_duplicates().shape[0]
+            )
+        else:
+            unique_peptides_passed = unique_sequences_passed
+
+        scan_col = next((c for c in ['scan', 'scan_num', 'scan_number', 'spectrum_scan', 'scan_id'] if c in df_rows.columns), None)
+        if scan_col and 'charge' in df_rows.columns:
+            scan_series = pd.to_numeric(df_rows.loc[valid_seq_mask, scan_col], errors='coerce')
+            charge_series = pd.to_numeric(df_rows.loc[valid_seq_mask, 'charge'], errors='coerce')
+            passed_psms = int(
+                pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values, 'scan': scan_series.values})
+                .dropna(subset=['scan'])
+                .drop_duplicates()
+                .shape[0]
+            )
+            if passed_psms == 0:
+                passed_psms = int(len(df_rows))
+        else:
+            passed_psms = int(len(df_rows))
+
+        return (passed_psms, unique_sequences_passed, unique_peptides_passed)
+
+    total_psms, total_unique_sequences, total_unique_peptides = _rows_counts(df)
+    passed_psms, unique_sequences_passed, unique_peptides_passed = _rows_counts(df_filtered)
+    print(f"Total PSMs: {total_psms}")
+    print(f"Total unique sequences: {total_unique_sequences}")
+    print(f"Total unique peptides (sequence + charge): {total_unique_peptides}")
+    print(f"Passed PSMs: {passed_psms}")
+    print(f"Passed unique sequences: {unique_sequences_passed}")
+    print(f"Passed unique peptides (sequence + charge): {unique_peptides_passed}")
 
     def _reason_tags(i):
         tags = []
@@ -460,12 +548,18 @@ def main():
             ax.set_yscale('log')
             ax.scatter(q_plot[~passed], pep_plot[~passed], c='#CCCCCC', s=12, alpha=0.7, edgecolors='0.6', linewidths=0.3, label=f'Rejected ({n_total - n_pass})')
             ax.scatter(q_plot[passed], pep_plot[passed], c='#2E86AB', s=12, alpha=0.6, edgecolors='0.6', linewidths=0.3, label=f'Passing ({n_pass})')
-            ax.axhline(args.pep_threshold, color='red', linestyle='--', linewidth=2, label=f'PEP = {args.pep_threshold}')
-            ax.axvline(args.q_threshold, color='orange', linestyle='--', linewidth=2, label=f'Q-value = {args.q_threshold}')
+            if args.use_pep:
+                ax.axhline(args.pep_threshold, color='red', linestyle='--', linewidth=2, label=f'PEP = {args.pep_threshold}')
+            if args.use_q:
+                ax.axvline(args.q_threshold, color='orange', linestyle='--', linewidth=2, label=f'Q-value = {args.q_threshold}')
             ax.set_xlabel(f'Q-value ({qcol})', fontsize=12, color='0.85')
             ax.set_ylabel(f'PEP ({pepcol})', fontsize=12, color='0.85')
-            if args.use_qpep:
+            if args.use_q and args.use_pep:
                 ttl = f'Confidence filter: {n_pass} / {n_total} rows pass (Q≤{args.q_threshold} and PEP≤{args.pep_threshold})'
+            elif args.use_q:
+                ttl = f'Confidence filter: {n_pass} / {n_total} rows pass (Q≤{args.q_threshold})'
+            elif args.use_pep:
+                ttl = f'Confidence filter: {n_pass} / {n_total} rows pass (PEP≤{args.pep_threshold})'
             else:
                 ttl = f'Confidence filter (disabled): {n_pass} / {n_total} rows pass'
             ax.set_title(ttl, fontsize=14, color='0.9')

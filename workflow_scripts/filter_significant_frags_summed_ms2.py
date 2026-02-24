@@ -28,10 +28,6 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-MIN_INTENSITY_FRAC = 0.01  # 1% of max MS2
-PPM_THRESHOLD = 5.0
-MIN_SIG_FRAGS = 5
-MIN_SINGLE_AA_OVERHANGS = 2
 DEFAULT_INPUT = os.path.join(_PROJECT_ROOT, 'data', 'comet_frags_perc_openMS_prefilter_extraction_envelope.csv')
 DEFAULT_MZML = os.path.join(_PROJECT_ROOT, 'data', 'WT_nep2_0MUrea_08.mzML')
 
@@ -126,6 +122,42 @@ def _unique_peptide_stats(df):
     return len(pep_set), len(pep_charge_set)
 
 
+def _rows_counts(df):
+    """Return (psms, unique_sequences, unique_peptides_seq_plus_charge)."""
+    import pandas as pd
+    if df is None or len(df) == 0:
+        return (0, 0, 0)
+    seq_col = next((c for c in ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'] if c in df.columns), None)
+    if seq_col is None:
+        return (len(df), 0, 0)
+    seq_series = df[seq_col].astype(str).str.strip()
+    valid_seq_mask = seq_series.ne('') & seq_series.str.lower().ne('nan')
+    seq_series = seq_series[valid_seq_mask]
+    if len(seq_series) == 0:
+        return (len(df), 0, 0)
+    unique_sequences = int(seq_series.nunique())
+    if 'charge' in df.columns:
+        charge_series = pd.to_numeric(df.loc[valid_seq_mask, 'charge'], errors='coerce')
+        unique_peptides = int(pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values}).drop_duplicates().shape[0])
+    else:
+        unique_peptides = unique_sequences
+    scan_col = next((c for c in ['scan', 'scan_num', 'scan_number', 'spectrum_scan', 'scan_id'] if c in df.columns), None)
+    if scan_col and 'charge' in df.columns:
+        scan_series = pd.to_numeric(df.loc[valid_seq_mask, scan_col], errors='coerce')
+        charge_series = pd.to_numeric(df.loc[valid_seq_mask, 'charge'], errors='coerce')
+        psms = int(
+            pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values, 'scan': scan_series.values})
+            .dropna(subset=['scan'])
+            .drop_duplicates()
+            .shape[0]
+        )
+        if psms == 0:
+            psms = int(len(df))
+    else:
+        psms = int(len(df))
+    return (psms, unique_sequences, unique_peptides)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Combined significant fragmentation: 5 ppm + min sig frags + min single-AA overhangs + 1%% max MS2 (all from summed MS2).'
@@ -134,13 +166,13 @@ def main():
     ap.add_argument('--input', '-i', default=DEFAULT_INPUT, help='Input CSV from extraction (has RT windows)')
     ap.add_argument('--output', '-o', default=None, help='Output CSV path')
     ap.add_argument('--output-dir', default=None, help='Output directory')
-    ap.add_argument('--ppm', type=float, default=PPM_THRESHOLD, help=f'PPM tolerance (default: {PPM_THRESHOLD})')
-    ap.add_argument('--min-frac', type=float, default=MIN_INTENSITY_FRAC,
-                    help=f'Min fragment signal as fraction of max MS2 (default: {MIN_INTENSITY_FRAC})')
-    ap.add_argument('--min-sig-frags', type=int, default=MIN_SIG_FRAGS,
-                    help=f'Min significant fragments per row (default: {MIN_SIG_FRAGS})')
-    ap.add_argument('--min-overhangs', type=int, default=MIN_SINGLE_AA_OVERHANGS,
-                    help=f'Min significant single-AA overhangs per row (default: {MIN_SINGLE_AA_OVERHANGS})')
+    ap.add_argument('--ppm', type=float, default=None, help='PPM tolerance (required).')
+    ap.add_argument('--min-frac', type=float, default=None,
+                    help='Min fragment signal as fraction of max MS2 (required).')
+    ap.add_argument('--min-sig-frags', type=int, default=None,
+                    help='Min significant fragments per row (required).')
+    ap.add_argument('--min-overhangs', type=int, default=None,
+                    help='Min significant single-AA overhangs per row (required).')
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -148,6 +180,18 @@ def main():
         sys.exit(1)
     if not os.path.exists(args.mzml):
         print(f"Error: mzML file not found: {args.mzml}")
+        sys.exit(1)
+    if args.ppm is None:
+        print("Error: --ppm is required.")
+        sys.exit(1)
+    if args.min_frac is None:
+        print("Error: --min-frac is required.")
+        sys.exit(1)
+    if args.min_sig_frags is None:
+        print("Error: --min-sig-frags is required.")
+        sys.exit(1)
+    if args.min_overhangs is None:
+        print("Error: --min-overhangs is required.")
         sys.exit(1)
 
     try:
@@ -210,6 +254,7 @@ def main():
         if col not in df.columns:
             df[col] = ''
 
+    df_input_counts = df.copy()
     n_before = len(df)
     unique_pep_before, unique_pep_charge_before = _unique_peptide_stats(df)
     scatter_data = []
@@ -391,6 +436,14 @@ def main():
     _log(f"[Significant fragmentation] Unique peptides: accepted={unique_pep_after}, rejected={unique_pep_rejected}, total={unique_pep_before}")
     _log(f"[Significant fragmentation] Unique peptide+charge: accepted={unique_pep_charge_after}, rejected={unique_pep_charge_rejected}, total={unique_pep_charge_before}")
     _log(f"[Significant fragmentation] Rows: {n_before} -> {n_after} (removed {n_rejected})")
+    total_psms, total_unique_sequences, total_unique_peptides = _rows_counts(df_input_counts)
+    passed_psms, passed_unique_sequences, passed_unique_peptides = _rows_counts(df)
+    _log(f"Total PSMs: {total_psms}")
+    _log(f"Total unique sequences: {total_unique_sequences}")
+    _log(f"Total unique peptides (sequence + charge): {total_unique_peptides}")
+    _log(f"Passed PSMs: {passed_psms}")
+    _log(f"Passed unique sequences: {passed_unique_sequences}")
+    _log(f"Passed unique peptides (sequence + charge): {passed_unique_peptides}")
     if skip_no_rt or skip_no_peptide or skip_no_ms2:
         parts = []
         if skip_no_rt:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Step 7: Filter by isotopic envelope (M0, M+1, M+2 present; M0 and M+1 > M+2 and M+3).
+Step 7: Filter by isotopic envelope (M0, M+1, M+2, M+3 present; M0/M+1 > M+2 > M+3).
 
 Runs after chromatogram extraction (Step 6). Keeps only rows where:
   (1) M0, M+1, M+2, and M+3 are present in summed MS1 (has_required_isotopes)
-  (2) Envelope passes: both M0 and M+1 are greater than both M+2 and M+3
+  (2) Envelope passes: both M0 and M+1 are greater than M+2, and M+2 > M+3
       (computed directly from m0/m1/m2/m3_intensity when available)
 
 Requires extraction envelope columns from Step 6. Prefers direct intensity columns:
@@ -50,12 +50,21 @@ def _to_bool(v):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Step 7: Filter by isotopic envelope (M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3).'
+        description='Step 7: Filter by isotopic envelope (M0, M+1, M+2, M+3 present; M0/M+1 > M+2 > M+3).'
     )
     ap.add_argument('--input', '-i', default=DEFAULT_INPUT,
                     help=f'Input CSV from Step 6 (default: {os.path.basename(DEFAULT_INPUT)})')
     ap.add_argument('--output', '-o', default=None, help='Output CSV path')
     ap.add_argument('--output-dir', default=None, help='Output directory')
+    ap.add_argument(
+        '--envelope-mode',
+        choices=['strict_m3_required', 'm3_optional'],
+        default='strict_m3_required',
+        help=(
+            "strict_m3_required: require M0/M+1/M+2/M+3 and M0/M+1 > M+2 > M+3; "
+            "m3_optional: require M0/M+1/M+2 and M0/M+1 > M+2, then enforce M0/M+1/M+2 > M+3 only if M+3 has signal."
+        ),
+    )
     ap.add_argument('--no-plots', action='store_true', help='Skip MS1 chromatogram plot generation')
     args = ap.parse_args()
 
@@ -114,46 +123,157 @@ def main():
         sys.exit(1)
 
     # Filter criteria from summed MS1 (integration window):
-    #   (1) M0, M+1, M+2, M+3 present (has_required_isotopes == True)
-    #   (2) M0 and M+1 both > M+2 and M+3
+    # strict_m3_required:
+    #   (1) M0, M+1, M+2, M+3 present
+    #   (2) M0 and M+1 both > M+2, and M+2 > M+3
+    # m3_optional:
+    #   (1) M0, M+1, M+2 present
+    #   (2) M0 and M+1 both > M+2
+    #   (3) if M+3 has signal, require M0/M+1/M+2 > M+3
 
-    def _has_required_isotopes(row):
+    def _num(v):
+        x = pd.to_numeric(pd.Series([v]), errors='coerce').iloc[0]
+        return float(x) if pd.notna(x) else None
+
+    def _iso_tokens(row):
+        mi = row.get('matched_isotopes')
+        if pd.isna(mi):
+            return set()
+        s = str(mi).replace(' ', '')
+        out = set()
+        for tok in ('M+0', 'M+1', 'M+2', 'M+3'):
+            if tok in s:
+                out.add(tok)
+        return out
+
+    def _has_isotope_triplet(row):
+        if has_matched_isotopes:
+            toks = _iso_tokens(row)
+            return ('M+0' in toks) and ('M+1' in toks) and ('M+2' in toks)
+        if has_i0 and has_i1 and has_i2:
+            i0 = _num(row.get('m0_intensity'))
+            i1 = _num(row.get('m1_intensity'))
+            i2 = _num(row.get('m2_intensity'))
+            return (i0 is not None and i0 > 0) and (i1 is not None and i1 > 0) and (i2 is not None and i2 > 0)
         if has_req_iso:
             req = row.get('has_required_isotopes')
             return (not pd.isna(req)) and _to_bool(req)
-        # Backward compatibility: infer from matched_isotopes string in older extraction outputs.
-        mi = row.get('matched_isotopes')
-        if pd.isna(mi):
-            return False
-        s = str(mi).replace(' ', '')
-        return ('M+0' in s) and ('M+1' in s) and ('M+2' in s) and ('M+3' in s)
+        return False
+
+    def _has_isotope_quartet(row):
+        if has_matched_isotopes:
+            toks = _iso_tokens(row)
+            return ('M+0' in toks) and ('M+1' in toks) and ('M+2' in toks) and ('M+3' in toks)
+        if has_req_iso:
+            req = row.get('has_required_isotopes')
+            return (not pd.isna(req)) and _to_bool(req)
+        if has_intensity_quartet:
+            i0 = _num(row.get('m0_intensity'))
+            i1 = _num(row.get('m1_intensity'))
+            i2 = _num(row.get('m2_intensity'))
+            i3 = _num(row.get('m3_intensity'))
+            return (
+                (i0 is not None and i0 > 0)
+                and (i1 is not None and i1 > 0)
+                and (i2 is not None and i2 > 0)
+                and (i3 is not None and i3 > 0)
+            )
+        return False
+
+    def _m3_has_signal(row):
+        if has_matched_isotopes:
+            return 'M+3' in _iso_tokens(row)
+        if has_i3:
+            i3 = _num(row.get('m3_intensity'))
+            return i3 is not None and i3 > 0
+        return False
 
     def _passes_envelope(row):
-        if not _has_required_isotopes(row):
-            return False
+        if args.envelope_mode == 'strict_m3_required':
+            if not _has_isotope_quartet(row):
+                return False
+        else:
+            if not _has_isotope_triplet(row):
+                return False
         m_new = row.get('m0_m1_gt_m2_m3')
         m0 = row.get('m0_gt_m1_gt_m2')
         env = row.get('envelope_ok')
         # Primary path: compute directly from extraction intensity columns.
         if has_intensity_quartet:
-            i0 = pd.to_numeric(pd.Series([row.get('m0_intensity')]), errors='coerce').iloc[0]
-            i1 = pd.to_numeric(pd.Series([row.get('m1_intensity')]), errors='coerce').iloc[0]
-            i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
-            i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
-            if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
-                return bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+            i0 = _num(row.get('m0_intensity'))
+            i1 = _num(row.get('m1_intensity'))
+            i2 = _num(row.get('m2_intensity'))
+            i3 = _num(row.get('m3_intensity'))
+            if i0 is not None and i1 is not None and i2 is not None:
+                if not ((i0 > i2) and (i1 > i2)):
+                    return False
+                if args.envelope_mode == 'strict_m3_required':
+                    if i3 is None:
+                        return False
+                    return i2 > i3
+                # m3_optional mode
+                if _m3_has_signal(row):
+                    if i3 is None:
+                        return False
+                    return (i0 > i3) and (i1 > i3) and (i2 > i3)
+                return True
         # Fallback: explicit boolean metric from newer extraction output.
         if has_new_env and pd.notna(m_new):
-            return _to_bool(m_new)
+            if args.envelope_mode == 'strict_m3_required':
+                return _to_bool(m_new)
+            # In m3_optional mode, m0_m1_gt_m2_m3 is stricter than needed and still valid if True.
+            if _to_bool(m_new):
+                return True
         # Legacy fallbacks.
         if has_m0 and pd.notna(m0):
-            return _to_bool(m0)
+            if args.envelope_mode == 'strict_m3_required':
+                return _to_bool(m0)
+            # m0_gt_m1_gt_m2 does not include M+3 relation; apply conditional M+3 check if we can.
+            if not _to_bool(m0):
+                return False
+            if _m3_has_signal(row) and has_i3 and has_i0 and has_i1 and has_i2:
+                i0 = _num(row.get('m0_intensity'))
+                i1 = _num(row.get('m1_intensity'))
+                i2 = _num(row.get('m2_intensity'))
+                i3 = _num(row.get('m3_intensity'))
+                if None not in (i0, i1, i2, i3):
+                    return (i0 > i3) and (i1 > i3) and (i2 > i3)
+                return False
+            return True
         if has_env_ok and pd.notna(env):
             return _to_bool(env)
         return False
 
     mask = df.apply(_passes_envelope, axis=1)
     df_out = df[mask].reset_index(drop=True)
+
+    def _rows_counts(df_rows):
+        if df_rows is None or len(df_rows) == 0:
+            return (0, 0, 0)
+        seq_col = next((c for c in ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'] if c in df_rows.columns), None)
+        if seq_col is None:
+            return (len(df_rows), 0, 0)
+        seq_series = df_rows[seq_col].astype(str).str.strip()
+        valid_seq_mask = seq_series.ne('') & seq_series.str.lower().ne('nan')
+        seq_series = seq_series[valid_seq_mask]
+        if len(seq_series) == 0:
+            return (len(df_rows), 0, 0)
+        unique_sequences = int(seq_series.nunique())
+        if 'charge' in df_rows.columns:
+            charge_series = pd.to_numeric(df_rows.loc[valid_seq_mask, 'charge'], errors='coerce')
+            unique_peptides = int(pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values}).drop_duplicates().shape[0])
+        else:
+            unique_peptides = unique_sequences
+        scan_col = next((c for c in ['scan', 'scan_num', 'scan_number', 'spectrum_scan', 'scan_id'] if c in df_rows.columns), None)
+        if scan_col and 'charge' in df_rows.columns:
+            scan_series = pd.to_numeric(df_rows.loc[valid_seq_mask, scan_col], errors='coerce')
+            charge_series = pd.to_numeric(df_rows.loc[valid_seq_mask, 'charge'], errors='coerce')
+            psms = int(pd.DataFrame({'seq': seq_series.values, 'charge': charge_series.values, 'scan': scan_series.values}).dropna(subset=['scan']).drop_duplicates().shape[0])
+            if psms == 0:
+                psms = int(len(df_rows))
+        else:
+            psms = int(len(df_rows))
+        return (psms, unique_sequences, unique_peptides)
     # Standardize legacy retention_time headers to RT headers.
     for old, new in [
         ('MS1_retention_time_sec', 'MS1_RT_sec'),
@@ -221,6 +341,14 @@ def main():
 
     df_out.to_csv(out_csv, index=False)
     print(f"[Step 7] Envelope filter: {n_before} -> {n_after} rows (dropped {n_dropped})")
+    total_psms, total_unique_sequences, total_unique_peptides = _rows_counts(df)
+    passed_psms, passed_unique_sequences, passed_unique_peptides = _rows_counts(df_out)
+    print(f"Total PSMs: {total_psms}")
+    print(f"Total unique sequences: {total_unique_sequences}")
+    print(f"Total unique peptides (sequence + charge): {total_unique_peptides}")
+    print(f"Passed PSMs: {passed_psms}")
+    print(f"Passed unique sequences: {passed_unique_sequences}")
+    print(f"Passed unique peptides (sequence + charge): {passed_unique_peptides}")
     print(f"[Step 7] Output: {os.path.abspath(out_csv)}")
 
     # Generate MS1 chromatogram plots for all peptides in this step input

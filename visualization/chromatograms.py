@@ -1195,7 +1195,7 @@ def isotope_mz_list(mz_mono, charge, n_isos=4):
     
     return [mz_mono + k * (C13_C12_DIFF / charge) for k in range(n_isos)]
 
-def extract_aligned_isotope_chromatograms(raw_file, mz_targets, ppm_tolerance=20.0, rt_min_sec=None, rt_max_sec=None):
+def extract_aligned_isotope_chromatograms(raw_file, mz_targets, ppm_tolerance=20.0, rt_min_sec=None, rt_max_sec=None, peak_matching_ppm_threshold=6.0):
     """
     Extract aligned MS1 chromatograms for multiple isotope m/z targets.
     Returns aligned RT grid and intensity matrix (n_scans x n_isos) with zeros preserved.
@@ -1244,8 +1244,8 @@ def extract_aligned_isotope_chromatograms(raw_file, mz_targets, ppm_tolerance=20
     measured_mz_matrix = np.full((n_scans, n_isos), np.nan, dtype=np.float64)
     
     # Extract intensities for each isotope at each MS1 scan
-    # Peak selection when multiple candidates: favor lowest ppm down to 6 ppm; below 6 ppm, choose highest intensity
-    PPM_INTENSITY_THRESHOLD = 6.0  # Below this ppm, prefer highest intensity; at/above, prefer lowest ppm
+    # Peak selection when multiple candidates: favor lowest ppm down to threshold; below threshold, choose highest intensity.
+    PPM_INTENSITY_THRESHOLD = float(peak_matching_ppm_threshold)
     for scan_idx, (rt, spec) in enumerate(ms1_scans):
         try:
             mzs, ints = spec.get_peaks()
@@ -2599,7 +2599,7 @@ def find_peak_boundaries(chromatogram, ms1_rts, group_data=None, rt_anchor=None,
 FILTERING_CRITERIA_PLOT = (
     "XIC ppm=20 | anchor mz/rt=20ppm/60s | pre-filter: (no E-value threshold) | "
     "score=0.28 coel + 0.28 shape + 0.14 ratio + 0.12 RT_cov + 0.05 rt_prior + 0.05 quality + 0.20 strength | "
-    "accept: M0, M+1, M+2, M+3 present; M0 and M+1 > M+2 and M+3 | PSM: q≤0.05, PEP≤0.05"
+    "accept: M0, M+1, M+2, M+3 present; M0/M+1 > M+2 > M+3 | PSM: q≤0.05, PEP≤0.05"
 )
 
 
@@ -2931,21 +2931,45 @@ def create_summed_ms1_spectrum_figure(row, mzml_path, min_rt=None, max_rt=None, 
             bbox=dict(boxstyle='round,pad=0.35', facecolor='lightblue', alpha=0.8, edgecolor='black', linewidth=0.8), zorder=25)
     plt.tight_layout()
     if return_metrics:
-        m0 = observed_iso.get(0, {}).get('max_intensity', 0.0)
-        m1 = observed_iso.get(1, {}).get('max_intensity', 0.0)
-        m2 = observed_iso.get(2, {}).get('max_intensity', 0.0)
-        m3 = observed_iso.get(3, {}).get('max_intensity', 0.0)
-        has_required_isotopes = all(i in observed_iso for i in (0, 1, 2, 3))
-        m0_m1_gt_m2_m3 = bool(has_required_isotopes and (m0 > m2) and (m0 > m3) and (m1 > m2) and (m1 > m3))
-        envelope_ok = bool(m0_m1_gt_m2_m3)
+        # Standard envelope rule: pass if M0 > M+1 OR M+1 > M+2 (within +/-5 ppm matches).
+        m0 = float(observed_iso.get(0, {}).get('max_intensity', 0.0) or 0.0)
+        m1 = float(observed_iso.get(1, {}).get('max_intensity', 0.0) or 0.0)
+        m2 = float(observed_iso.get(2, {}).get('max_intensity', 0.0) or 0.0)
+        standard_pass = bool((m0 > 0 and m1 > 0 and m0 > m1) or (m1 > 0 and m2 > 0 and m1 > m2))
+
+        # Larger envelope below M0: reject if M-2 > M-1 > M0 OR M-1 > M0.
+        spacing = C13_C12_DIFF / charge if charge > 0 else C13_C12_DIFF
+        m0_mz = isotope_mzs[0]
+
+        def _peak_intensity_ppm(target_mz, ppm):
+            tol_da = target_mz * ppm * 1e-6
+            mask = (spec_mzs >= target_mz - tol_da) & (spec_mzs <= target_mz + tol_da)
+            if np.any(mask):
+                return float(np.max(spec_ints[mask]))
+            return 0.0
+
+        m_minus_1 = _peak_intensity_ppm(m0_mz - spacing, 12.0)
+        m_minus_2 = _peak_intensity_ppm(m0_mz - (2.0 * spacing), 12.0)
+        larger_m2_rule = bool(m_minus_2 > m_minus_1 and m_minus_1 > m0)
+        larger_m1_rule = bool(m_minus_1 > m0)
+        larger_below = bool(larger_m2_rule or larger_m1_rule)
+
+        rejection_reason = None
+        if not standard_pass:
+            rejection_reason = 'M0/M+1/M+2'
+        elif larger_below:
+            rejection_reason = 'larger envelope below M0 (M-2>M-1>M0 or M-1>M0)'
+
         metrics = {
             'matched_iso_indices': sorted(matched_iso_indices),
             'observed_iso': observed_iso,
-            'has_required_isotopes': has_required_isotopes,
-            'm0_m1_gt_m2_m3': m0_m1_gt_m2_m3 if has_required_isotopes else False,
-            'm0_gt_m1_gt_m2': bool((m0 > m1) or (m1 > m2)) if has_required_isotopes else False,
-            'm2_le_m0': bool(m2 <= m0) if has_required_isotopes else False,
-            'passes_envelope': envelope_ok,
+            'passes_envelope': bool(standard_pass and not larger_below),
+            'rejection_reason': rejection_reason,
+            'm0_intensity': m0,
+            'm_minus_1_intensity': m_minus_1,
+            'm_minus_2_intensity': m_minus_2,
+            'possible_larger_envelope_m2_gt_m1_gt_m0': larger_m2_rule,
+            'possible_larger_envelope_m1_gt_m0': larger_m1_rule,
         }
         return fig, metrics
     return fig
@@ -2984,7 +3008,7 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
         rt_min_sec, rt_max_sec = float(np.min(all_rts_sec)), float(np.max(all_rts_sec))
         if rt_max_sec <= rt_min_sec:
             rt_max_sec = rt_min_sec + 60.0
-        buffer_min = max(0.5, (rt_max_sec - rt_min_sec) / 60.0 * 0.1)
+        buffer_min = max(1.0, (rt_max_sec - rt_min_sec) / 60.0 * 0.16)
         x_min_ov = max(0.0, rt_min_sec / 60.0 - buffer_min)
         x_max_ov = rt_max_sec / 60.0 + buffer_min
         wins_min = [item['min_rt'] for item in overlay_data if item.get('min_rt') is not None]
@@ -3020,7 +3044,8 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
     track_height, track_gap = 2.0, 0.25
     label_pad_min = 1.2
     n_tracks = len(overlay_data)
-    fig_overview = plt.figure(figsize=(22, 72))
+    # Wider canvas to give peak callout labels more horizontal space.
+    fig_overview = plt.figure(figsize=(30, 72))
     fig_overview.patch.set_facecolor('black')
     gs_overview = GridSpec(3, 1, figure=fig_overview, height_ratios=[5, 5, 6], hspace=0.35)
     ax_overview = fig_overview.add_subplot(gs_overview[0])
@@ -3040,17 +3065,29 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
         total_ints = np.asarray(item['total_intensities'], dtype=float)
         if len(rts_min_overlay) < 2 or len(total_ints) < 2:
             continue
+        cmin = item.get('collection_min_rt')
+        cmax = item.get('collection_max_rt')
+        if cmin is not None and cmax is not None:
+            cmin_min = float(cmin) / 60.0
+            cmax_min = float(cmax) / 60.0
+            if cmax_min < cmin_min:
+                cmin_min, cmax_min = cmax_min, cmin_min
+            shade_mask = (rts_min_overlay >= cmin_min) & (rts_min_overlay <= cmax_min)
+        else:
+            shade_mask = np.zeros_like(rts_min_overlay, dtype=bool)
         ta = item.get('total_area')
         color = cmap_overview(area_norm_overview(ta)) if area_norm_overview is not None and ta is not None and not (isinstance(ta, float) and (np.isnan(ta) or ta < 0)) else (0.6, 0.6, 0.6, 0.8)
         color_rgb = color[:3] if len(color) >= 3 else color
         low_ints = np.where(total_ints < 1e5, total_ints, 0)
         high_ints = np.where(total_ints >= 1e5, total_ints, 0)
-        ax_overview.fill_between(rts_min_overlay, 0, low_ints, color=color_rgb, alpha=0.12, zorder=5)
-        ax_overview.fill_between(rts_min_overlay, 0, high_ints, color=color_rgb, alpha=0.35, zorder=5)
+        low_ints_fill = np.where(shade_mask, low_ints, 0.0)
+        high_ints_fill = np.where(shade_mask, high_ints, 0.0)
+        ax_overview.fill_between(rts_min_overlay, 0, low_ints_fill, color=color_rgb, alpha=0.12, zorder=5)
+        ax_overview.fill_between(rts_min_overlay, 0, high_ints_fill, color=color_rgb, alpha=0.35, zorder=5)
         low_plot = np.where(total_ints < 1e5, total_ints, np.nan)
         high_plot = np.where(total_ints >= 1e5, total_ints, np.nan)
         ax_overview.plot(rts_min_overlay, low_plot, color=color_rgb, alpha=0.25, linewidth=1.0, path_effects=overlay_path_effects)
-        ax_overview.plot(rts_min_overlay, high_plot, color=color_rgb, alpha=0.95, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
+        ax_overview.plot(rts_min_overlay, high_plot, color=color_rgb, alpha=0.95, linewidth=2.5, path_effects=overlay_path_effects)
     ax_overview.set_ylabel('Intensity', fontsize=13, fontfamily='serif', color='0.85')
     ax_overview.set_title('Accepted Peptides – Raw Intensity (green = integration window, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
     ax_overview.set_xlim(left=x_min_ov, right=x_max_ov_plot)
@@ -3064,7 +3101,6 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
     ax_overview.grid(True, alpha=0.25)
     for spine in ax_overview.spines.values():
         spine.set_color('0.6')
-    ax_overview.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1, labelcolor='0.9')
     for item in overlay_data:
         min_rt_m, max_rt_m = item.get('min_rt'), item.get('max_rt')
         cmin, cmax = item.get('collection_min_rt'), item.get('collection_max_rt')
@@ -3078,17 +3114,29 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
         total_ints_log = np.maximum(total_ints, y_floor)
         if len(rts_min_overlay) < 2 or len(total_ints_log) < 2:
             continue
+        cmin = item.get('collection_min_rt')
+        cmax = item.get('collection_max_rt')
+        if cmin is not None and cmax is not None:
+            cmin_min = float(cmin) / 60.0
+            cmax_min = float(cmax) / 60.0
+            if cmax_min < cmin_min:
+                cmin_min, cmax_min = cmax_min, cmin_min
+            shade_mask = (rts_min_overlay >= cmin_min) & (rts_min_overlay <= cmax_min)
+        else:
+            shade_mask = np.zeros_like(rts_min_overlay, dtype=bool)
         ta = item.get('total_area')
         color = cmap_overview(area_norm_overview(ta)) if area_norm_overview is not None and ta is not None and not (isinstance(ta, float) and (np.isnan(ta) or ta < 0)) else (0.6, 0.6, 0.6, 0.8)
         color_rgb = color[:3] if len(color) >= 3 else color
         low_log = np.where(total_ints_log < 1e5, total_ints_log, y_floor)
         high_log = np.where(total_ints_log >= 1e5, total_ints_log, y_floor)
-        ax_overview_log.fill_between(rts_min_overlay, y_floor, low_log, color=color_rgb, alpha=0.12, zorder=5)
-        ax_overview_log.fill_between(rts_min_overlay, y_floor, high_log, color=color_rgb, alpha=0.35, zorder=5)
+        low_log_fill = np.where(shade_mask, low_log, y_floor)
+        high_log_fill = np.where(shade_mask, high_log, y_floor)
+        ax_overview_log.fill_between(rts_min_overlay, y_floor, low_log_fill, color=color_rgb, alpha=0.12, zorder=5)
+        ax_overview_log.fill_between(rts_min_overlay, y_floor, high_log_fill, color=color_rgb, alpha=0.35, zorder=5)
         low_plot_log = np.where(total_ints_log < 1e5, total_ints_log, np.nan)
         high_plot_log = np.where(total_ints_log >= 1e5, total_ints_log, np.nan)
         ax_overview_log.plot(rts_min_overlay, low_plot_log, color=color_rgb, alpha=0.25, linewidth=1.0, path_effects=overlay_path_effects)
-        ax_overview_log.plot(rts_min_overlay, high_plot_log, color=color_rgb, alpha=0.95, linewidth=2.5, label=item['label'], path_effects=overlay_path_effects)
+        ax_overview_log.plot(rts_min_overlay, high_plot_log, color=color_rgb, alpha=0.95, linewidth=2.5, path_effects=overlay_path_effects)
     ax_overview_log.set_ylabel('Intensity (log)', fontsize=13, fontfamily='serif', color='0.85')
     ax_overview_log.set_yscale('log')
     ax_overview_log.set_title('Accepted Peptides – Raw Intensity (log; green = integration, gray = collection)', fontsize=14, fontweight='bold', fontfamily='serif', color='0.9')
@@ -3103,7 +3151,6 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
     ax_overview_log.grid(True, alpha=0.25, which='both')
     for spine in ax_overview_log.spines.values():
         spine.set_color('0.6')
-    ax_overview_log.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=8, prop={'family': 'serif'}, ncol=1, labelcolor='0.9')
     for i, item in enumerate(overlay_data):
         rts_min = np.asarray(item['rts'], dtype=float) / 60.0
         total_ints = np.asarray(item['total_intensities'], dtype=float)
@@ -3114,9 +3161,20 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
         I_norm = total_ints / imax
         y_offset = i * (track_height + track_gap)
         y_plot = I_norm * track_height + y_offset
+        cmin = item.get('collection_min_rt')
+        cmax = item.get('collection_max_rt')
+        if cmin is not None and cmax is not None:
+            cmin_min = float(cmin) / 60.0
+            cmax_min = float(cmax) / 60.0
+            if cmax_min < cmin_min:
+                cmin_min, cmax_min = cmax_min, cmin_min
+            shade_mask = (rts_min >= cmin_min) & (rts_min <= cmax_min)
+        else:
+            shade_mask = np.zeros_like(rts_min, dtype=bool)
         ta = item.get('total_area')
         color = cmap_overview(area_norm_overview(ta)) if area_norm_overview is not None and ta is not None and not (isinstance(ta, float) and (np.isnan(ta) or ta < 0)) else (0.5, 0.5, 0.5, 0.9)
-        ax_overview_tracks.fill_between(rts_min, y_offset, y_plot, color=color, alpha=0.95)
+        y_fill = np.where(shade_mask, y_plot, y_offset)
+        ax_overview_tracks.fill_between(rts_min, y_offset, y_fill, color=color, alpha=0.95)
         ax_overview_tracks.plot(rts_min, y_plot, color=color, linewidth=1.5, alpha=1.0)
         lab = item.get('label') or f'#{i+1}'
         if len(str(lab)) > 22:
@@ -3161,6 +3219,308 @@ def _create_overlay_figures(overlay_data, output_dir, area_vmin_global=None, are
     print(f"[DEBUG] Overview overlay plot saved to: {os.path.abspath(overview_path)}")
 
 
+def _create_zoom_all_linear_log_tracks_from_overlay(overlay_data, output_dir, base_name, add_peak_labels=False):
+    """Create all-peptides zoom plot (linear + log + tracks) from overlay_data."""
+    if len(overlay_data) == 0:
+        return
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.ticker import MultipleLocator
+    from matplotlib.patches import Patch
+
+    os.makedirs(output_dir, exist_ok=True)
+    all_zoom = sorted(overlay_data, key=lambda e: float(e.get('min_rt', 0.0) or 0.0))
+    valid_areas = [
+        e.get('total_area') for e in all_zoom
+        if e.get('total_area') is not None and not (isinstance(e.get('total_area'), float) and np.isnan(e.get('total_area')))
+    ]
+    area_norm_zoom = Normalize(vmin=min(valid_areas), vmax=max(valid_areas)) if len(valid_areas) > 1 and max(valid_areas) > min(valid_areas) else None
+    cmap_zoom = _total_area_colormap_for_overlay()
+
+    x_min_all_min = float('inf')
+    x_max_all_min = 0.0
+    y_max_zoom = 0.0
+    for entry in all_zoom:
+        rts_min_z = np.asarray(entry['rts'], dtype=float) / 60.0
+        total_z = np.asarray(entry['total_intensities'], dtype=float)
+        if len(rts_min_z) < 2 or len(total_z) < 2:
+            continue
+        x_min_all_min = min(x_min_all_min, float(np.nanmin(rts_min_z)))
+        x_max_all_min = max(x_max_all_min, float(np.nanmax(rts_min_z)))
+        m = float(np.nanmax(total_z)) if len(total_z) > 0 else 0.0
+        if np.isfinite(m):
+            y_max_zoom = max(y_max_zoom, m)
+    if not np.isfinite(x_min_all_min):
+        x_min_all_min = 0.0
+    if x_max_all_min <= x_min_all_min:
+        x_max_all_min = x_min_all_min + 1.0
+    x_pad = max(0.5, (x_max_all_min - x_min_all_min) * 0.10)
+    y_floor = 1.0
+
+    n_tracks = max(1, len(all_zoom))
+    # Scale figure height with peptide count so each track label has room.
+    fig_h = max(30, min(95, 0.9 * n_tracks + 18))
+    fig_zoom_all = plt.figure(figsize=(30, fig_h))
+    fig_zoom_all.patch.set_facecolor('black')
+    gs_zoom = GridSpec(3, 1, figure=fig_zoom_all, height_ratios=[4, 4, 5], hspace=0.35)
+    ax_z_lin = fig_zoom_all.add_subplot(gs_zoom[0])
+    ax_z_log = fig_zoom_all.add_subplot(gs_zoom[1], sharex=ax_z_lin)
+    ax_z_tr = fig_zoom_all.add_subplot(gs_zoom[2], sharex=ax_z_lin)
+    for ax in (ax_z_lin, ax_z_log, ax_z_tr):
+        ax.set_facecolor('black')
+
+    for entry in all_zoom:
+        min_rt_m = entry.get('min_rt')
+        max_rt_m = entry.get('max_rt')
+        cmin = entry.get('collection_min_rt')
+        cmax = entry.get('collection_max_rt')
+        if min_rt_m is not None and max_rt_m is not None:
+            ax_z_lin.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+            ax_z_log.axvspan(float(min_rt_m) / 60.0, float(max_rt_m) / 60.0, alpha=0.06, color='green', zorder=0)
+        if cmin is not None and cmax is not None:
+            ax_z_lin.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+            ax_z_log.axvspan(float(cmin) / 60.0, float(cmax) / 60.0, alpha=0.04, color=COLLECTION_WINDOW_COLOR, zorder=0)
+
+    track_h = 1.35
+    track_gap = 0.45
+    for i, entry in enumerate(all_zoom):
+        rts_min_z = np.asarray(entry['rts'], dtype=float) / 60.0
+        total_z = np.asarray(entry['total_intensities'], dtype=float)
+        if len(rts_min_z) < 2 or len(total_z) < 2:
+            continue
+        cmin = entry.get('collection_min_rt')
+        cmax = entry.get('collection_max_rt')
+        shade_mask = np.zeros_like(rts_min_z, dtype=bool)
+        if cmin is not None and cmax is not None:
+            cmin_f = float(cmin)
+            cmax_f = float(cmax)
+            # Robust units: if collection values are much larger than RT(min) axis, treat as seconds.
+            if cmax_f > (float(np.nanmax(rts_min_z)) + 5.0):
+                cmin_f /= 60.0
+                cmax_f /= 60.0
+            if cmax_f < cmin_f:
+                cmin_f, cmax_f = cmax_f, cmin_f
+            shade_mask = (rts_min_z >= cmin_f) & (rts_min_z <= cmax_f)
+        ta = entry.get('total_area')
+        if area_norm_zoom is not None and ta is not None and not (isinstance(ta, float) and np.isnan(ta)):
+            color = cmap_zoom(area_norm_zoom(ta))
+        else:
+            color = (0.4, 0.4, 0.4, 0.9)
+        color_rgb = color[:3] if len(color) >= 3 else color
+
+        low_z = np.where(total_z < 1e5, total_z, np.nan)
+        high_z = np.where(total_z >= 1e5, total_z, np.nan)
+        low_fill = np.where(shade_mask & (total_z < 1e5), total_z, 0.0)
+        high_fill = np.where(shade_mask & (total_z >= 1e5), total_z, 0.0)
+        ax_z_lin.fill_between(rts_min_z, 0, low_fill, color=color_rgb, alpha=0.12, zorder=3)
+        ax_z_lin.fill_between(rts_min_z, 0, high_fill, color=color_rgb, alpha=0.35, zorder=3)
+        ax_z_lin.plot(rts_min_z, low_z, color=color_rgb, linewidth=1.0, alpha=0.3)
+        ax_z_lin.plot(rts_min_z, high_z, color=color_rgb, linewidth=2.4, alpha=0.95)
+
+        total_log = np.maximum(total_z, y_floor)
+        low_log = np.where(total_log < 1e5, total_log, np.nan)
+        high_log = np.where(total_log >= 1e5, total_log, np.nan)
+        low_log_fill = np.where(shade_mask & (total_log < 1e5), total_log, y_floor)
+        high_log_fill = np.where(shade_mask & (total_log >= 1e5), total_log, y_floor)
+        ax_z_log.fill_between(rts_min_z, y_floor, low_log_fill, color=color_rgb, alpha=0.12, zorder=3)
+        ax_z_log.fill_between(rts_min_z, y_floor, high_log_fill, color=color_rgb, alpha=0.35, zorder=3)
+        ax_z_log.plot(rts_min_z, low_log, color=color_rgb, linewidth=1.0, alpha=0.3)
+        ax_z_log.plot(rts_min_z, high_log, color=color_rgb, linewidth=2.4, alpha=0.95)
+
+        imax = float(np.nanmax(total_z)) if len(total_z) > 0 else 1.0
+        if not np.isfinite(imax) or imax <= 0:
+            imax = 1.0
+        y0 = i * (track_h + track_gap)
+        y_track = (total_z / imax) * track_h + y0
+        y_track_fill = np.where(shade_mask, y_track, y0)
+        track_fill_alpha = 0.95 if add_peak_labels else 0.28
+        track_line_width = 2.3 if add_peak_labels else 1.2
+        track_line_alpha = 1.0 if add_peak_labels else 0.9
+        ax_z_tr.fill_between(rts_min_z, y0, y_track_fill, color=color, alpha=track_fill_alpha, zorder=3)
+        ax_z_tr.plot(rts_min_z, y_track, color=color, linewidth=track_line_width, alpha=track_line_alpha)
+        if add_peak_labels:
+            track_label = str(entry.get('label') or f'#{i+1}').split('|')[0].strip()
+            if len(track_label) > 36:
+                track_label = track_label[:33] + '...'
+            ax_z_tr.text(
+                x_min_all_min - x_pad * 0.15,
+                y0 + track_h * 0.5,
+                track_label,
+                va='center',
+                ha='right',
+                fontsize=9,
+                fontfamily='serif',
+                fontweight='bold',
+                color='0.95',
+            )
+
+    # Optional apex labels (sequence + charge) for accepted/rejected overlays.
+    if add_peak_labels and y_max_zoom > 0:
+        peak_points = []
+        for entry in all_zoom:
+            rts_min_z = np.asarray(entry['rts'], dtype=float) / 60.0
+            total_z = np.asarray(entry['total_intensities'], dtype=float)
+            if len(rts_min_z) < 2 or len(total_z) < 2:
+                continue
+            try:
+                i_apex = int(np.nanargmax(total_z))
+            except Exception:
+                continue
+            if i_apex < 0 or i_apex >= len(rts_min_z):
+                continue
+            x_peak = float(rts_min_z[i_apex])
+            y_peak = float(total_z[i_apex]) if np.isfinite(total_z[i_apex]) else 0.0
+            if not np.isfinite(x_peak) or not np.isfinite(y_peak) or y_peak <= 0:
+                continue
+            ta = entry.get('total_area')
+            if area_norm_zoom is not None and ta is not None and not (isinstance(ta, float) and np.isnan(ta)):
+                color = cmap_zoom(area_norm_zoom(ta))
+            else:
+                color = (0.85, 0.85, 0.85, 0.95)
+            # Keep only "sequence +charge" from our "sequence +charge | mods" label format.
+            label = str(entry.get('label') or '').split('|')[0].strip()
+            if len(label) > 34:
+                label = label[:31] + '...'
+            peak_points.append((x_peak, y_peak, label, color))
+
+        if peak_points:
+            y_label_max = y_max_zoom
+            y_label_max_log = y_max_zoom
+            x_span = max(1e-6, x_max_all_min - x_min_all_min)
+            x_min_sep = x_span * 0.04
+            y_min_sep_lin = max(1.0, y_max_zoom * 0.06)
+            y_step_lin = max(1.0, y_max_zoom * 0.08)
+            y_min_sep_log_factor = 1.18
+            y_step_log_factor = 1.28
+            placed_lin = []
+            placed_log = []
+
+            def _resolve_linear_label_pos(x_val, y_start):
+                y_val = y_start
+                attempts = 0
+                while attempts < 60:
+                    clash = False
+                    for px, py in placed_lin:
+                        if abs(x_val - px) < x_min_sep and abs(y_val - py) < y_min_sep_lin:
+                            clash = True
+                            break
+                    if not clash:
+                        return y_val
+                    y_val += y_step_lin
+                    attempts += 1
+                return y_val
+
+            def _resolve_log_label_pos(x_val, y_start):
+                y_val = y_start
+                attempts = 0
+                while attempts < 60:
+                    clash = False
+                    for px, py in placed_log:
+                        if abs(x_val - px) < x_min_sep:
+                            denom = max(y_floor, min(y_val, py))
+                            ratio = max(y_val, py) / denom if denom > 0 else float('inf')
+                            if ratio < y_min_sep_log_factor:
+                                clash = True
+                                break
+                    if not clash:
+                        return y_val
+                    y_val *= y_step_log_factor
+                    attempts += 1
+                return y_val
+
+            for idx, (x_peak, y_peak, label, color) in enumerate(sorted(peak_points, key=lambda t: t[0])):
+                lane = idx % 3
+                y_text_lin_base = y_peak + y_max_zoom * (0.07 + 0.05 * lane)
+                y_text_log_base = max(y_floor * 1.05, y_peak * (1.28 + 0.14 * lane))
+                y_text_lin = _resolve_linear_label_pos(x_peak, y_text_lin_base)
+                y_text_log = _resolve_log_label_pos(x_peak, y_text_log_base)
+                placed_lin.append((x_peak, y_text_lin))
+                placed_log.append((x_peak, y_text_log))
+                y_label_max = max(y_label_max, y_text_lin)
+                y_label_max_log = max(y_label_max_log, y_text_log)
+                bubble_style = dict(boxstyle='round,pad=0.35', fc=(0, 0, 0, 0.72), ec=color, linewidth=1.2)
+                ax_z_lin.text(
+                    x_peak,
+                    y_text_lin,
+                    label,
+                    fontsize=11,
+                    fontfamily='serif',
+                    fontweight='bold',
+                    color='white',
+                    ha='center',
+                    va='bottom',
+                    bbox=bubble_style,
+                    zorder=9,
+                )
+                ax_z_log.text(
+                    x_peak,
+                    y_text_log,
+                    label,
+                    fontsize=11,
+                    fontfamily='serif',
+                    fontweight='bold',
+                    color='white',
+                    ha='center',
+                    va='bottom',
+                    bbox=bubble_style,
+                    zorder=9,
+                )
+            ax_z_lin.set_ylim(0, max(y_max_zoom * 1.1, y_label_max * 1.05))
+            ax_z_log.set_ylim(y_floor, max(y_max_zoom * 2.0, y_label_max_log * 1.05))
+
+    ax_z_lin.set_ylabel('Intensity', fontsize=11, fontfamily='serif', color='0.85')
+    ax_z_lin.set_title('All peptides (linear)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
+    ax_z_lin.set_xlim(x_min_all_min - x_pad, x_max_all_min)
+    ax_z_lin.xaxis.set_major_locator(MultipleLocator(max(0.5, (x_max_all_min - x_min_all_min) / 10)))
+    ax_z_lin.xaxis.set_minor_locator(MultipleLocator(max(0.1, (x_max_all_min - x_min_all_min) / 30)))
+    if y_max_zoom > 0:
+        ax_z_lin.set_ylim(0, y_max_zoom * 1.1)
+    ax_z_lin.grid(True, alpha=0.25)
+
+    ax_z_log.set_ylabel('Intensity (log)', fontsize=11, fontfamily='serif', color='0.85')
+    ax_z_log.set_yscale('log')
+    ax_z_log.set_title('All peptides (log)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
+    if y_max_zoom > 0:
+        ax_z_log.set_ylim(y_floor, y_max_zoom * 2.0)
+    ax_z_log.grid(True, alpha=0.25, which='both')
+
+    ax_z_tr.set_xlabel('MS1 Retention Time (min)', fontsize=11, fontfamily='serif', color='0.85')
+    ax_z_tr.set_ylabel('Track (shape norm.)', fontsize=10, fontfamily='serif', color='0.85')
+    ax_z_tr.set_title('All peptides (tracks)', fontsize=12, fontweight='bold', fontfamily='serif', color='0.9')
+    ax_z_tr.set_ylim(-0.2, len(all_zoom) * (track_h + track_gap) - track_gap + 0.2)
+    ax_z_tr.set_yticks([])
+    ax_z_tr.tick_params(axis='y', left=False)
+    ax_z_tr.grid(True, alpha=0.25, axis='x')
+
+    for ax in (ax_z_lin, ax_z_log, ax_z_tr):
+        ax.tick_params(colors='0.85')
+        for spine in ax.spines.values():
+            spine.set_color('0.6')
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontfamily('serif')
+
+    legend_handles = [
+        Patch(facecolor='green', alpha=0.06, edgecolor='none', label='Integration window'),
+        Patch(facecolor=COLLECTION_WINDOW_COLOR, alpha=0.04, edgecolor='none', label='Collection window'),
+    ]
+    ax_z_lin.legend(handles=legend_handles, loc='upper right', fontsize=9, prop={'family': 'serif'}, labelcolor='0.85')
+
+    if area_norm_zoom is not None:
+        sm_zoom = ScalarMappable(norm=area_norm_zoom, cmap=cmap_zoom)
+        sm_zoom.set_array([])
+        cbar = fig_zoom_all.colorbar(sm_zoom, ax=[ax_z_lin, ax_z_log, ax_z_tr], shrink=0.5, aspect=25, pad=0.08)
+        cbar.set_label('total_area (MS1 peak)', fontsize=11, fontweight='bold', fontfamily='serif', color='0.9')
+        cbar.ax.tick_params(labelsize=9, colors='0.85')
+
+    fig_zoom_all.suptitle('MS1 Chromatograms – All peptides (linear + log + tracks)', fontsize=13, fontweight='bold', fontfamily='serif', y=0.995, color='0.9')
+    plt.tight_layout(rect=[0, 0, 1, 0.97], pad=1.0)
+    zoom_all_path = os.path.join(output_dir, f"{base_name}_zoom_peptides_all_linear_log_tracks.png")
+    fig_zoom_all.savefig(zoom_all_path, dpi=150, bbox_inches='tight', facecolor='black', pad_inches=0.25)
+    plt.close(fig_zoom_all)
+    print(f"[DEBUG] Zoom (all peptides, linear + log + tracks) saved to: {os.path.abspath(zoom_all_path)}")
+
+
 def run_plots_from_dataframe(args):
     """
     Load chromatogram_metrics_all.csv and chromatogram_traces.npz; apply filtering criteria;
@@ -3183,6 +3543,7 @@ def run_plots_from_dataframe(args):
 
     df = pd.read_csv(metrics_csv)
     # Optionally restrict to peptides in filter CSV to reduce plotted set
+    filter_applied = False
     if filter_csv and os.path.exists(filter_csv):
         try:
             with open(filter_csv, 'r') as f:
@@ -3191,26 +3552,41 @@ def run_plots_from_dataframe(args):
         except Exception:
             filter_skip = 0
         df_filter = pd.read_csv(filter_csv, sep=',', skiprows=filter_skip, engine='python', quotechar='"', on_bad_lines='warn')
-        if 'plain_peptide' in df_filter.columns:
+        pep_candidates = ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence']
+        filter_pep_col = next((c for c in pep_candidates if c in df_filter.columns), None)
+        metrics_pep_col = next((c for c in pep_candidates if c in df.columns), None)
+        if filter_pep_col and metrics_pep_col:
             def _norm_mods(m):
                 if m is None or (isinstance(m, float) and pd.isna(m)):
                     return '-'
                 s = str(m).strip()
                 return s if s and s.lower() != 'nan' else '-'
-            df_filter['_mods'] = df_filter.apply(lambda r: _norm_mods(r.get('modifications', '-')), axis=1)
-            filter_keys = set(zip(
-                df_filter['plain_peptide'].astype(str).str.strip(),
-                df_filter['charge'].fillna(0).astype(int),
-                df_filter['_mods']
-            ))
-            # Metrics CSV may have 'peptide' or 'plain_peptide'
-            pep_col = 'plain_peptide' if 'plain_peptide' in df.columns else 'peptide'
+            def _norm_pep(p):
+                if p is None or (isinstance(p, float) and pd.isna(p)):
+                    return ''
+                return str(p).strip()
+
+            df_filter['_mods'] = df_filter.apply(lambda r: _norm_mods(r.get('modifications', r.get('mods', '-'))), axis=1)
+            df_filter['_pep'] = df_filter[filter_pep_col].apply(_norm_pep)
+            df_filter['_charge'] = pd.to_numeric(df_filter.get('charge', 0), errors='coerce').fillna(0).astype(int)
+            filter_keys = set(zip(df_filter['_pep'], df_filter['_charge'], df_filter['_mods']))
+
             df['_mods'] = df.apply(lambda r: _norm_mods(r.get('modifications', r.get('mods', '-'))), axis=1)
-            mask = df.apply(lambda r: (str(r.get(pep_col, '')).strip(), int(r.get('charge', 0)) if pd.notna(r.get('charge')) else 0, r['_mods']) in filter_keys, axis=1)
+            df['_pep'] = df[metrics_pep_col].apply(_norm_pep)
+            df['_charge'] = pd.to_numeric(df.get('charge', 0), errors='coerce').fillna(0).astype(int)
             n_before = len(df)
+            mask = df.apply(lambda r: (r['_pep'], int(r['_charge']), r['_mods']) in filter_keys, axis=1)
             df = df[mask].copy()
-            df = df.drop(columns=['_mods'], errors='ignore')
-            print(f"[DEBUG] Filter CSV: {len(df)} / {n_before} peptides to plot (restricted to peptides present in {os.path.basename(filter_csv)})")
+            df = df.drop(columns=['_mods', '_pep', '_charge'], errors='ignore')
+            print(f"[DEBUG] Filter CSV: {len(df)} / {n_before} peptides to plot (pep col: {filter_pep_col}->{metrics_pep_col}, restricted to {os.path.basename(filter_csv)})")
+            filter_applied = True
+        else:
+            raise RuntimeError(
+                f"Filter CSV provided but no compatible peptide column found. "
+                f"filter_cols={list(df_filter.columns)} metrics_cols={list(df.columns)}"
+            )
+    elif filter_csv and not os.path.exists(filter_csv):
+        raise RuntimeError(f"Filter CSV path was provided but does not exist: {filter_csv}")
     data = np.load(traces_path)
 
     def _has_modifications(m):
@@ -3231,7 +3607,7 @@ def run_plots_from_dataframe(args):
 
     # Apply filtering criteria from the dataframe columns (no mzML needed).
     # Require: (1) M0, M+1, M+2, M+3 present (has_required_isotopes);
-    #          (2) M0 and M+1 > M+2 and M+3.
+    #          (2) M0 and M+1 > M+2, and M+2 > M+3.
     status_list = []
     rejection_reasons = []
     for _, row in df.iterrows():
@@ -3244,7 +3620,7 @@ def run_plots_from_dataframe(args):
             i2 = pd.to_numeric(pd.Series([row.get('m2_intensity')]), errors='coerce').iloc[0]
             i3 = pd.to_numeric(pd.Series([row.get('m3_intensity')]), errors='coerce').iloc[0]
             if pd.notna(i0) and pd.notna(i1) and pd.notna(i2) and pd.notna(i3):
-                envelope_ok = bool((float(i0) > float(i2)) and (float(i0) > float(i3)) and (float(i1) > float(i2)) and (float(i1) > float(i3)))
+                envelope_ok = bool((float(i0) > float(i2)) and (float(i1) > float(i2)) and (float(i2) > float(i3)))
             else:
                 envelope_ok = _to_bool(row.get('envelope_ok', False))
         mods = row.get('modifications', '-')
@@ -3256,7 +3632,7 @@ def run_plots_from_dataframe(args):
             if not has_required:
                 rejection_reasons.append('Summed MS1 must contain M0, M+1, M+2, and M+3')
             elif not envelope_ok:
-                rejection_reasons.append(str(row.get('rejection_reason', 'Isotopic envelope must satisfy M0 and M+1 > M+2 and M+3')) or 'Isotopic envelope must satisfy M0 and M+1 > M+2 and M+3')
+                rejection_reasons.append(str(row.get('rejection_reason', 'Isotopic envelope must satisfy M0/M+1 > M+2 > M+3')) or 'Isotopic envelope must satisfy M0/M+1 > M+2 > M+3')
             else:
                 rejection_reasons.append('Excluded: peptide has modifications (--exclude-mods)')
 
@@ -3362,8 +3738,16 @@ def run_plots_from_dataframe(args):
             'sequence_start_pos': seq_start, 'min_rt': min_rt, 'max_rt': max_rt,
             'collection_min_rt': coll_min, 'collection_max_rt': coll_max,
         })
+    if filter_csv and not filter_applied:
+        raise RuntimeError("Filter CSV was provided but filter was not applied; refusing to generate unfiltered overlays/tracks.")
+
     if len(overlay_data) > 0:
+        print(f"[DEBUG] Overlay/tracks entries generated from filtered set: {len(overlay_data)}")
         _create_overlay_figures(overlay_data, output_dir)
+        base_for_zoom = os.path.splitext(os.path.basename(filter_csv if (filter_csv and os.path.exists(filter_csv)) else metrics_csv))[0]
+        if not base_for_zoom.endswith('_chromatograms'):
+            base_for_zoom = f"{base_for_zoom}_chromatograms"
+        _create_zoom_all_linear_log_tracks_from_overlay(overlay_data, output_dir, base_for_zoom)
 
     print(f"[DEBUG] Plot-from-dataframe: done. Accepted -> {output_dir}, Rejected -> {rejected_dir}")
 
@@ -3387,6 +3771,10 @@ def run_chromatograms(args):
     no_psm_filter = getattr(args, 'no_psm_filter', False)
     # Step 6 (extract): skip 0.5% intensity filter; significance filter applied in Step 7 (refine_significant_frags)
     skip_significance_intensity_filter = getattr(args, 'skip_significance_intensity_filter', False)
+    peak_matching_ppm_threshold = float(getattr(args, 'peak_matching_ppm_threshold', 6.0))
+    min_apex_intensity = float(getattr(args, 'min_apex_intensity', 1e5))
+    shape_corr_min = float(getattr(args, 'shape_corr_min', SHAPE_CORR_MIN))
+    apex_ppm_reject_threshold = float(getattr(args, 'apex_ppm_reject_threshold', 6.0))
 
     if not comet_csv or not raw_file:
         print("Error: comet_csv and raw_file are required unless --plot-only is used.")
@@ -3859,10 +4247,11 @@ def run_chromatograms(args):
     FILTERING_CRITERIA = (
         "XIC ppm=20 | anchor mz/rt=20ppm/60s | pre-filter: (no E-value threshold) | "
         "score=0.28 coel + 0.28 shape + 0.14 ratio + 0.12 RT_cov + 0.05 rt_prior + 0.05 quality + 0.20 strength | "
-        "reject: modifications, apex < 10^5 | accept: apex ≥ 10^5 | PSM: q≤0.05, PEP≤0.05 | envelope filter: Step 7"
+        f"reject: modifications, apex < {min_apex_intensity:g}, shape < {shape_corr_min:g}, apex ppm > {apex_ppm_reject_threshold:g} | "
+        "envelope filter: Step 7"
     )
     MIN_SCANS_REQUIRED = 1  # need >= 1 scan with valid MS1 RT; envelope computed for Step 7 (not rejected here)
-    MIN_APEX_INTENSITY = 1e5  # apex peak below this is treated as noise; pretty much never select below 10^5
+    MIN_APEX_INTENSITY = float(min_apex_intensity)
 
     # Allowed modification masses (fixed mods from sample prep); peptides with ONLY these are not rejected
     ALLOWED_MODIFICATION_MASSES = frozenset(['57.0215', '57.021500'])  # Carbamidomethyl (C) - fixed
@@ -3894,11 +4283,6 @@ def run_chromatograms(args):
             if norm not in allowed_norm:
                 return True
         return False
-    # PSM score thresholds: reject peptide if its best PSM exceeds any of these (aligned with scatter-plot reference lines)
-    FILTER_PSM_QVALUE_MAX = 0.05   # reject if best PSM q-value > this (q ≤ 0.05 acceptable)
-    FILTER_PSM_PEP_MAX = 0.05      # reject if best PSM PEP > this (PEP ≤ 0.05 acceptable)
-    FILTER_PSM_EVALUE_MAX = float('inf')  # no E-value threshold (do not reject based on E-value)
-    
     # Track peak window data for ALL peptides (accepted and rejected) for CSV output
     all_peak_windows = []  # List of dicts with peak window info for CSV export
     # Collect (rts, intensity) per peptide in same order as all_peak_windows for npz (extract_only: full matrix; normal: total trace for downstream by-channel/overlay)
@@ -4239,7 +4623,12 @@ def run_chromatograms(args):
             if not isotope_mzs:
                 overlay_skipped_no_mz += 1
                 continue
-            rts_ov, intensity_matrix_ov, _ = extract_aligned_isotope_chromatograms(raw_file, isotope_mzs, ppm_tolerance=20.0)
+            rts_ov, intensity_matrix_ov, _ = extract_aligned_isotope_chromatograms(
+                raw_file,
+                isotope_mzs,
+                ppm_tolerance=20.0,
+                peak_matching_ppm_threshold=peak_matching_ppm_threshold,
+            )
             if len(rts_ov) == 0:
                 overlay_skipped_empty += 1
                 continue
@@ -4365,8 +4754,7 @@ def run_chromatograms(args):
             plt.savefig(filepath, dpi=150, bbox_inches='tight', facecolor='white')
             abspath = os.path.abspath(filepath)
             early_rejected_paths_ref.append(abspath)
-            print(f"[DEBUG] CHROMATOGRAMS_PEPTIDES: early-rejected -> {abspath}")
-            print(f"[DEBUG] Saved early-rejected plot: {abspath}")
+            print(f"[DEBUG] CHROMATOGRAMS_PEPTIDES: saved -> {abspath} [early-rejected]")
         except Exception as e:
             print(f"[ERROR] Failed to save early-rejected plot: {os.path.abspath(filepath)}: {e}", file=sys.stderr)
         finally:
@@ -4403,13 +4791,13 @@ def run_chromatograms(args):
         if 'modification' in r.lower() or 'has mods' in r.lower():
             return 'Excluded mods'
         if 'Apex intensity' in r or '10^5' in r or 'noise' in r.lower():
-            return 'Apex intensity < 10^5 (noise)'
+            return 'Apex intensity below threshold'
         if 'proline' in r.lower():
             return 'Starts/ends with proline'
         if 'Shape correlation' in r or 'shape_corr' in r.lower():
-            return 'Shape correlation < 0.8'
+            return 'Shape correlation below threshold'
         if 'ppm' in r.lower() and 'theoretical' in r.lower():
-            return 'Peak m/z >6 ppm from theoretical'
+            return 'Peak m/z above apex ppm threshold'
         return 'Other'
     # Significant-fragment data (5 ppm + 0.5% intensity): populated in pass 1 when we have MS2; merged into output CSVs.
     # Keep one canonical overhang mapping column: single_aa_overhangs_protein_positions.
@@ -4563,7 +4951,12 @@ def run_chromatograms(args):
             
                 # Extract aligned isotope chromatograms from mzML (Skyline-like: aligned RT grid, zeros preserved).
                 # Same extraction used for: main chromatogram plot (ax), overlay traces (all_peptide_overlay_data), and window bar (min_rt/max_rt).
-                rts, intensity_matrix, measured_mz_matrix = extract_aligned_isotope_chromatograms(raw_file, isotope_mzs, ppm_tolerance=20.0)
+                rts, intensity_matrix, measured_mz_matrix = extract_aligned_isotope_chromatograms(
+                    raw_file,
+                    isotope_mzs,
+                    ppm_tolerance=20.0,
+                    peak_matching_ppm_threshold=peak_matching_ppm_threshold,
+                )
             
                 if len(rts) == 0:
                     rejected_peptide_keys.add(peptide_key)
@@ -5024,18 +5417,25 @@ def run_chromatograms(args):
         
                 # Sort by score (highest first)
                 scored_candidates.sort(key=lambda x: x['score'], reverse=True)
-                # Restrict to peaks with apex intensity >= MIN_APEX_INTENSITY (avoid assigning noise); pretty much never select below 10^5
+                # Restrict to peaks with apex intensity >= configured threshold (avoid assigning noise).
                 acceptable_candidates = [c for c in scored_candidates if c['apex_intensity'] >= MIN_APEX_INTENSITY]
                 if not acceptable_candidates:
                     if pass_num == 0:
                         all_peptide_scatter_data[peptide_key] = _scatter_sentinel_with_overlay(peptide_key)
                     elif pass_num == 1:
-                        _save_early_rejected_figure(group, peptide_key, current_peptide_1based, num_peptides, "Apex intensity < 10^5 (noise); no higher peak", rejected_dir, FILTERING_CRITERIA, early_rejected_paths)
-                        rejection_counts['Apex intensity < 10^5 (noise)'] += 1
-                        print(f"[DEBUG] Peptide {current_peptide_1based}/{num_peptides}: {peptide_key} -> early-rejected (no peak >= 10^5)")
+                        _save_early_rejected_figure(
+                            group, peptide_key, current_peptide_1based, num_peptides,
+                            f"Apex intensity < {MIN_APEX_INTENSITY:g} (noise); no higher peak",
+                            rejected_dir, FILTERING_CRITERIA, early_rejected_paths
+                        )
+                        rejection_counts['Apex intensity below threshold'] += 1
+                        print(
+                            f"[DEBUG] Peptide {current_peptide_1based}/{num_peptides}: {peptide_key} "
+                            f"-> early-rejected (no peak >= {MIN_APEX_INTENSITY:g})"
+                        )
                     plt.close(fig)
                     continue
-                # Best = highest score among peaks >= 10^5; tie-break by apex so we prioritize real signal when scores are close
+                # Best = highest score among peaks above the configured apex threshold.
                 best_peak = acceptable_candidates[0]
                 top_score = best_peak['score']
                 for c in acceptable_candidates[1:]:
@@ -5684,10 +6084,16 @@ def run_chromatograms(args):
                             mz_near=40.0, min_y_sep_frac=0.045, min_intensity_frac=(0.0 if skip_significance_intensity_filter else SIGNIFICANT_FRAGMENT_MIN_INTENSITY_FRAC))
                         significant_frag_count = len(label_placements_pre)
                 # Add annotations to individual figure (pass all table RTs so both clusters visible)
-                n_scan_rts = len([rt for rt in ms1_rts_table if rt and rt > 0])
+                valid_scan_rts = [rt for rt in ms1_rts_table if rt and rt > 0]
+                n_scan_rts = len(valid_scan_rts)
+                n_unique_scan_rts = len({float(rt) for rt in valid_scan_rts})
                 if idx < 15 or n_scan_rts <= 3:
-                    x_min_vals = [round(rt/60, 2) for rt in ms1_rts_table[:5] if rt and rt > 0]
-                    print(f"[DEBUG]   This unique peptide: drawing {n_scan_rts} spectrum RT line(s) at x (min) = {x_min_vals}{'...' if n_scan_rts > 5 else ''}")
+                    x_min_vals = [round(rt / 60, 2) for rt in valid_scan_rts[:5]]
+                    print(
+                        f"[DEBUG]   This unique peptide: {n_scan_rts} total PSMs; "
+                        f"PSMs detected at {n_unique_scan_rts} unique MS1 RTs "
+                        f"(x min preview = {x_min_vals}{'...' if n_scan_rts > 5 else ''})"
+                    )
                 add_peak_annotations(ax, scored_candidates, best_peak, min_rt_min, max_rt_min, 
                                apex_rt_min, rts, rts_min, total_intensities, min_rt, max_rt,
                                rt_anchor=rt_anchor, anchor_evalue=anchor_evalue, 
@@ -5999,7 +6405,7 @@ def run_chromatograms(args):
                     # Check summed spectrum in the INTEGRATION WINDOW (detected_peak_min_rt..max_rt) only.
                     # Core envelope logic (for CSV columns):
                     #   1) M0, M+1, M+2, M+3 present (highest-intensity peak within +/-5 ppm per isotope)
-                    #   2) M0 and M+1 are both > M+2 and M+3
+                    #   2) M0 and M+1 are both > M+2, and M+2 > M+3
                     core_peak_metrics = get_isotope_peak_metrics(
                         spec_mzs_windowed_integration, spec_ints_windowed_integration, isotope_mzs, ppm_tol=5.0
                     )
@@ -6014,7 +6420,7 @@ def run_chromatograms(args):
                     m1_gt_m2 = has_required_in_window and I1 > 0 and I2 > 0 and I1 > I2
                     m0_gt_m1_gt_m2 = bool(m0_gt_m1 or m1_gt_m2)
                     m2_le_m0 = bool(has_required_in_window and I2 <= I0)
-                    m0_m1_gt_m2_m3 = bool(has_required_in_window and (I0 > I2) and (I0 > I3) and (I1 > I2) and (I1 > I3))
+                    m0_m1_gt_m2_m3 = bool(has_required_in_window and (I0 > I2) and (I1 > I2) and (I2 > I3))
                     envelope_ok = bool(m0_m1_gt_m2_m3)
 
                     # When re-extracting with a primary/alternate filter CSV, trust envelope criterion from the filter
@@ -6036,36 +6442,16 @@ def run_chromatograms(args):
                             elif str(v).strip().lower() in ('true', '1', 'yes'):
                                 filter_envelope_trusted = True
 
-                    if filter_envelope_trusted:
-                        # Require M0, M+1, M+2 present even when trusting filter envelope
-                        envelope_ok = has_required_in_window
-                        if not envelope_ok:
-                            rejection_reason = "Summed MS1 must contain M0, M+1, M+2, and M+3"
-                            is_rejected = True
-                        else:
-                            is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
-                            rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
-                    elif no_psm_filter:
-                        # Require M0, M+1, M+2 present even in no-filter run
-                        envelope_ok = has_required_in_window
-                        if not envelope_ok:
-                            rejection_reason = "Summed MS1 must contain M0, M+1, M+2, and M+3"
-                            is_rejected = True
-                        else:
-                            is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
-                            rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
-                    else:
-                        # Do not reject for envelope here; Step 7 handles filtering.
-                        # Keep extraction acceptance independent from envelope ordering.
-                        # Do NOT reject for envelope here; Step 7 (filter_envelope.py) handles that
-                        is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
-                        rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
+                    # Do not reject for envelope here; Step 7 (filter_envelope.py) applies
+                    # strict vs optional-M+3 envelope mode selected in the app.
+                    is_rejected = False if not (exclude_mods and _has_modifications(mods)) else True
+                    rejection_reason = None if not is_rejected else "Excluded: peptide has modifications (--exclude-mods)"
 
-                    # Reject if peak m/z >6 ppm from theoretical
-                    PPM_REJECT_THRESHOLD = 6.0
+                    # Reject if apex precursor m/z error exceeds configured ppm threshold.
+                    PPM_REJECT_THRESHOLD = float(apex_ppm_reject_threshold)
                     if ppm_at_apex is not None and ppm_at_apex > PPM_REJECT_THRESHOLD:
                         is_rejected = True
-                        rejection_reason = f"Peak m/z >6 ppm from theoretical ({ppm_at_apex:.2f} ppm)"
+                        rejection_reason = f"Peak m/z >{PPM_REJECT_THRESHOLD:g} ppm from theoretical ({ppm_at_apex:.2f} ppm)"
 
                     # Helper to get numeric score from a row (used for PSM filter and for best-PSM display below)
                     def _score_from_row(row, col, fallback_keys):
@@ -6085,29 +6471,12 @@ def run_chromatograms(args):
                                     except (TypeError, ValueError):
                                         pass
                         return None
-                    def _psm_passes_all(row):
-                        """Match Step 4 (filter_comet_frags_confidence): pass if Q≤0.05 OR PEP≤0.05 (OR logic)."""
-                        q = _score_from_row(row, qvalue_col, ['percolator_qvalue', 'q-value', 'qvalue', 'Q-value'])
-                        p = _score_from_row(row, pep_col, ['percolator_PEP', 'pep', 'PEP'])
-                        e = _score_from_row(row, evalue_col, ['e-value', 'e_value', 'E-value'])
-                        if e is not None and np.isfinite(e) and e > FILTER_PSM_EVALUE_MAX:
-                            return False
-                        q_ok = (q is None or not np.isfinite(q) or q <= FILTER_PSM_QVALUE_MAX)
-                        p_ok = (p is None or not np.isfinite(p) or p <= FILTER_PSM_PEP_MAX)
-                        return q_ok or p_ok  # Same as Step 4: Q≤0.05 OR PEP≤0.05
-                    # Apply PSM score filters (Q-value, PEP, E-value): accept peptide if ANY PSM passes all metrics (skip when no_psm_filter)
-                    if not is_rejected and not no_psm_filter:
-                        any_psm_passes = any(_psm_passes_all(row) for _, row in group.iterrows())
-                        if not any_psm_passes:
-                            is_rejected = True
-                            rejection_reason = "PSM filters: no PSM passed (Q≤0.05 OR PEP≤0.05)"
-                            print(f"[DEBUG]   Rejecting peptide {peptide[:30]}: {rejection_reason}", file=sys.stderr)
-                    # Shape correlation threshold: require best peak to have shape_corr >= SHAPE_CORR_MIN
+                    # Shape correlation threshold: require best peak to have shape_corr >= configured minimum.
                     if not is_rejected:
                         sc = best_peak.get('shape_corr')
-                        if sc is not None and not (isinstance(sc, float) and np.isnan(sc)) and float(sc) < SHAPE_CORR_MIN:
+                        if sc is not None and not (isinstance(sc, float) and np.isnan(sc)) and float(sc) < shape_corr_min:
                             is_rejected = True
-                            rejection_reason = f"Shape correlation {float(sc):.3f} < {SHAPE_CORR_MIN}"
+                            rejection_reason = f"Shape correlation {float(sc):.3f} < {shape_corr_min:g}"
                             print(f"[DEBUG]   Rejecting peptide {peptide[:30]}: {rejection_reason}", file=sys.stderr)
                     # Significant single-AA overhang is enforced per-peptide from MS2 (placed_ion_labels); no CSV fallback
                     # Best PSM for display (lowest q-value if available, else lowest E-value); prefer one that passes if any
@@ -8468,8 +8837,6 @@ def run_chromatograms(args):
                 # Use fixed bbox instead of 'tight' to prevent figure resizing
                 # bbox_inches=None uses the figure size as-is without padding adjustments
                 abspath = os.path.abspath(filepath)
-                print(f"[DEBUG] CHROMATOGRAMS_PEPTIDES: Saving PNG -> {abspath}")
-                print(f"[DEBUG] Saving figure to: {abspath}")
                 try:
                     os.makedirs(rejected_dir if is_rejected else output_dir, exist_ok=True)
                     plt.savefig(filepath, dpi=200, bbox_inches=None, facecolor='black', pad_inches=0.1)
@@ -8479,8 +8846,6 @@ def run_chromatograms(args):
                         saved_accepted_paths.append(abspath)
                     decision = f"rejected ({rejection_reason})" if is_rejected else "accepted"
                     print(f"[DEBUG] CHROMATOGRAMS_PEPTIDES: saved -> {abspath} [{decision}]")
-                    print(f"[DEBUG] Peptide {current_peptide_1based}/{num_peptides}: {peptide_key} -> {decision}")
-                    print(f"[DEBUG] Saved {'rejected' if is_rejected else 'accepted'} individual plot: {abspath}")
                 except Exception as e:
                     print(f"[ERROR] Failed to save peptide figure: {abspath}: {e}", file=sys.stderr)
                     print(f"[ERROR] Peptide {current_peptide_1based}/{num_peptides}: {peptide_key} ({'rejected' if is_rejected else 'accepted'})", file=sys.stderr)
@@ -10216,6 +10581,15 @@ def run_chromatograms(args):
             print(f"[DEBUG] Rejection reasons:")
             for reason, count in rejection_reasons.items():
                 print(f"[DEBUG]   {reason}: {count}")
+            # Explicitly summarize peak-matching ppm exclusions for Step 6 logs.
+            peak_match_ppm_excluded = sum(
+                count for reason, count in rejection_reasons.items()
+                if ('ppm' in str(reason).lower() and 'theoretical' in str(reason).lower())
+            )
+            print(
+                f"[DEBUG]   Peak matching ppm (<= {peak_matching_ppm_threshold:g}): "
+                f"failed {peak_match_ppm_excluded} (no peak within threshold)"
+            )
         
         # Save ALL peak windows (accepted and rejected) to CSV in the output directory
         # Merge significant_data (fragments, pairs, single-AA overhang positions) into each window for CSV columns
@@ -10858,6 +11232,8 @@ def _parse_chromatogram_args():
                         help='Path to chromatogram_traces.npz (from --extract-only). Required for --plot-only.')
     parser.add_argument('--extract-output-dir', dest='extract_output_dir', default=None,
                         help='Directory for chromatogram_metrics_all.csv and chromatogram_traces.npz when using --extract-only (default: same dir as output_png).')
+    parser.add_argument('--peak-matching-ppm-threshold', dest='peak_matching_ppm_threshold', type=float, default=6.0,
+                        help='PPM cutoff for selecting intensity-vs-accuracy when multiple MS1 peaks match (default: 6.0).')
     return parser.parse_args()
 
 

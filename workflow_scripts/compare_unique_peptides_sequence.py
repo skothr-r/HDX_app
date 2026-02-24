@@ -51,6 +51,24 @@ def _parse_protein_positions(val, seq_start=None):
     return pos_set
 
 
+def _first_nonempty_str(row, candidates):
+    """Return first non-empty/non-NaN string from candidate columns."""
+    for c in candidates:
+        v = row.get(c)
+        if v is None:
+            continue
+        try:
+            import pandas as pd  # local import
+            if pd.isna(v):
+                continue
+        except Exception:
+            pass
+        s = str(v).strip()
+        if s and s.lower() != 'nan':
+            return s
+    return ''
+
+
 def _load_fasta(fasta_path, protein_id=None):
     """Load protein sequence from FASTA. Returns (seq, id) or (None, None)."""
     if not os.path.exists(fasta_path):
@@ -72,6 +90,21 @@ def _load_fasta(fasta_path, protein_id=None):
     if seq and (protein_id is None or ident == protein_id):
         return ''.join(seq), ident
     return (''.join(seq), ident) if seq else (None, None)
+
+
+def _sorted_unique_tokens(values, sep=','):
+    out = set()
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s.lower() == 'nan':
+            continue
+        for tok in s.split(sep):
+            t = tok.strip()
+            if t:
+                out.add(t)
+    return sorted(out)
 
 
 def main():
@@ -116,6 +149,16 @@ def main():
         skip = 0
     df = pd.read_csv(args.input, sep=',', skiprows=skip, engine='python', quotechar='"', on_bad_lines='warn')
     print(f"[Step 8] Loaded {len(df)} rows from {os.path.basename(args.input)}", flush=True)
+
+    # Normalize legacy column naming from earlier runs.
+    if 'valuable_peptide' in df.columns:
+        if 'valuable_sequence' in df.columns:
+            legacy_vals = pd.to_numeric(df['valuable_peptide'], errors='coerce').fillna(0).astype(int)
+            current_vals = pd.to_numeric(df['valuable_sequence'], errors='coerce').fillna(0).astype(int)
+            df['valuable_sequence'] = (legacy_vals.gt(0) | current_vals.gt(0)).astype(int)
+            df = df.drop(columns=['valuable_peptide'])
+        else:
+            df = df.rename(columns={'valuable_peptide': 'valuable_sequence'})
 
     col_overhangs_prot = 'significant_single_aa_overhangs_protein_positions' if 'significant_single_aa_overhangs_protein_positions' in df.columns else None
     if col_overhangs_prot is None and 'single_aa_overhangs_protein_positions' in df.columns:
@@ -233,6 +276,69 @@ def main():
     df.to_csv(out_csv, index=False)
     print(f"[Step 8] Output saved to: {os.path.abspath(out_csv)}", flush=True)
 
+    # Write compact unique-peptide table (one row per sequence+charge+modifications),
+    # explicitly collapsing scan/row-specific duplicates.
+    pep_candidates = ['peptide_sequence', 'plain_peptide', 'peptide', 'sequence']
+    df_u = df.copy()
+    df_u['_pep_seq'] = df_u.apply(lambda r: _first_nonempty_str(r, pep_candidates), axis=1)
+    df_u['_charge'] = pd.to_numeric(df_u.get('charge'), errors='coerce')
+    df_u['_mods'] = df_u.get('modifications', pd.Series(['-'] * len(df_u))).astype(str).str.strip()
+    df_u.loc[df_u['_mods'].isin(['', 'nan', 'None']), '_mods'] = '-'
+    df_u = df_u[df_u['_pep_seq'].astype(str).str.strip() != ''].copy()
+
+    overhang_col = (
+        'significant_single_aa_overhangs_protein_positions'
+        if 'significant_single_aa_overhangs_protein_positions' in df_u.columns
+        else ('single_aa_overhangs_protein_positions' if 'single_aa_overhangs_protein_positions' in df_u.columns else None)
+    )
+    pairs_col = (
+        'single_aa_overhang_fragment_pairs'
+        if 'single_aa_overhang_fragment_pairs' in df_u.columns
+        else ('significant_fragment_pairs' if 'significant_fragment_pairs' in df_u.columns else None)
+    )
+
+    # Keep all original columns: pick one representative row per sequence+charge+mods,
+    # then add n_rows_collapsed and aggregated overhang fields.
+    unique_rows = []
+    q_candidates = ['percolator_qvalue', 'q_value', 'qvalue', 'q-val', 'qval']
+    q_col = next((c for c in q_candidates if c in df_u.columns), None)
+    for (pep, ch, mods_key), g in df_u.groupby(['_pep_seq', '_charge', '_mods'], dropna=False, sort=True):
+        if q_col:
+            qv = pd.to_numeric(g[q_col], errors='coerce')
+            best_idx = qv.idxmin() if qv.notna().any() else g.index[0]
+        else:
+            best_idx = g.index[0]
+        row_out = g.loc[best_idx].copy()
+        overhang_positions = _sorted_unique_tokens(g[overhang_col]) if overhang_col else []
+        overhang_pairs = _sorted_unique_tokens(g[pairs_col]) if pairs_col else []
+        row_out['n_rows_collapsed'] = int(len(g))
+        row_out['valuable_sequence'] = int(pd.to_numeric(g.get('valuable_sequence', 0), errors='coerce').fillna(0).astype(int).max() > 0)
+        row_out['protect_peptide'] = bool(pd.Series(g.get('protect_peptide', False)).astype(bool).max())
+        row_out['modifications'] = str(mods_key) if str(mods_key).strip() else '-'
+        # Normalize key fields to the grouping key.
+        if 'peptide_sequence' in row_out.index:
+            row_out['peptide_sequence'] = str(pep)
+        elif 'plain_peptide' in row_out.index:
+            row_out['plain_peptide'] = str(pep)
+        if 'charge' in row_out.index:
+            row_out['charge'] = (int(ch) if pd.notna(ch) else '')
+        if overhang_col:
+            row_out[overhang_col] = ','.join(overhang_positions)
+        if pairs_col:
+            row_out[pairs_col] = ','.join(overhang_pairs)
+        unique_rows.append(row_out)
+
+    unique_out_csv = os.path.join(out_dir, f'{base}_sequence_unique_peptides.csv')
+    df_unique = pd.DataFrame(unique_rows)
+    helper_cols = [c for c in ['_pep_seq', '_charge', '_mods'] if c in df_unique.columns]
+    if helper_cols:
+        df_unique = df_unique.drop(columns=helper_cols)
+    if 'n_rows_collapsed' in df_unique.columns:
+        cols = [c for c in df_unique.columns if c != 'n_rows_collapsed'] + ['n_rows_collapsed']
+        df_unique = df_unique[cols]
+    df_unique.to_csv(unique_out_csv, index=False)
+    print(f"[Step 8] Unique sequence+charge+mods CSV saved to: {os.path.abspath(unique_out_csv)} ({len(df_unique)} rows)", flush=True)
+
     # Unique peptides plots if FASTA provided
     if args.fasta and os.path.exists(args.fasta):
         print(f"[Step 8] Loading FASTA: {args.fasta}", flush=True)
@@ -245,7 +351,7 @@ def main():
                 seen = set()
                 for idx in df.index:
                     row = df.loc[idx]
-                    peptide = row.get('plain_peptide') or row.get('sequence') or ''
+                    peptide = _first_nonempty_str(row, ['plain_peptide', 'peptide_sequence', 'peptide', 'sequence'])
                     if not peptide:
                         continue
                     clean = re.sub(r'\[.*?\]', '', peptide)
@@ -295,6 +401,8 @@ def main():
                         unique_output, seq_cov_dir
                     )
                     print(f"[Step 8] Unique peptides plot saved to: {unique_output}", flush=True)
+                else:
+                    print("[Step 8] No peptide rows available for plotting (check peptide columns).", flush=True)
             except Exception as e:
                 print(f"[Step 8] Warning: Could not create unique peptides plot: {e}")
 
