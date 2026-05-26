@@ -2,6 +2,11 @@
 # Install: conda env create -f environment_hdx_app.yml
 # Activate: conda activate hdx_app
 # Run: streamlit run hdx_filter_app.py
+#
+# Apple Silicon (M1/M2/M3): thermorawfileparser needs x86. Recreate env:
+#   conda env remove -n hdx_app
+#   CONDA_SUBDIR=osx-64 conda env create -f environment_hdx_app.yml
+#   conda activate hdx_app && conda config --env --set subdir osx-64
 
 name: hdx_app
 channels:
@@ -18,4 +23,12 @@ dependencies:
   - plotly>=5.0.0
   - matplotlib>=3.5.0
   - scipy
-  - percolator  # Optional: for q-values in Comet pipeline (Streamlit Cloud skips if not installed)
+  - lxml
+  - thermorawfileparser  # RAW to mzML conversion (Create tab); needs osx-64 on Apple Silicon
+  - pip
+  - pip:
+      - pyhxexpress>=0.1.1
+      - brain-isotopic-distribution
+      - biopython
+      - pyteomics
+      - pymupdf
